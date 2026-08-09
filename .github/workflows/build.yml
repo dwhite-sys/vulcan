@@ -1,0 +1,95 @@
+name: Build Vulcan
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: Linux
+          - os: windows-latest
+            name: Windows
+          - os: macos-latest
+            name: macOS
+
+    runs-on: ${{ matrix.os }}
+    name: Build (${{ matrix.name }})
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: vulcan-app/package-lock.json
+
+      - name: Install rpm tools (Linux only)
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get install -y rpm
+
+      - name: Install dependencies
+        working-directory: vulcan-app
+        run: npm ci
+
+      - name: Build
+        working-directory: vulcan-app
+        run: npm run electron:build
+
+      - name: Upload Linux artifacts
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Vulcan-Linux
+          path: |
+            vulcan-app/electron-dist/*.deb
+            vulcan-app/electron-dist/*.rpm
+            vulcan-app/electron-dist/*.tar.gz
+            vulcan-app/electron-dist/*.AppImage
+
+      - name: Upload Windows artifact
+        if: matrix.os == 'windows-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Vulcan-Windows
+          path: vulcan-app/electron-dist/*.exe
+
+      - name: Upload macOS artifact
+        if: matrix.os == 'macos-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Vulcan-macOS
+          path: vulcan-app/electron-dist/*.dmg
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: |
+      startsWith(github.ref, 'refs/tags/v') &&
+      (needs.build.result == 'success' || needs.build.result == 'failure')
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+          merge-multiple: true
+
+      - name: Create GitHub release and upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Vulcan ${{ github.ref_name }}
+          generate_release_notes: true
+          files: artifacts/**/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

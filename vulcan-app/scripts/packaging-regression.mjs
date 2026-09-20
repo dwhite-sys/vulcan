@@ -67,6 +67,11 @@ assert.match(shell, /standalone_server_bootstrap\(\)/);
 assert.match(shell, /Vulcan-Server\.tar\.gz/);
 assert.match(shell, /loginctl enable-linger/);
 assert.match(shell, /SERVER_ONLY/);
+assert(shell.includes('VULCAN_HOME="${VULCAN_CONFIG_DIR:-$HOME/.vulcan}"'));
+assert(shell.includes('APP_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}/vulcan"'));
+assert(shell.includes('installed_source="$PAYLOAD_HOME/server"'));
+assert(shell.includes('"$BIN_HOME/uv" pip install --python "$RUNTIME/bin/python" "$installed_source"'));
+assert(!shell.includes('"$BIN_HOME/uv" pip install --python "$RUNTIME/bin/python" "$SERVER_SOURCE"'));
 
 const workflow = read(path.join(root, '.github', 'workflows', 'build.yml'));
 assert.match(workflow, /ubuntu-latest/);

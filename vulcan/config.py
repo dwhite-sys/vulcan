@@ -9,6 +9,11 @@ Directory layout:
   ~/.vulcan/
     config.json          — server runtime settings only (network endpoint definitions are client-owned)
     server.pid           — running Vulcan server PID
+    runtime/             — Vulcan-managed Python environment
+    python/              — Vulcan-managed Python installation
+    bin/                 — Vulcan-private launchers/tools
+    uv-tools/            — Vulcan-owned uv tool state
+    payload/             — persisted packaged server payload + payload hash
     chats/               — also bind-mounted read-only at /chats for cross-chat file references
       <chat-uuid>/       — per-conversation data
         workspace/       — agent working directory, bind-mounted rw at /workspace

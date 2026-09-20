@@ -82,15 +82,16 @@ run_privileged() {
 }
 
 OS="$(uname -s)"
-DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}/vulcan"
+VULCAN_HOME="${VULCAN_CONFIG_DIR:-$HOME/.vulcan}"
+APP_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}/vulcan"
 CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
-BIN_HOME="$DATA_HOME/bin"
-PYTHON_HOME="$DATA_HOME/python"
-UV_TOOL_HOME="$DATA_HOME/uv-tools"
-RUNTIME="$DATA_HOME/runtime"
-PAYLOAD_HOME="$DATA_HOME/payload"
-SERVER_INSTALLED_HASH="$DATA_HOME/server-payload.sha256"
-mkdir -p "$DATA_HOME" "$BIN_HOME" "$PYTHON_HOME" "$UV_TOOL_HOME" "$PAYLOAD_HOME"
+BIN_HOME="$VULCAN_HOME/bin"
+PYTHON_HOME="$VULCAN_HOME/python"
+UV_TOOL_HOME="$VULCAN_HOME/uv-tools"
+RUNTIME="$VULCAN_HOME/runtime"
+PAYLOAD_HOME="$VULCAN_HOME/payload"
+SERVER_INSTALLED_HASH="$PAYLOAD_HOME/server-payload.sha256"
+mkdir -p "$VULCAN_HOME" "$BIN_HOME" "$PYTHON_HOME" "$UV_TOOL_HOME" "$PAYLOAD_HOME"
 
 export UV_PYTHON_INSTALL_DIR="$PYTHON_HOME"
 export UV_TOOL_DIR="$UV_TOOL_HOME"
@@ -188,7 +189,7 @@ standalone_linux_bootstrap() {
   [[ "$OS" == "Linux" ]] || fail "The direct curl installer currently installs the Linux AppImage; macOS should launch the Vulcan DMG/app"
   ensure_downloader
 
-  local app_home="$DATA_HOME/app" installed="$DATA_HOME/app/Vulcan.AppImage"
+  local app_home="$APP_DATA_HOME/app" installed="$APP_DATA_HOME/app/Vulcan.AppImage"
   local tmp_app tmp_sum extract_root resources packaged_installer app_url sum_url result
   mkdir -p "$app_home"
   tmp_app="$(mktemp "${TMPDIR:-/tmp}/vulcan-appimage.XXXXXX")"
@@ -363,24 +364,61 @@ server_payload_hash() {
 ensure_vulcan_runtime() {
   ensure_python
   [[ -n "$SERVER_SOURCE" && -d "$SERVER_SOURCE" ]] || fail "Vulcan server payload is missing"
+
   local wanted current="" py="$RUNTIME/bin/python"
+  local installed_source="$PAYLOAD_HOME/server"
+
   wanted="$(server_payload_hash)"
   [[ -f "$SERVER_INSTALLED_HASH" ]] && current="$(tr -d '[:space:]' < "$SERVER_INSTALLED_HASH")"
-  local healthy=0
-  if [[ -x "$py" ]] && "$py" -c 'import vulcan, fastapi, uvicorn, cryptography, numpy, sklearn, fastembed, spacy, PIL' >/dev/null 2>&1; then healthy=1; fi
-  if [[ "$current" == "$wanted" && "$healthy" -eq 1 ]]; then return; fi
+
+  local healthy=0 payload_ready=0
+  if [[ -x "$py" ]] && "$py" -c 'import vulcan, fastapi, uvicorn, cryptography, numpy, sklearn, fastembed, spacy, PIL' >/dev/null 2>&1; then
+    healthy=1
+  fi
+  [[ -f "$installed_source/pyproject.toml" ]] && payload_ready=1
+
+  if [[ "$current" == "$wanted" && "$healthy" -eq 1 && "$payload_ready" -eq 1 ]]; then
+    return
+  fi
 
   say "Repairing Vulcan server runtime"
-  # Virtualenv entry-point shebangs contain the venv's absolute path, so build
-  # directly at the final location rather than creating a temporary venv and moving it.
+
+  # Packaged resources are delivery media, not Vulcan's persistent home.
+  # Persist the server payload under ~/.vulcan before setuptools/uv builds it.
+  local source_real installed_real="" staged_source
+  source_real="$(cd "$SERVER_SOURCE" && pwd -P)"
+
+  if [[ -d "$installed_source" ]]; then
+    installed_real="$(cd "$installed_source" && pwd -P)"
+  fi
+
+  if [[ "$source_real" != "$installed_real" ]]; then
+    staged_source="$PAYLOAD_HOME/.server.$$"
+    rm -rf "$staged_source"
+    mkdir -p "$staged_source"
+
+    if ! cp -R "$SERVER_SOURCE"/. "$staged_source"/; then
+      rm -rf "$staged_source"
+      fail "Could not persist Vulcan server payload under $VULCAN_HOME"
+    fi
+
+    rm -rf "$installed_source"
+    mv "$staged_source" "$installed_source"
+  fi
+
   if [[ -n "$GUEST" || "$SERVER_ONLY" -eq 1 ]]; then
     run_privileged systemctl stop vulcan.service >/dev/null 2>&1 || true
   else
     systemctl --user stop vulcan.service >/dev/null 2>&1 || true
   fi
+
   rm -rf "$RUNTIME"
   "$BIN_HOME/uv" venv --python 3.12 "$RUNTIME" >/dev/null
-  "$BIN_HOME/uv" pip install --python "$RUNTIME/bin/python" "$SERVER_SOURCE" >/dev/null
+
+  if ! "$BIN_HOME/uv" pip install --python "$RUNTIME/bin/python" "$installed_source" >/dev/null; then
+    fail "Could not install Vulcan server runtime"
+  fi
+
   printf '%s\n' "$wanted" > "$SERVER_INSTALLED_HASH"
 }
 
@@ -489,7 +527,7 @@ PY
 install_linux_desktop() {
   [[ "$SERVER_ONLY" -eq 0 ]] || return 0
   [[ "$FROM_APP" -eq 1 ]] || return 0
-  local app_home="$DATA_HOME/app"
+  local app_home="$APP_DATA_HOME/app"
   local desktop_home="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
   local icon_home="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/512x512/apps"
   local autostart_home="$CONFIG_HOME/autostart"
@@ -587,7 +625,7 @@ macos_host_converge() {
   [[ -n "$SERVER_SOURCE" && -d "$SERVER_SOURCE" ]] || fail "Packaged Vulcan server payload is missing"
   local wanted_hash guest_hash
   wanted_hash="$(server_payload_hash)"
-  guest_hash="$(colima -p vulcan ssh -- sh -lc 'if [ -f "$HOME/.local/share/vulcan/payload/server-payload.sha256" ] && [ -f "$HOME/.local/share/vulcan/payload/server/pyproject.toml" ]; then tr -d "[:space:]" < "$HOME/.local/share/vulcan/payload/server-payload.sha256"; fi' 2>/dev/null || true)"
+  guest_hash="$(colima -p vulcan ssh -- sh -lc 'if [ -f "$HOME/.vulcan/payload/server-payload.sha256" ] && [ -f "$HOME/.vulcan/payload/server/pyproject.toml" ]; then tr -d "[:space:]" < "$HOME/.vulcan/payload/server-payload.sha256"; fi' 2>/dev/null || true)"
 
   # The payload is immutable for a given desktop build.  Avoid copying it into
   # the VM on every healthy launch; only refresh it when the packaged hash changes
@@ -600,9 +638,9 @@ macos_host_converge() {
     tar -C "$SERVER_SOURCE" -czf "$tmp_tar" .
     printf '%s\n' "$wanted_hash" > "$tmp_hash"
 
-    colima -p vulcan ssh -- sh -lc 'rm -rf "$HOME/.local/share/vulcan/payload/server"; mkdir -p "$HOME/.local/share/vulcan/payload/server"; cat > /tmp/vulcan-server.tar.gz' < "$tmp_tar"
-    colima -p vulcan ssh -- sh -lc 'tar -xzf /tmp/vulcan-server.tar.gz -C "$HOME/.local/share/vulcan/payload/server"; rm -f /tmp/vulcan-server.tar.gz'
-    colima -p vulcan ssh -- sh -lc 'mkdir -p "$HOME/.local/share/vulcan/payload"; cat > "$HOME/.local/share/vulcan/payload/server-payload.sha256"' < "$tmp_hash"
+    colima -p vulcan ssh -- sh -lc 'rm -rf "$HOME/.vulcan/payload/server"; mkdir -p "$HOME/.vulcan/payload/server"; cat > /tmp/vulcan-server.tar.gz' < "$tmp_tar"
+    colima -p vulcan ssh -- sh -lc 'tar -xzf /tmp/vulcan-server.tar.gz -C "$HOME/.vulcan/payload/server"; rm -f /tmp/vulcan-server.tar.gz'
+    colima -p vulcan ssh -- sh -lc 'mkdir -p "$HOME/.vulcan/payload"; cat > "$HOME/.vulcan/payload/server-payload.sha256"' < "$tmp_hash"
     rm -f "$tmp_tar" "$tmp_hash"
   fi
 
@@ -613,8 +651,8 @@ macos_host_converge() {
   [[ -n "$guest_home" ]] || fail "Could not resolve the Colima guest home directory"
   colima -p vulcan ssh -- bash -s -- \
     --guest macos-colima \
-    --server-source "$guest_home/.local/share/vulcan/payload/server" \
-    --server-hash-file "$guest_home/.local/share/vulcan/payload/server-payload.sha256" \
+    --server-source "$guest_home/.vulcan/payload/server" \
+    --server-hash-file "$guest_home/.vulcan/payload/server-payload.sha256" \
     --version "$VERSION" < "$0"
 
   # Colima/Lima automatically forwards guest listening ports to the macOS host,

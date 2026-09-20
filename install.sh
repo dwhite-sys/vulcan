@@ -598,10 +598,13 @@ linux_converge() {
   # can immediately adopt newly-added docker-group membership via `sg` instead of
   # forcing an SSH logout/login cycle.
   if docker info >/dev/null 2>&1; then
+    say "Preparing Docker workspace image"
     "$RUNTIME/bin/vulcan" install --runtime-only >/dev/null
   elif [[ "$SERVER_ONLY" -eq 1 ]] && have sg && id -nG "$USER" | tr ' ' '\n' | grep -qx docker; then
+    say "Preparing Docker workspace image"
     sg docker -c "$(printf '%q' "$RUNTIME/bin/vulcan") install --runtime-only" >/dev/null || fail "Could not prepare the Docker workspace image with the newly-added docker group"
   fi
+  say "Starting Vulcan services"
   ensure_vulcan_service_linux
   if [[ "$relogin" == 0 ]] && ! wait_server; then fail "Vulcan server did not become healthy on port 8468"; fi
 

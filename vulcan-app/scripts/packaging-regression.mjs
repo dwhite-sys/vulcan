@@ -54,10 +54,45 @@ assert.match(preload, /desktop:\s*\{/);
 assert.match(preload, /onOpenChat/);
 
 const coordinator = read(path.join(appRoot, 'electron', 'installCoordinator.cjs'));
+const setupWindow = read(path.join(appRoot, 'electron', 'setupWindow.cjs'));
+const setupPreload = read(path.join(appRoot, 'electron', 'setupPreload.cjs'));
+const setupHtml = read(path.join(appRoot, 'electron', 'setup.html'));
 assert.match(coordinator, /process\.resourcesPath/);
 assert.match(coordinator, /app\.moveToApplicationsFolder\(\)/);
 assert.match(coordinator, /powershell\.exe/);
 assert.match(coordinator, /install\.sh/);
+assert.match(coordinator, /onProgress/);
+assert.match(coordinator, /installerStageForLine/);
+assert.match(coordinator, /type: 'log'/);
+
+assert.match(main, /createSetupWindow/);
+assert.match(main, /allowShow: shouldShowOnReady/);
+assert.match(main, /startupRepairInProgress/);
+assert.match(main, /onProgress: \(payload\) => setupController\?\.progress\(payload\)/);
+assert.match(
+  main,
+  /await setupController\.complete\(\)[\s\S]*const passwordStore/,
+  'the real Vulcan renderer must not be created until setup convergence completes',
+);
+
+assert.match(setupWindow, /width: 560, height: 124/);
+assert.match(setupWindow, /width: 560, height: 300/);
+assert.match(setupWindow, /SHOW_DELAY_MS = 400/);
+assert.match(setupWindow, /setContentSize\(size\.width, size\.height\)/);
+assert.match(setupPreload, /vulcan-setup-details/);
+assert.match(setupPreload, /vulcan-setup-progress/);
+
+assert(setupHtml.includes('Click for details'));
+assert(setupHtml.includes('First launch setup'));
+assert(setupHtml.includes('Working…'));
+assert(setupHtml.includes('repeating-linear-gradient('));
+assert(setupHtml.includes('125deg'));
+assert(setupHtml.includes('rgba(255,255,255,.28) 0 7px'));
+assert(setupHtml.includes('rgba(255,255,255,.05) 7px 14px'));
+assert.match(setupHtml, /animation:barber \.7s linear infinite/);
+assert.match(setupHtml, /from\{transform:translateX\(-20px\)\}/);
+assert.match(setupHtml, /to\{transform:translateX\(0\)\}/);
+assert.match(setupHtml, /--bar:#62c99d/);
 assert.doesNotMatch(
   coordinator,
   /app\.relaunch/,
@@ -92,6 +127,8 @@ assert.match(
   /install_linux_desktop >\/dev\/null/,
   'Linux must persist its stable AppImage without forcing a process handoff',
 );
+assert.match(shell, /say "Preparing Docker workspace image"/);
+assert.match(shell, /say "Starting Vulcan services"/);
 assert.match(shell, /standalone_linux_bootstrap\(\)/);
 assert.match(shell, /releases\/latest\/download\/%s/);
 assert.match(shell, /Vulcan\.AppImage\.sha256/);

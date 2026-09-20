@@ -5,6 +5,7 @@ const os = require('os');
 const { createSecurePasswordStore, registerSecurePasswordIpc } = require('./securePasswordStore.cjs');
 const { createSemanticToolCacheStore, registerSemanticToolCacheIpc } = require('./semanticToolCacheStore.cjs');
 const { ensurePackagedRuntime } = require('./installCoordinator.cjs');
+const { createSetupWindow } = require('./setupWindow.cjs');
 
 const isDev = process.env.NODE_ENV === 'development';
 
@@ -13,6 +14,8 @@ let mainWindow = null;
 let tray = null;
 let isQuitting = false;
 let shouldShowOnReady = !startHidden;
+let setupController = null;
+let startupRepairInProgress = false;
 
 const gotSingleInstanceLock = app.requestSingleInstanceLock();
 if (!gotSingleInstanceLock) {
@@ -25,6 +28,12 @@ if (!gotSingleInstanceLock) {
 }
 
 function showMainWindow(chatId = null) {
+  if (startupRepairInProgress) {
+    shouldShowOnReady = true;
+    setupController?.show();
+    return;
+  }
+
   if (!mainWindow || mainWindow.isDestroyed()) {
     if (!app.isReady()) return;
     createWindow();
@@ -562,15 +571,42 @@ ipcMain.on('native-file-drag-start', (event, payload) => {
 });
 
 app.whenReady().then(async () => {
-  const repair = await ensurePackagedRuntime({ app, dialog, shell });
+  startupRepairInProgress = app.isPackaged && process.env.VULCAN_SKIP_REPAIR !== '1';
+
+  if (startupRepairInProgress) {
+    setupController = createSetupWindow({ allowShow: shouldShowOnReady });
+  }
+
+  const repair = await ensurePackagedRuntime({
+    app,
+    dialog,
+    shell,
+    onProgress: (payload) => setupController?.progress(payload),
+  });
+
+  startupRepairInProgress = false;
+
   if (repair?.relaunching || repair?.quit) {
+    setupController?.close();
+    setupController = null;
     app.exit(0);
     return;
   }
+
   if (repair?.ok === false) {
-    dialog.showErrorBox('Vulcan repair failed', repair.message || 'Vulcan could not repair its local runtime.');
+    setupController?.close();
+    setupController = null;
+    dialog.showErrorBox(
+      'Vulcan repair failed',
+      repair.message || 'Vulcan could not repair its local runtime.',
+    );
     app.exit(1);
     return;
+  }
+
+  if (setupController) {
+    await setupController.complete();
+    setupController = null;
   }
 
   const passwordStore = createSecurePasswordStore({

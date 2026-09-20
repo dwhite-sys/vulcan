@@ -195,6 +195,109 @@ def _update_slot_meta(chat_id: str, kind: SlotKind, slot: int, **values):
                 pass
 
 
+def get_slot_focus(chat_id: str, kind: SlotKind) -> int | None:
+    """Return the durable selected slot for one terminal kind."""
+    with _scrollback_lock:
+        data = _load_slot_meta(chat_id)
+        focus = data.get("_focus")
+        if not isinstance(focus, dict):
+            return None
+        raw = focus.get(kind)
+        if isinstance(raw, bool):
+            return None
+        try:
+            slot = int(raw)
+        except (TypeError, ValueError):
+            return None
+        return slot if 1 <= slot <= SLOT_MAX else None
+
+
+def set_slot_focus(chat_id: str, kind: SlotKind, slot: int | None) -> None:
+    """Persist terminal selection independently of an individual AgentRun."""
+    if slot is not None:
+        slot = int(slot)
+        if slot < 1 or slot > SLOT_MAX:
+            raise ValueError(f"Terminal slot must be between 1 and {SLOT_MAX}")
+
+    with _scrollback_lock:
+        data = _load_slot_meta(chat_id)
+        focus = data.get("_focus")
+        if not isinstance(focus, dict):
+            focus = {}
+
+        if slot is None:
+            focus.pop(kind, None)
+        else:
+            focus[kind] = slot
+
+        if focus:
+            data["_focus"] = focus
+        else:
+            data.pop("_focus", None)
+
+        path = _slots_file(chat_id)
+        tmp = path.with_suffix(".tmp")
+        try:
+            tmp.write_text(json.dumps(data, default=str), encoding="utf-8")
+            os.replace(tmp, path)
+        except Exception:
+            logger.warning(
+                "Could not persist terminal focus for %s:%s",
+                chat_id, kind, exc_info=True,
+            )
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
+def clear_slot_focus_if_matches(
+    chat_id: str,
+    kind: SlotKind,
+    slot: int,
+) -> bool:
+    """Clear durable focus only if it still points at this slot."""
+    with _scrollback_lock:
+        data = _load_slot_meta(chat_id)
+        focus = data.get("_focus")
+        if not isinstance(focus, dict):
+            return False
+
+        raw = focus.get(kind)
+        if isinstance(raw, bool):
+            return False
+        try:
+            current = int(raw)
+        except (TypeError, ValueError):
+            return False
+
+        if current != int(slot):
+            return False
+
+        focus.pop(kind, None)
+        if focus:
+            data["_focus"] = focus
+        else:
+            data.pop("_focus", None)
+
+        path = _slots_file(chat_id)
+        tmp = path.with_suffix(".tmp")
+        try:
+            tmp.write_text(json.dumps(data, default=str), encoding="utf-8")
+            os.replace(tmp, path)
+            return True
+        except Exception:
+            logger.warning(
+                "Could not clear terminal focus for %s:%s:%s",
+                chat_id, kind, slot, exc_info=True,
+            )
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return False
+
+
 def _persisted_slot_entry(chat_id: str, kind: SlotKind, slot: int) -> dict:
     value = _load_slot_meta(chat_id).get(f"{kind}:{slot}")
     return value if isinstance(value, dict) else {}
@@ -672,6 +775,7 @@ def _start_slot_proc(chat_id: str, kind: SlotKind, slot: int, cols: int = 80, ro
                     close_reason="process-exit", cols=ts.cols, rows=ts.rows,
                     last_activity=ts.last_activity,
                 )
+                clear_slot_focus_if_matches(ts.chat_id, ts.kind, ts.slot)
 
     threading.Thread(target=_collect, daemon=True).start()
     _start_inactivity_watcher(ts)
@@ -743,6 +847,7 @@ def close_slot(chat_id: str, kind: SlotKind, slot: int, reason: str = 'explicit'
                     _scrollbacks.pop(key, None)
                 _clear_slot_revival_state(chat_id, kind, slot)
                 _update_slot_meta(chat_id, kind, slot, open=False, parked=False, close_reason='explicit', scrollback='')
+                clear_slot_focus_if_matches(chat_id, kind, slot)
             return
         if ts.finished:
             if reason == 'explicit' and ts.close_reason in _LIFECYCLE_REOPEN_REASONS:
@@ -751,6 +856,7 @@ def close_slot(chat_id: str, kind: SlotKind, slot: int, reason: str = 'explicit'
                     _scrollbacks.pop(key, None)
                 _clear_slot_revival_state(chat_id, kind, slot)
                 _update_slot_meta(chat_id, kind, slot, open=False, parked=False, close_reason='explicit', scrollback='')
+                clear_slot_focus_if_matches(chat_id, kind, slot)
             return
         ts.close_reason = reason
         ts.finished = True
@@ -774,6 +880,8 @@ def close_slot(chat_id: str, kind: SlotKind, slot: int, reason: str = 'explicit'
             close_reason=reason, cols=ts.cols, rows=ts.rows, last_activity=ts.last_activity,
             **({"scrollback": ""} if reason == 'explicit' else {}),
         )
+        if not logical_open:
+            clear_slot_focus_if_matches(chat_id, kind, slot)
 
 
 def close_chat_slots(chat_id: str, reason: str = 'explicit'):

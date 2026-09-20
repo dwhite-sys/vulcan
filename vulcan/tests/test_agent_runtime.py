@@ -1304,6 +1304,120 @@ class StorageAndParserTests(unittest.TestCase):
 
 
 class BackgroundAgentTests(unittest.IsolatedAsyncioTestCase):
+    async def test_workspace_warmup_restores_durable_agent_terminal_focus(self):
+        run = agent.AgentRun(
+            chat=chat("terminal-focus-restore"),
+            options=options(settings={
+                "toolMode": "search",
+                "cliWorkspaceEnabled": True,
+                "panelsEnabled": True,
+            }),
+            manager=agent.RunManager(),
+            run_id="terminal-focus-restore:run",
+        )
+
+        slots = [{
+            "kind": "agent",
+            "slot": 1,
+            "finished": False,
+            "logical_open": True,
+        }]
+
+        with mock.patch.object(
+            agent.docker, "container_running", return_value=True
+        ), mock.patch.object(
+            agent.term, "list_slots", return_value=slots
+        ), mock.patch.object(
+            agent.term, "get_slot_focus", return_value=1
+        ):
+            await agent._warm_workspace(run)
+
+        self.assertEqual(run.terminal_slots, [1])
+        self.assertEqual(run.terminal_focus, 1)
+
+    async def test_switch_terminal_persists_focus_outside_agent_run(self):
+        run = agent.AgentRun(
+            chat=chat("terminal-focus-switch"),
+            options=options(settings={
+                "toolMode": "search",
+                "cliWorkspaceEnabled": True,
+                "panelsEnabled": True,
+            }),
+            manager=agent.RunManager(),
+            run_id="terminal-focus-switch:run",
+        )
+        run.terminal_slots = [1]
+
+        with mock.patch.object(
+            agent,
+            "_resume_agent_terminals",
+            new=mock.AsyncMock(return_value=[{
+                "slot": 1,
+                "running": False,
+                "pid": None,
+            }]),
+        ), mock.patch.object(
+            agent.term,
+            "set_slot_focus",
+        ) as persist:
+            result = await agent.execute_tool(
+                run,
+                "switch_terminal",
+                {"slot": 1},
+                "turn",
+                "event",
+            )
+
+        self.assertTrue(result["result"]["ok"])
+        self.assertEqual(run.terminal_focus, 1)
+        persist.assert_called_once_with(
+            "terminal-focus-switch",
+            "agent",
+            1,
+        )
+
+    async def test_terminal_recovery_drops_stale_nonexistent_slot(self):
+        run = agent.AgentRun(
+            chat=chat("terminal-stale-slot"),
+            options=options(settings={
+                "toolMode": "search",
+                "cliWorkspaceEnabled": True,
+                "panelsEnabled": True,
+            }),
+            manager=agent.RunManager(),
+            run_id="terminal-stale-slot:run",
+        )
+        run.terminal_slots = [1]
+        run.terminal_focus = 1
+
+        with mock.patch.object(
+            agent.term,
+            "live_slot_states",
+            return_value=None,
+        ), mock.patch.object(
+            agent.term,
+            "resume_logical_slots",
+            return_value=[],
+        ), mock.patch.object(
+            agent.term,
+            "get_slot_focus",
+            return_value=1,
+        ), mock.patch.object(
+            agent.term,
+            "clear_slot_focus_if_matches",
+            return_value=True,
+        ) as clear:
+            states = await agent._resume_agent_terminals(run)
+
+        self.assertEqual(states, [])
+        self.assertEqual(run.terminal_slots, [])
+        self.assertIsNone(run.terminal_focus)
+        clear.assert_called_once_with(
+            "terminal-stale-slot",
+            "agent",
+            1,
+        )
+
     async def test_periodic_checkpoint_scheduler_commits_existing_workspaces(self):
         server = load_server_module()
         identifier = "scheduled-workspace-checkpoint"

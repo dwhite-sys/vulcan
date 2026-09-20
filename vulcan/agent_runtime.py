@@ -1173,6 +1173,34 @@ def _toolset(run: AgentRun) -> list[dict[str, Any]]:
     return result
 
 
+async def _reconcile_agent_terminal_focus(run: AgentRun) -> None:
+    """Restore durable focus only when that logical terminal still exists."""
+    slots = set(run.terminal_slots)
+
+    if run.terminal_focus in slots:
+        return
+
+    persisted = await asyncio.to_thread(
+        term.get_slot_focus,
+        run.chat["id"],
+        "agent",
+    )
+
+    if persisted in slots:
+        run.terminal_focus = persisted
+        return
+
+    run.terminal_focus = None
+
+    if persisted is not None:
+        await asyncio.to_thread(
+            term.clear_slot_focus_if_matches,
+            run.chat["id"],
+            "agent",
+            persisted,
+        )
+
+
 async def _warm_workspace(run: AgentRun) -> None:
     try:
         if not await asyncio.to_thread(docker.container_running, run.chat["id"]):
@@ -1180,8 +1208,10 @@ async def _warm_workspace(run: AgentRun) -> None:
         slots = await asyncio.to_thread(term.list_slots, run.chat["id"])
         run.terminal_slots = [
             int(slot["slot"]) for slot in slots
-            if slot.get("kind") == "agent" and slot.get("logical_open", not slot.get("finished"))
+            if slot.get("kind") == "agent"
+            and slot.get("logical_open", not slot.get("finished"))
         ]
+        await _reconcile_agent_terminal_focus(run)
     except Exception:
         logger.warning("Could not warm workspace for %s", run.chat["id"], exc_info=True)
 
@@ -1201,6 +1231,7 @@ async def _resume_agent_terminals(run: AgentRun) -> list[dict[str, Any]]:
             term.live_slot_states, run.chat["id"], "agent", sorted(set(run.terminal_slots))
         )
         if live is not None:
+            await _reconcile_agent_terminal_focus(run)
             return live
 
     task = run.terminal_resume_task
@@ -1214,15 +1245,20 @@ async def _resume_agent_terminals(run: AgentRun) -> list[dict[str, Any]]:
                     await run.workspace_warm_task
                 except Exception:
                     pass
-            previous_slots = sorted(set(run.terminal_slots))
-            states = await asyncio.to_thread(term.resume_logical_slots, run.chat["id"], "agent")
-            if states:
-                run.terminal_slots = sorted({int(item["slot"]) for item in states})
-                return states
-            # Preserve already-known logical identity if metadata was not yet
-            # materialized (notably immediately after open_terminal). Real tool
-            # interaction will still validate/revive the selected slot.
-            return [{"slot": int(slot), "running": False, "pid": None} for slot in previous_slots]
+            states = await asyncio.to_thread(
+                term.resume_logical_slots,
+                run.chat["id"],
+                "agent",
+            )
+
+            # Physical or transparently-revivable terminal state is authoritative.
+            # Never synthesize an "idle" terminal from stale AgentRun bookkeeping.
+            run.terminal_slots = sorted({
+                int(item["slot"]) for item in states
+            })
+
+            await _reconcile_agent_terminal_focus(run)
+            return states
         task = asyncio.create_task(recover(), name=f"vulcan-terminal-resume:{run.chat['id']}")
         run.terminal_resume_task = task
     return await task
@@ -1950,6 +1986,12 @@ async def execute_tool(run: AgentRun, name: str, arguments: dict[str, Any], turn
             slots = ", ".join(map(str, run.terminal_slots)) or "none"
             return {"result": {"error": f"Terminal {slot} is not open. Open slots: {slots}"}}
         run.terminal_focus = slot
+        await asyncio.to_thread(
+            term.set_slot_focus,
+            run.chat["id"],
+            "agent",
+            slot,
+        )
         run.manager.publish(run.chat["id"], "push/terminal-state", {"chat_id": run.chat["id"], "slots": run.terminal_slots, "focused": slot})
         return {"result": {"ok": True, "slot": slot, "note": f"Switched focus to terminal {slot}."}}
     if name == "close_terminal":

@@ -23,7 +23,7 @@ Once a tagged GitHub release exists, Linux users can install the same AppImage u
 curl -fsSL https://raw.githubusercontent.com/dwhite-sys/vulcan/main/install.sh | bash
 ```
 
-The public script does not build Vulcan from source. It downloads the release asset `Vulcan.AppImage` plus `Vulcan.AppImage.sha256`, verifies the SHA-256, installs the AppImage at `~/.local/share/vulcan/app/Vulcan.AppImage`, extracts its bundled resources without requiring FUSE, and invokes the exact same self-repairing converger Electron invokes on normal launches. The installed desktop entry, icon, autostart entry, backend runtime, Etna kits, Docker state, and Vulcan service therefore converge through one implementation regardless of whether installation started by double-clicking the AppImage or piping the GitHub script to Bash.
+The public script does not build Vulcan from source. It downloads the stable `Vulcan.AppImage` release asset, verifies it against the SHA-256 digest published by GitHub's release API, installs it at `~/.local/share/vulcan/app/Vulcan.AppImage`, extracts its bundled resources without requiring FUSE, and invokes the exact same self-repairing converger Electron invokes on normal launches. The installed desktop entry, icon, autostart entry, backend runtime, Etna kits, Docker state, and Vulcan service therefore converge through one implementation regardless of whether installation started by double-clicking the AppImage or piping the GitHub script to Bash.
 
 A specific release can be selected without changing the script:
 
@@ -39,7 +39,7 @@ A Linux server does not need to download or install Electron at all:
 curl -fsSL https://raw.githubusercontent.com/dwhite-sys/vulcan/main/install.sh | bash -s -- --server-only
 ```
 
-`--server-only` downloads the much smaller `Vulcan-Server.tar.gz` release bundle instead of the AppImage. It installs/repairs uv, managed Python, Etna + required kits, Docker, the Vulcan runtime, and the workspace image, but creates no AppImage, `.desktop` entry, icon, tray autostart, or other desktop integration. Native Linux server-only installs use `/etc/systemd/system/vulcan.service` so the backend starts at boot and survives SSH logout; Etna remains a user service and the installer enables systemd user lingering for that account.
+`--server-only` resolves the selected GitHub release tag, downloads GitHub's source tarball for that exact tag, and runs the tagged installer against only its `vulcan` server package. It installs/repairs uv, managed Python, Etna + required kits, Docker, the Vulcan runtime, and the workspace image, but creates no AppImage, `.desktop` entry, icon, tray autostart, or other desktop integration. Native Linux server-only installs use `/etc/systemd/system/vulcan.service` so the backend starts at boot and survives SSH logout; Etna remains a user service and the installer enables systemd user lingering for that account.
 
 A specific headless release is selected the same way:
 
@@ -47,7 +47,7 @@ A specific headless release is selected the same way:
 curl -fsSL https://raw.githubusercontent.com/dwhite-sys/vulcan/main/install.sh | bash -s -- --server-only --release vX.Y.Z
 ```
 
-For development/private testing, `VULCAN_APPIMAGE_URL` / `VULCAN_APPIMAGE_SHA256_URL` override the desktop release assets, while `VULCAN_SERVER_BUNDLE_URL` / `VULCAN_SERVER_BUNDLE_SHA256_URL` override the headless bundle URLs.
+For development/private testing, `VULCAN_APPIMAGE_URL` together with `VULCAN_APPIMAGE_SHA256` can override the official desktop asset and digest. `VULCAN_SOURCE_TARBALL_URL` can override the tagged source archive used by the headless bootstrap path.
 
 ## Backend topology
 

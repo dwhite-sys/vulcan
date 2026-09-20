@@ -41,12 +41,14 @@ jobs:
       - name: Packaging preflight
         run: node scripts/packaging-regression.mjs
 
+      - name: Validate headless source bootstrap
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: bash scripts/headless-bootstrap-regression.sh
+
       - name: Install dependencies
         run: npm ci
 
-      # electron:build generates the backend hash, runs the packaging regression,
-      # builds Vite, and invokes electron-builder with --publish never. Release
-      # publication is owned exclusively by the release job below.
       - name: Build packaged desktop artifact
         run: npm run electron:build
 
@@ -55,7 +57,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          src="$(find electron-dist -maxdepth 1 -type f -name '*.AppImage' ! -name 'Vulcan.AppImage' -print -quit)"
+
+          src="$(
+            find electron-dist -maxdepth 1 -type f \
+              -name '*.AppImage' \
+              ! -name 'Vulcan.AppImage' \
+              -print -quit
+          )"
+
           test -n "$src"
           chmod +x "$src"
 
@@ -67,7 +76,11 @@ jobs:
             "$GITHUB_WORKSPACE/vulcan-app/$src" --appimage-extract >/dev/null
           )
 
-          desktop="$(find "$inspect/squashfs-root" -type f -name '*.desktop' -print -quit)"
+          desktop="$(
+            find "$inspect/squashfs-root" \
+              -type f -name '*.desktop' -print -quit
+          )"
+
           test -n "$desktop"
           grep -Fxq 'X-AppImage-Integrate=false' "$desktop"
 
@@ -75,83 +88,71 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         shell: bash
         run: |
-          src="$(find electron-dist -maxdepth 1 -type f -name '*.AppImage' ! -name 'Vulcan.AppImage' -print -quit)"
+          set -euo pipefail
+
+          src="$(
+            find electron-dist -maxdepth 1 -type f \
+              -name '*.AppImage' \
+              ! -name 'Vulcan.AppImage' \
+              -print -quit
+          )"
+
           test -n "$src"
           cp "$src" electron-dist/Vulcan.AppImage
-          sha256sum electron-dist/Vulcan.AppImage > electron-dist/Vulcan.AppImage.sha256
-
-      - name: Prepare headless server release bundle
-        if: matrix.os == 'ubuntu-latest'
-        shell: bash
-        run: |
-          rm -rf electron-dist/server-bundle
-          mkdir -p electron-dist/server-bundle/vulcan-server
-          tar -C ../vulcan \
-            --exclude='./tests' \
-            --exclude='*/__pycache__' \
-            --exclude='./.pytest_cache' \
-            --exclude='*/.pytest_cache' \
-            --exclude='./.mypy_cache' \
-            --exclude='*/.mypy_cache' \
-            --exclude='*.pyc' \
-            --exclude='./SERVER_MANAGEMENT_UI_BACKLOG.md' \
-            -cf - . | tar -C electron-dist/server-bundle/vulcan-server -xf -
-          cp ../install.sh electron-dist/server-bundle/install.sh
-          cp build/server-payload.sha256 electron-dist/server-bundle/server-payload.sha256
-          tar -C electron-dist/server-bundle -czf electron-dist/Vulcan-Server.tar.gz \
-            install.sh server-payload.sha256 vulcan-server
-          sha256sum electron-dist/Vulcan-Server.tar.gz > electron-dist/Vulcan-Server.tar.gz.sha256
 
       - name: Prepare stable Windows release asset
         if: matrix.os == 'windows-latest'
         shell: pwsh
         run: |
-          $src = Get-ChildItem electron-dist -Filter '*.exe' | Where-Object { $_.Name -ne 'Vulcan-Setup.exe' } | Select-Object -First 1
-          if (-not $src) { throw 'No Windows installer was produced' }
+          $src = Get-ChildItem electron-dist -Filter '*.exe' |
+            Where-Object { $_.Name -ne 'Vulcan-Setup.exe' } |
+            Select-Object -First 1
+
+          if (-not $src) {
+            throw 'No Windows installer was produced'
+          }
+
           Copy-Item $src.FullName electron-dist/Vulcan-Setup.exe
-          $hash = (Get-FileHash electron-dist/Vulcan-Setup.exe -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$hash  Vulcan-Setup.exe" | Set-Content -NoNewline electron-dist/Vulcan-Setup.exe.sha256
 
       - name: Prepare stable macOS release asset
         if: matrix.os == 'macos-latest'
         shell: bash
         run: |
-          src="$(find electron-dist -maxdepth 1 -type f -name '*.dmg' ! -name 'Vulcan.dmg' -print -quit)"
+          set -euo pipefail
+
+          src="$(
+            find electron-dist -maxdepth 1 -type f \
+              -name '*.dmg' \
+              ! -name 'Vulcan.dmg' \
+              -print -quit
+          )"
+
           test -n "$src"
           cp "$src" electron-dist/Vulcan.dmg
-          shasum -a 256 electron-dist/Vulcan.dmg > electron-dist/Vulcan.dmg.sha256
 
-      - name: Upload Linux artifacts
+      - name: Upload Linux artifact
         if: matrix.os == 'ubuntu-latest'
         uses: actions/upload-artifact@v4
         with:
           name: Vulcan-Linux
           if-no-files-found: error
-          path: |
-            vulcan-app/electron-dist/*.AppImage
-            vulcan-app/electron-dist/*.AppImage.sha256
-            vulcan-app/electron-dist/Vulcan-Server.tar.gz
-            vulcan-app/electron-dist/Vulcan-Server.tar.gz.sha256
+          path: vulcan-app/electron-dist/Vulcan.AppImage
 
-      - name: Upload Windows artifacts
+      - name: Upload Windows artifact
         if: matrix.os == 'windows-latest'
         uses: actions/upload-artifact@v4
         with:
           name: Vulcan-Windows
           if-no-files-found: error
-          path: |
-            vulcan-app/electron-dist/*.exe
-            vulcan-app/electron-dist/*.exe.sha256
+          path: vulcan-app/electron-dist/Vulcan-Setup.exe
 
-      - name: Upload macOS artifacts
+      - name: Upload macOS artifact
         if: matrix.os == 'macos-latest'
         uses: actions/upload-artifact@v4
         with:
           name: Vulcan-macOS
           if-no-files-found: error
-          path: |
-            vulcan-app/electron-dist/*.dmg
-            vulcan-app/electron-dist/*.dmg.sha256
+          path: vulcan-app/electron-dist/Vulcan.dmg
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
@@ -159,6 +160,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+
     steps:
       - name: Download build artifacts
         uses: actions/download-artifact@v4
@@ -166,9 +168,44 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      - name: Prepare release description
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for asset in \
+            Vulcan.AppImage \
+            Vulcan-Setup.exe \
+            Vulcan.dmg
+          do
+            test -f "artifacts/$asset"
+          done
+
+          {
+            echo '### SHA-256'
+            echo
+            echo '| Asset | SHA-256 |'
+            echo '| --- | --- |'
+
+            for asset in \
+              Vulcan.AppImage \
+              Vulcan-Setup.exe \
+              Vulcan.dmg
+            do
+              hash="$(sha256sum "artifacts/$asset" | awk '{print $1}')"
+              printf '| `%s` | `%s` |\n' "$asset" "$hash"
+            done
+
+            echo
+          } > release-body.md
+
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
+          body_path: release-body.md
           fail_on_unmatched_files: true
-          files: artifacts/**/*
+          files: |
+            artifacts/Vulcan.AppImage
+            artifacts/Vulcan-Setup.exe
+            artifacts/Vulcan.dmg

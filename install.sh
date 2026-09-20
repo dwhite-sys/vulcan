@@ -17,9 +17,8 @@ SERVER_SOURCE_EXPLICIT=0
 JSON_MODE=0
 RELEASE_TAG="${VULCAN_RELEASE_TAG:-latest}"
 APPIMAGE_URL_OVERRIDE="${VULCAN_APPIMAGE_URL:-}"
-APPIMAGE_SHA256_URL_OVERRIDE="${VULCAN_APPIMAGE_SHA256_URL:-}"
-SERVER_BUNDLE_URL_OVERRIDE="${VULCAN_SERVER_BUNDLE_URL:-}"
-SERVER_BUNDLE_SHA256_URL_OVERRIDE="${VULCAN_SERVER_BUNDLE_SHA256_URL:-}"
+APPIMAGE_SHA256_OVERRIDE="${VULCAN_APPIMAGE_SHA256:-}"
+SOURCE_TARBALL_URL_OVERRIDE="${VULCAN_SOURCE_TARBALL_URL:-}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -122,10 +121,11 @@ download_file() {
     wget -qO "$dest" "$url"
   fi
 }
-verify_sha256_file() {
-  local file="$1" checksum_file="$2" expected actual
-  expected="$(awk 'NF {print $1; exit}' "$checksum_file" | tr '[:upper:]' '[:lower:]')"
-  [[ "$expected" =~ ^[0-9a-f]{64}$ ]] || fail "Downloaded checksum is malformed"
+verify_sha256() {
+  local file="$1" expected="${2,,}" actual
+  expected="${expected#sha256:}"
+  [[ "$expected" =~ ^[0-9a-f]{64}$ ]] || fail "Expected SHA-256 is malformed"
+
   if have sha256sum; then
     actual="$(sha256sum "$file" | awk '{print $1}')"
   elif have shasum; then
@@ -135,7 +135,67 @@ verify_sha256_file() {
   else
     fail "sha256sum, shasum, or openssl is required to verify downloaded Vulcan artifacts"
   fi
-  [[ "${actual,,}" == "$expected" ]] || fail "Downloaded Vulcan artifact checksum verification failed"
+
+  [[ "${actual,,}" == "$expected" ]] \
+    || fail "Downloaded Vulcan artifact checksum verification failed"
+}
+
+release_api_url() {
+  if [[ "$RELEASE_TAG" == "latest" ]]; then
+    printf '%s' 'https://api.github.com/repos/dwhite-sys/vulcan/releases/latest'
+  else
+    printf 'https://api.github.com/repos/dwhite-sys/vulcan/releases/tags/%s' "$RELEASE_TAG"
+  fi
+}
+
+release_metadata() {
+  local metadata
+  metadata="$(download_stdout "$(release_api_url)")" \
+    || fail "Could not read Vulcan release metadata for $RELEASE_TAG"
+  printf '%s\n' "$metadata"
+}
+
+resolve_release_tag() {
+  if [[ "$RELEASE_TAG" != "latest" ]]; then
+    printf '%s' "$RELEASE_TAG"
+    return
+  fi
+
+  local metadata line
+  metadata="$(release_metadata)"
+
+  while IFS= read -r line; do
+    if [[ "$line" =~ \"tag_name\"[[:space:]]*:[[:space:]]*\"([^\"]+)\" ]]; then
+      printf '%s' "${BASH_REMATCH[1]}"
+      return
+    fi
+  done <<< "$metadata"
+
+  fail "GitHub release metadata did not contain a release tag"
+}
+
+release_asset_digest() {
+  local asset="$1" metadata line found=0
+  metadata="$(release_metadata)"
+
+  while IFS= read -r line; do
+    if [[ "$line" == *"\"name\": \"$asset\""* ]]; then
+      found=1
+      continue
+    fi
+
+    if [[ "$found" -eq 1 ]] \
+      && [[ "$line" =~ \"digest\"[[:space:]]*:[[:space:]]*\"sha256:([0-9A-Fa-f]{64})\" ]]; then
+      printf '%s' "${BASH_REMATCH[1],,}"
+      return
+    fi
+
+    if [[ "$found" -eq 1 && "$line" == *"}"* ]]; then
+      found=0
+    fi
+  done <<< "$metadata"
+
+  fail "GitHub release metadata did not contain a SHA-256 digest for $asset"
 }
 
 release_asset_url() {
@@ -148,40 +208,73 @@ release_asset_url() {
 }
 
 standalone_server_bootstrap() {
-  [[ "$OS" == "Linux" ]] || fail "--server-only network bootstrap currently supports native Linux"
+  [[ "$OS" == "Linux" ]] \
+    || fail "--server-only network bootstrap currently supports native Linux"
+
   ensure_downloader
   have tar || fail "tar is required for --server-only"
 
-  local tmp_bundle tmp_sum extract_root bundle_url sum_url packaged_installer resources result
-  tmp_bundle="$(mktemp "${TMPDIR:-/tmp}/vulcan-server.XXXXXX.tar.gz")"
-  tmp_sum="$(mktemp "${TMPDIR:-/tmp}/vulcan-server-sha.XXXXXX")"
-  extract_root="$(mktemp -d "${TMPDIR:-/tmp}/vulcan-server-extract.XXXXXX")"
-  trap 'rm -f "${tmp_bundle:-}" "${tmp_sum:-}"; rm -rf "${extract_root:-}"' EXIT
+  local resolved_tag source_url tmp_source extract_root source_root
+  local packaged_installer result
 
-  bundle_url="${SERVER_BUNDLE_URL_OVERRIDE:-$(release_asset_url Vulcan-Server.tar.gz)}"
-  sum_url="${SERVER_BUNDLE_SHA256_URL_OVERRIDE:-$(release_asset_url Vulcan-Server.tar.gz.sha256)}"
+  resolved_tag="$(resolve_release_tag)"
+  source_url="${SOURCE_TARBALL_URL_OVERRIDE:-https://api.github.com/repos/dwhite-sys/vulcan/tarball/$resolved_tag}"
 
-  say "Downloading Vulcan headless server bundle (${RELEASE_TAG})"
-  download_file "$bundle_url" "$tmp_bundle" || fail "Could not download Vulcan server bundle from $bundle_url"
-  download_file "$sum_url" "$tmp_sum" || fail "Could not download Vulcan server bundle checksum from $sum_url"
-  verify_sha256_file "$tmp_bundle" "$tmp_sum"
+  tmp_source="$(mktemp "${TMPDIR:-/tmp}/vulcan-source.XXXXXX.tar.gz")"
+  extract_root="$(mktemp -d "${TMPDIR:-/tmp}/vulcan-source-extract.XXXXXX")"
 
-  tar -xzf "$tmp_bundle" -C "$extract_root" || fail "Could not extract the Vulcan server bundle"
-  packaged_installer="$extract_root/install.sh"
-  resources="$extract_root"
-  [[ -f "$packaged_installer" ]] || fail "The Vulcan server bundle does not contain install.sh"
-  [[ -d "$resources/vulcan-server" ]] || fail "The Vulcan server bundle does not contain the server payload"
-  [[ -f "$resources/server-payload.sha256" ]] || fail "The Vulcan server bundle does not contain the server payload hash"
+  trap 'rm -f "${tmp_source:-}"; rm -rf "${extract_root:-}"' EXIT
+
+  say "Downloading Vulcan source for ${resolved_tag}"
+  download_file "$source_url" "$tmp_source" \
+    || fail "Could not download Vulcan source archive from $source_url"
+
+  tar -xzf "$tmp_source" -C "$extract_root" \
+    || fail "Could not extract the Vulcan source archive"
+
+  source_root="$(
+    find "$extract_root" -mindepth 1 -maxdepth 1 -type d -print -quit
+  )"
+
+  [[ -n "$source_root" ]] \
+    || fail "Vulcan source archive did not contain a repository root"
+
+  packaged_installer="$source_root/install.sh"
+
+  [[ -f "$packaged_installer" ]] \
+    || fail "Vulcan source archive does not contain install.sh"
+
+  [[ -f "$source_root/vulcan/pyproject.toml" ]] \
+    || fail "Vulcan source archive does not contain the server package"
+
+  # Match the packaged server payload: tests and repository-only backlog material
+  # are useful in source archives but need not become persistent runtime payload.
+  rm -rf "$source_root/vulcan/tests"
+  rm -f "$source_root/vulcan/SERVER_MANAGEMENT_UI_BACKLOG.md"
 
   say "Converging headless Vulcan server"
-  local cmd=(/bin/bash "$packaged_installer" --server-only --server-source "$resources/vulcan-server" --server-hash-file "$resources/server-payload.sha256" --version "$VERSION")
+
+  local cmd=(
+    /bin/bash "$packaged_installer"
+    --server-only
+    --server-source "$source_root/vulcan"
+    --version "${resolved_tag#v}"
+  )
+
   [[ "$JSON_MODE" -eq 1 ]] && cmd+=(--json)
-  if "${cmd[@]}"; then result=0; else result=$?; fi
+
+  if "${cmd[@]}"; then
+    result=0
+  else
+    result=$?
+  fi
+
   [[ "$result" -eq 0 ]] || exit "$result"
 
-  rm -f "$tmp_bundle" "$tmp_sum"
+  rm -f "$tmp_source"
   rm -rf "$extract_root"
   trap - EXIT
+
   say "Vulcan server is installed and supervised by systemd."
 }
 
@@ -190,20 +283,25 @@ standalone_linux_bootstrap() {
   ensure_downloader
 
   local app_home="$APP_DATA_HOME/app" installed="$APP_DATA_HOME/app/Vulcan.AppImage"
-  local tmp_app tmp_sum extract_root resources packaged_installer app_url sum_url result
+  local tmp_app extract_root resources packaged_installer app_url expected_sha result
   mkdir -p "$app_home"
   tmp_app="$(mktemp "${TMPDIR:-/tmp}/vulcan-appimage.XXXXXX")"
-  tmp_sum="$(mktemp "${TMPDIR:-/tmp}/vulcan-appimage-sha.XXXXXX")"
   extract_root="$(mktemp -d "${TMPDIR:-/tmp}/vulcan-appimage-extract.XXXXXX")"
-  trap 'rm -f "${tmp_app:-}" "${tmp_sum:-}"; rm -rf "${extract_root:-}"' EXIT
+  trap 'rm -f "${tmp_app:-}"; rm -rf "${extract_root:-}"' EXIT
 
   app_url="${APPIMAGE_URL_OVERRIDE:-$(release_asset_url Vulcan.AppImage)}"
-  sum_url="${APPIMAGE_SHA256_URL_OVERRIDE:-$(release_asset_url Vulcan.AppImage.sha256)}"
+
+  if [[ -n "$APPIMAGE_SHA256_OVERRIDE" ]]; then
+    expected_sha="$APPIMAGE_SHA256_OVERRIDE"
+  elif [[ -n "$APPIMAGE_URL_OVERRIDE" ]]; then
+    fail "Custom VULCAN_APPIMAGE_URL requires VULCAN_APPIMAGE_SHA256"
+  else
+    expected_sha="$(release_asset_digest Vulcan.AppImage)"
+  fi
 
   say "Downloading Vulcan AppImage (${RELEASE_TAG})"
-  download_file "$app_url" "$tmp_app" || fail "Could not download Vulcan AppImage from $app_url"
-  download_file "$sum_url" "$tmp_sum" || fail "Could not download Vulcan AppImage checksum from $sum_url"
-  verify_sha256_file "$tmp_app" "$tmp_sum"
+  download_file "$app_url" "$tmp_app"     || fail "Could not download Vulcan AppImage from $app_url"
+  verify_sha256 "$tmp_app" "$expected_sha"
   chmod 0755 "$tmp_app"
 
   # The release artifact is the source of truth. Extract its bundled resources
@@ -233,7 +331,7 @@ standalone_linux_bootstrap() {
   fi
   [[ "$result" -eq 0 ]] || exit "$result"
 
-  rm -f "$tmp_app" "$tmp_sum"
+  rm -f "$tmp_app"
   rm -rf "$extract_root"
   trap - EXIT
   say "Vulcan is installed at $installed"
@@ -701,10 +799,11 @@ PLIST
 #   Desktop Linux: curl -fsSL https://raw.githubusercontent.com/dwhite-sys/vulcan/main/install.sh | bash
 #   Headless:      curl -fsSL https://raw.githubusercontent.com/dwhite-sys/vulcan/main/install.sh | bash -s -- --server-only
 #
-# The desktop path downloads and verifies the AppImage, then delegates to the
-# converger embedded in that artifact. --server-only downloads a small release
-# bundle containing only this converger + the Vulcan server payload; it never
-# installs Electron, a .desktop entry, an icon, or desktop autostart integration.
+# The desktop path downloads the AppImage, verifies it against GitHub's release
+# asset SHA-256 digest, then delegates to the converger embedded in that artifact.
+# --server-only downloads the selected release's GitHub source archive and invokes
+# that tag's installer against only its Vulcan server package; it never installs
+# Electron, a .desktop entry, an icon, or desktop autostart integration.
 # Explicit --server-source/--guest modes bypass both network bootstrap wrappers.
 if [[ "$SERVER_ONLY" -eq 1 && "$FROM_APP" -eq 0 && -z "$GUEST" && "$SERVER_SOURCE_EXPLICIT" -eq 0 && -z "$RESOURCES_DIR" ]]; then
   standalone_server_bootstrap

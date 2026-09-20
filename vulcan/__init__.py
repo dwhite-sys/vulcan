@@ -1,1 +1,0 @@
-# Vulcan — LLM orchestration server

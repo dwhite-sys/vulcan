@@ -12,7 +12,7 @@ const pkg = JSON.parse(read(path.join(appRoot, 'package.json')));
 assert.deepEqual(pkg.build.linux.target, ['AppImage']);
 assert.equal(
   pkg.build.toolsets?.appimage,
-  '1.0.3',
+  '1.0.2',
   'Linux AppImage must use the static runtime so host FUSE2 is not required',
 );
 assert.deepEqual(pkg.build.win.target, ['nsis']);

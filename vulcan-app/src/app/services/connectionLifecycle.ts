@@ -54,7 +54,8 @@ export function installConnectionLifecycle(): Cleanup {
   // powerMonitor is main-process-only; preload forwards only the semantic
   // "connection may be stale" event, keeping Electron details out of WS logic.
   const electronAPI = (window as any).electronAPI;
-  if (typeof electronAPI?.onConnectionMayBeStale === 'function') {
+  const isElectronDesktop = typeof electronAPI?.onConnectionMayBeStale === 'function';
+  if (isElectronDesktop) {
     const dispose = electronAPI.onConnectionMayBeStale(() => { void verifyConnection(); });
     if (typeof dispose === 'function') cleanups.push(dispose);
   }
@@ -88,14 +89,15 @@ export function installConnectionLifecycle(): Cleanup {
   cleanups.push(() => window.removeEventListener('online', onOnline));
 
   // Heartbeats are both server-observable proof-of-life and a browser suspend
-  // detector. Background/sleep may freeze timers; a large jump means "verify
-  // now" rather than "the socket is definitely dead."
+  // detector. A hidden Electron window is still an active desktop client: it may
+  // be relaying client-POV provider/Etna traffic and receiving server-run pushes.
+  // Plain web/mobile renderers may still reduce background work while hidden.
   let lastTick = Date.now();
   const heartbeat = window.setInterval(() => {
     const now = Date.now();
     const gap = now - lastTick;
     lastTick = now;
-    if (gap >= TIMER_GAP_MS || document.visibilityState === 'visible') {
+    if (isElectronDesktop || gap >= TIMER_GAP_MS || document.visibilityState === 'visible') {
       void verifyConnection();
     }
   }, HEARTBEAT_MS);

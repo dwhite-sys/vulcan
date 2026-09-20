@@ -117,14 +117,4 @@ async function ensurePackagedRuntime({ app, dialog, shell }) {
   return { ok: true, ...result };
 }
 
-function relaunchInstalledLinuxApp({ app, relaunchPath }) {
-  if (process.platform !== 'linux' || !relaunchPath) return false;
-  const args = process.argv.includes('--hidden') ? ['--hidden'] : [];
-  // app.relaunch schedules the installed AppImage after this process exits,
-  // avoiding a race with Electron's single-instance lock.
-  app.relaunch({ execPath: relaunchPath, args });
-  app.exit(0);
-  return true;
-}
-
-module.exports = { ensurePackagedRuntime, relaunchInstalledLinuxApp, parseResult };
+module.exports = { ensurePackagedRuntime, parseResult };

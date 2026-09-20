@@ -579,8 +579,10 @@ DESKTOP
 }
 
 linux_converge() {
-  local relaunch="" relogin=0
-  if [[ -z "$GUEST" && "$SERVER_ONLY" -eq 0 ]]; then relaunch="$(install_linux_desktop)"; fi
+  local relogin=0
+  # Persist/update the stable AppImage and desktop metadata for future launches,
+  # but keep the Electron process the user actually opened as this first session.
+  if [[ -z "$GUEST" && "$SERVER_ONLY" -eq 0 ]]; then install_linux_desktop >/dev/null; fi
   ensure_vulcan_runtime
   # Etna is deliberately host-side. On native headless Linux, the host is also
   # the server machine, so the same Etna + kit runtime is retained.
@@ -603,9 +605,9 @@ linux_converge() {
   ensure_vulcan_service_linux
   if [[ "$relogin" == 0 ]] && ! wait_server; then fail "Vulcan server did not become healthy on port 8468"; fi
 
-  # Only relaunch when the current AppImage is not already the installed copy.
-  if [[ -n "$relaunch" && -n "$APP_PATH" && "$(readlink -f "$APP_PATH")" == "$(readlink -f "$relaunch")" ]]; then relaunch=""; fi
-  emit_ok "$relaunch" "$relogin"
+  # Successful desktop convergence continues in the launching Electron process.
+  # The persisted AppImage is used naturally by later desktop/app-menu launches.
+  emit_ok "" "$relogin"
 }
 
 macos_host_converge() {

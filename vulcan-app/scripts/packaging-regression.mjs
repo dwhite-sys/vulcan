@@ -58,7 +58,26 @@ assert.match(coordinator, /process\.resourcesPath/);
 assert.match(coordinator, /app\.moveToApplicationsFolder\(\)/);
 assert.match(coordinator, /powershell\.exe/);
 assert.match(coordinator, /install\.sh/);
-assert.match(coordinator, /app\.relaunch\(\{ execPath: relaunchPath, args \}\)/);
+assert.doesNotMatch(
+  coordinator,
+  /app\.relaunch/,
+  'Linux first-run installation must not kill and relaunch Electron',
+);
+assert.doesNotMatch(
+  main,
+  /relaunchInstalledLinuxApp/,
+  'Linux first run must continue in the launching Electron process',
+);
+assert.match(
+  main,
+  /backgroundThrottling:\s*false/,
+  'tray-hidden Electron must keep renderer transport and relay work live',
+);
+assert.match(
+  main,
+  /const repair = await ensurePackagedRuntime[\s\S]*const win = createWindow\(\)/,
+  'the visible application window must be created only after runtime convergence',
+);
 
 const shell = read(path.join(root, 'install.sh'));
 for (const marker of ['ensure_uv()', 'ensure_python()', 'ensure_etna()', 'ensure_vulcan_runtime()', 'ensure_docker_linux()', 'ensure_vulcan_service_linux()']) {
@@ -68,6 +87,11 @@ assert.match(shell, /pacman -S --needed --noconfirm docker/);
 assert.match(shell, /Keep Etna native on macOS/);
 assert.match(shell, /colima start vulcan --runtime docker/);
 assert.match(shell, /VULCAN_RESULT=/);
+assert.match(
+  shell,
+  /install_linux_desktop >\/dev\/null/,
+  'Linux must persist its stable AppImage without forcing a process handoff',
+);
 assert.match(shell, /standalone_linux_bootstrap\(\)/);
 assert.match(shell, /releases\/latest\/download\/%s/);
 assert.match(shell, /Vulcan\.AppImage\.sha256/);

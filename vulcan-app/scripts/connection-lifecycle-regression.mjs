@@ -10,12 +10,24 @@ assert.match(lifecycle, /PLATFORM TOPOLOGY[\s\S]*Electron desktop[\s\S]*Capacito
   'The three-platform lifecycle topology must remain documented next to the adapter');
 assert.match(main, /powerMonitor\.on\('resume'/,
   'Electron OS resume must proactively mark the connection suspect');
+assert.match(main, /backgroundThrottling:\s*false/,
+  'hiding the Electron window must not throttle renderer-owned transport or relays');
 assert.match(preload, /onConnectionMayBeStale/,
   'Electron preload must expose only the semantic lifecycle hint');
 assert.match(lifecycle, /appStateChange[\s\S]*isActive/,
   'Capacitor foregrounding must proactively verify the connection');
 assert.match(lifecycle, /visibilitychange[\s\S]*pageshow[\s\S]*TIMER_GAP_MS/,
   'Web lifecycle must use visibility/pageshow plus timer discontinuity fallback');
+assert.match(
+  lifecycle,
+  /const isElectronDesktop = typeof electronAPI\?\.onConnectionMayBeStale === 'function'/,
+  'the lifecycle adapter must distinguish a tray-capable Electron renderer from an ordinary hidden web page',
+);
+assert.match(
+  lifecycle,
+  /if \(isElectronDesktop \|\| gap >= TIMER_GAP_MS \|\| document\.visibilityState === 'visible'\)/,
+  'Electron proof-of-life must continue while the BrowserWindow is hidden',
+);
 assert.match(lifecycle, /ensureConnected\(\{ reconfirm: true \}\)/,
   'All lifecycle paths must converge on the same reconfirmation routine');
 assert.match(ws, /if \(this\.recoveryPromise && this\.recoveryGeneration === generation\) return this\.recoveryPromise/,

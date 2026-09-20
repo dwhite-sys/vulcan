@@ -4,7 +4,7 @@ const fs = require('fs');
 const os = require('os');
 const { createSecurePasswordStore, registerSecurePasswordIpc } = require('./securePasswordStore.cjs');
 const { createSemanticToolCacheStore, registerSemanticToolCacheIpc } = require('./semanticToolCacheStore.cjs');
-const { ensurePackagedRuntime, relaunchInstalledLinuxApp } = require('./installCoordinator.cjs');
+const { ensurePackagedRuntime } = require('./installCoordinator.cjs');
 
 const isDev = process.env.NODE_ENV === 'development';
 
@@ -369,6 +369,10 @@ function createWindow() {
       nodeIntegration: false,
       contextIsolation: true,
       preload: path.join(__dirname, 'preload.cjs'),
+      // Closing Vulcan hides this BrowserWindow; it does not suspend the desktop
+      // client. General WS, client-POV inference/Etna relays, and run updates must
+      // remain fully live while the UI is in the tray.
+      backgroundThrottling: false,
       webviewTag: true, // beta Design: isolated guest web surface with selector preload
       // Pin localStorage to a stable partition based on userData path,
       // not the URL origin — this prevents data loss when switching between
@@ -563,7 +567,6 @@ app.whenReady().then(async () => {
     app.exit(0);
     return;
   }
-  if (repair?.relaunchPath && relaunchInstalledLinuxApp({ app, relaunchPath: repair.relaunchPath })) return;
   if (repair?.ok === false) {
     dialog.showErrorBox('Vulcan repair failed', repair.message || 'Vulcan could not repair its local runtime.');
     app.exit(1);

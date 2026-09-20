@@ -99,9 +99,18 @@ html,body{
   height:8px;
   margin-top:13px;
   border-radius:999px;
-  background:var(--bar);
+  background:#242528;
   border:1px solid #202123;
   overflow:hidden;
+}
+
+.fill{
+  height:100%;
+  width:0%;
+  overflow:hidden;
+  border-radius:inherit;
+  background:var(--bar);
+  transition:width .24s ease;
 }
 
 .stripes{
@@ -157,13 +166,13 @@ html,body{
 }
 
 .drawer.open{
-  max-height:230px;
+  max-height:266px;
   opacity:1;
   border-top-width:1px;
 }
 
 .drawer-inner{
-  padding:12px 17px 15px;
+  padding:14px 17px 18px;
 }
 
 .steps{
@@ -216,21 +225,34 @@ html,body{
 }
 
 .log{
-  margin-top:10px;
-  height:60px;
-  overflow:auto;
+  margin-top:12px;
+  height:120px;
+  overflow-y:auto;
+  overflow-x:hidden;
   border:1px solid #25272b;
   border-radius:7px;
   background:#0e1012;
   color:#757b82;
-  padding:8px 9px;
-  font:8.5px/1.45 "Cascadia Code","SFMono-Regular",Consolas,monospace;
+  padding:12px 14px 14px;
+  font:8.5px/1.55 "Cascadia Code","SFMono-Regular",Consolas,monospace;
   white-space:pre-wrap;
+  scrollbar-width:none;
+  -ms-overflow-style:none;
+}
+
+.log::-webkit-scrollbar{
+  width:0;
+  height:0;
+  display:none;
 }
 
 .complete .progress{
-  background:var(--green);
   border-color:rgba(98,201,157,.35);
+}
+
+.complete .fill{
+  width:100% !important;
+  background:var(--green);
 }
 
 .complete .stripes{
@@ -281,7 +303,9 @@ html,body{
     </div>
 
     <div class="progress">
-      <div class="stripes"></div>
+      <div class="fill" id="progressFill">
+        <div class="stripes"></div>
+      </div>
     </div>
 
     <div class="bottom">
@@ -309,8 +333,12 @@ const phases = [
 ];
 
 const state = new Map(phases.map((phase) => [phase.key, 'waiting']));
-state.set('checking', 'active');
+const groupTotals = new Map();
+const taskStates = new Map();
 
+let structuredPlan = false;
+let totalIndividualTasks = 0;
+let latestDoneTask = 0;
 let activeKey = 'checking';
 let detailsOpen = false;
 
@@ -324,6 +352,7 @@ const drawer = document.getElementById('drawer');
 const link = document.getElementById('detailsLink');
 const steps = document.getElementById('steps');
 const log = document.getElementById('log');
+const progressFill = document.getElementById('progressFill');
 
 function stamp(){
   return new Date().toLocaleTimeString([], { hour12:false });
@@ -352,7 +381,80 @@ function renderSteps(){
   }
 }
 
+function updateProgress(){
+  if (structuredPlan){
+    latestDoneTask = [...taskStates.values()].filter(
+      (task) => task === 'done' || task === 'skipped'
+    ).length;
+  }
+
+  const ratio = totalIndividualTasks > 0
+    ? latestDoneTask / totalIndividualTasks
+    : 0;
+
+  progressFill.style.width =
+    `${Math.max(0, Math.min(1, ratio)) * 100}%`;
+}
+
+function recomputeGroup(group){
+  const expected = Number(groupTotals.get(group) || 0);
+  const entries = [...taskStates.entries()]
+    .filter(([key]) => key.startsWith(`${group}:`))
+    .map(([, value]) => value);
+  const completed = entries.filter(
+    (value) => value === 'done' || value === 'skipped'
+  ).length;
+
+  if (expected > 0 && completed >= expected) state.set(group, 'done');
+  else if (entries.length > 0) state.set(group, 'active');
+  else state.set(group, 'waiting');
+}
+
+function applyPlan(payload){
+  structuredPlan = true;
+  taskStates.clear();
+  groupTotals.clear();
+  totalIndividualTasks = Number(payload?.total || 0);
+  latestDoneTask = 0;
+
+  for (const phase of phases){
+    state.set(phase.key, 'waiting');
+    groupTotals.set(
+      phase.key,
+      Number(payload?.groups?.[phase.key] || 0),
+    );
+  }
+
+  renderSteps();
+  updateProgress();
+}
+
+function applyTask(payload){
+  const group = String(payload?.group || '');
+  const id = String(payload?.id || '');
+  const taskState = String(payload?.state || '');
+
+  if (!state.has(group) || !id) return;
+  if (!['running', 'done', 'skipped'].includes(taskState)) return;
+
+  taskStates.set(`${group}:${id}`, taskState);
+  recomputeGroup(group);
+
+  if (taskState === 'running'){
+    activeKey = group;
+    if (payload.title) title.textContent = payload.title;
+    if (payload.detail || payload.label){
+      sub.textContent = payload.detail || payload.label;
+    }
+  }
+
+  renderSteps();
+  updateProgress();
+}
+
 function activateStage(payload){
+  if (structuredPlan) return;
+
   const key = String(payload?.key || '');
   if (!state.has(key)) return;
 
@@ -366,11 +468,21 @@ function activateStage(payload){
   if (payload.title) title.textContent = payload.title;
   if (payload.detail) sub.textContent = payload.detail;
 
+  totalIndividualTasks = phases.length;
+  latestDoneTask = phases.filter(
+    (phase) => state.get(phase.key) === 'done'
+  ).length;
+
   renderSteps();
+  updateProgress();
 }
 
 function complete(){
   for (const phase of phases) state.set(phase.key, 'done');
+
+  if (!totalIndividualTasks) totalIndividualTasks = phases.length;
+  latestDoneTask = totalIndividualTasks;
+  progressFill.style.width = '100%';
 
   renderSteps();
 
@@ -390,11 +502,23 @@ link.addEventListener('click', () => {
   window.vulcanSetup?.setDetailsOpen(detailsOpen);
 });
 
+state.set('checking', 'active');
 renderSteps();
+updateProgress();
 appendLog('Beginning Vulcan convergence.');
 
 window.vulcanSetup?.onProgress((payload) => {
   if (!payload || typeof payload !== 'object') return;
+
+  if (payload.type === 'plan'){
+    applyPlan(payload);
+    return;
+  }
+
+  if (payload.type === 'task'){
+    applyTask(payload);
+    return;
+  }
 
   if (payload.type === 'stage'){
     activateStage(payload);

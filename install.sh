@@ -36,7 +36,11 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-say() { printf 'Vulcan: %s\n' "$*" >&2; }
+say() {
+  if [[ "${CLI_PROGRESS_ACTIVE:-0}" -eq 1 ]]; then return 0; fi
+  printf 'Vulcan: %s\n' "$*" >&2
+}
+support() { printf '%s\n' "$*" >&2; }
 warn() { printf 'Vulcan warning: %s\n' "$*" >&2; }
 fail() {
   local msg="$*"
@@ -65,6 +69,148 @@ emit_ok() {
   fi
 }
 have() { command -v "$1" >/dev/null 2>&1; }
+
+PROGRESS_TOTAL=0
+PROGRESS_DONE=0
+PROGRESS_COMPLETED='|'
+PROGRESS_LAST_GROUP=''
+CLI_PROGRESS_ACTIVE=0
+DOCKER_RELOGIN=0
+CLI_LIGHT_GREEN=''
+CLI_GREEN=''
+CLI_LIGHT_GREY=''
+CLI_GREY=''
+CLI_LIGHT_BLUE=''
+CLI_RESET=''
+
+progress_group_label() {
+  case "$1" in
+    checking) printf '%s' 'Checking installation' ;;
+    python) printf '%s' 'Preparing Python' ;;
+    server) printf '%s' 'Installing server' ;;
+    etna) printf '%s' 'Checking Etna' ;;
+    workspace) printf '%s' 'Preparing workspace' ;;
+    services) printf '%s' 'Starting services' ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+progress_is_complete() {
+  case "$PROGRESS_COMPLETED" in
+    *"|$1|"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+cli_clear_progress() {
+  [[ "$CLI_PROGRESS_ACTIVE" -eq 1 && -t 2 ]] || return 0
+  printf '\r\033[2K' >&2
+}
+
+cli_render_progress() {
+  [[ "$CLI_PROGRESS_ACTIVE" -eq 1 && -t 2 ]] || return 0
+  [[ "$PROGRESS_TOTAL" -gt 0 ]] || return 0
+  local filled empty pct fill_text='' empty_text=''
+  filled=$(( PROGRESS_DONE * 50 / PROGRESS_TOTAL ))
+  empty=$(( 50 - filled ))
+  pct=$(( PROGRESS_DONE * 100 / PROGRESS_TOTAL ))
+  printf -v fill_text '%*s' "$filled" ''
+  printf -v empty_text '%*s' "$empty" ''
+  fill_text="${fill_text// /█}"
+  empty_text="${empty_text// /░}"
+  printf '\r\033[2K%s%s%s%s%s (%d/%d) (%d%%)' \
+    "$CLI_LIGHT_GREEN" "$fill_text" "$CLI_GREEN" "$empty_text" "$CLI_RESET" \
+    "$PROGRESS_DONE" "$PROGRESS_TOTAL" "$pct" >&2
+}
+
+cli_section() {
+  [[ "$CLI_PROGRESS_ACTIVE" -eq 1 ]] || return 0
+  local group="$1"
+  [[ "$group" != "$PROGRESS_LAST_GROUP" ]] || return 0
+  cli_clear_progress
+  printf '%s%s%s\n' "$CLI_GREY" "$(progress_group_label "$group")" "$CLI_RESET" >&2
+  PROGRESS_LAST_GROUP="$group"
+}
+
+progress_plan() {
+  local total="$1" checking="$2" python="$3" server="$4"
+  local etna="$5" workspace="$6" services="$7"
+  PROGRESS_TOTAL="$total"
+  PROGRESS_DONE=0
+  PROGRESS_COMPLETED='|'
+  PROGRESS_LAST_GROUP=''
+
+  if [[ "$JSON_MODE" -eq 1 ]]; then
+    printf 'VULCAN_PROGRESS={"type":"plan","total":%d,"groups":{"checking":%d,"python":%d,"server":%d,"etna":%d,"workspace":%d,"services":%d}}\n' \
+      "$total" "$checking" "$python" "$server" "$etna" "$workspace" "$services" >&2
+    return
+  fi
+
+  if [[ "$SERVER_ONLY" -eq 1 && -z "$GUEST" ]]; then
+    CLI_PROGRESS_ACTIVE=1
+    if [[ -t 2 && -z "${NO_COLOR:-}" ]]; then
+      CLI_LIGHT_GREEN=$'\033[92m'
+      CLI_GREEN=$'\033[32m'
+      CLI_LIGHT_GREY=$'\033[37m'
+      CLI_GREY=$'\033[90m'
+      CLI_LIGHT_BLUE=$'\033[94m'
+      CLI_RESET=$'\033[0m'
+    fi
+    cli_render_progress
+  fi
+}
+
+progress_task_start() {
+  local group="$1" id="$2" label="$3"
+  local key="$group:$id"
+  [[ "$PROGRESS_TOTAL" -gt 0 ]] || return 0
+  progress_is_complete "$key" && return 0
+
+  if [[ "$JSON_MODE" -eq 1 ]]; then
+    printf 'VULCAN_PROGRESS={"type":"task","group":%s,"id":%s,"state":"running","label":%s}\n' \
+      "$(python_json_string "$group")" "$(python_json_string "$id")" "$(python_json_string "$label")" >&2
+    return
+  fi
+
+  if [[ "$CLI_PROGRESS_ACTIVE" -eq 1 ]]; then
+    cli_section "$group"
+    cli_render_progress
+  fi
+}
+
+progress_task_finish() {
+  local group="$1" id="$2" state="$3" label="$4"
+  local key="$group:$id"
+  [[ "$PROGRESS_TOTAL" -gt 0 ]] || return 0
+  progress_is_complete "$key" && return 0
+  PROGRESS_COMPLETED="${PROGRESS_COMPLETED}${key}|"
+  PROGRESS_DONE=$(( PROGRESS_DONE + 1 ))
+
+  if [[ "$JSON_MODE" -eq 1 ]]; then
+    printf 'VULCAN_PROGRESS={"type":"task","group":%s,"id":%s,"state":%s,"label":%s}\n' \
+      "$(python_json_string "$group")" "$(python_json_string "$id")" \
+      "$(python_json_string "$state")" "$(python_json_string "$label")" >&2
+    return
+  fi
+
+  if [[ "$CLI_PROGRESS_ACTIVE" -eq 1 ]]; then
+    cli_section "$group"
+    cli_clear_progress
+    if [[ "$state" == skipped ]]; then
+      printf '  %s·%s  %s\n' "$CLI_LIGHT_GREY" "$CLI_RESET" "$label" >&2
+    else
+      printf '  %s✔%s  %s\n' "$CLI_LIGHT_GREEN" "$CLI_RESET" "$label" >&2
+    fi
+    cli_render_progress
+  fi
+}
+
+progress_conclusion() {
+  [[ "$CLI_PROGRESS_ACTIVE" -eq 1 ]] || return 0
+  cli_clear_progress
+  printf '%s[Vulcan]%s %s✔%s  %s\n' \
+    "$CLI_LIGHT_BLUE" "$CLI_RESET" "$CLI_LIGHT_GREEN" "$CLI_RESET" "$1" >&2
+}
 
 run_privileged() {
   if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
@@ -225,7 +371,7 @@ standalone_server_bootstrap() {
 
   trap 'rm -f "${tmp_source:-}"; rm -rf "${extract_root:-}"' EXIT
 
-  say "Downloading Vulcan source for ${resolved_tag}"
+  support "Downloading Vulcan source for ${resolved_tag}..."
   download_file "$source_url" "$tmp_source" \
     || fail "Could not download Vulcan source archive from $source_url"
 
@@ -252,7 +398,7 @@ standalone_server_bootstrap() {
   rm -rf "$source_root/vulcan/tests"
   rm -f "$source_root/vulcan/SERVER_MANAGEMENT_UI_BACKLOG.md"
 
-  say "Converging headless Vulcan server"
+  support "Converging headless Vulcan server..."
 
   local cmd=(
     /bin/bash "$packaged_installer"
@@ -275,7 +421,7 @@ standalone_server_bootstrap() {
   rm -rf "$extract_root"
   trap - EXIT
 
-  say "Vulcan server is installed and supervised by systemd."
+  : # converger emitted the final result line
 }
 
 standalone_linux_bootstrap() {
@@ -339,37 +485,52 @@ standalone_linux_bootstrap() {
 }
 
 ensure_uv() {
+  progress_task_start python uv "Checking uv runtime"
   if [[ -x "$BIN_HOME/uv" ]] && "$BIN_HOME/uv" --version >/dev/null 2>&1; then
+    progress_task_finish python uv skipped "uv runtime already ready"
     return
   fi
   say "Repairing uv runtime"
   ensure_downloader
   download_stdout https://astral.sh/uv/install.sh | env UV_UNMANAGED_INSTALL="$BIN_HOME" sh >/dev/null
   [[ -x "$BIN_HOME/uv" ]] || fail "uv installer completed without creating $BIN_HOME/uv"
+  progress_task_finish python uv done "uv runtime ready"
 }
 
 ensure_python() {
   ensure_uv
-  if "$BIN_HOME/uv" python find --managed-python 3.12 >/dev/null 2>&1; then return; fi
+  progress_task_start python python312 "Checking managed Python 3.12"
+  if "$BIN_HOME/uv" python find --managed-python 3.12 >/dev/null 2>&1; then
+    progress_task_finish python python312 skipped "Python 3.12 already ready"
+    return
+  fi
   say "Installing Vulcan-managed Python 3.12"
   "$BIN_HOME/uv" python install 3.12 >/dev/null
+  progress_task_finish python python312 done "Python 3.12 ready"
 }
 
 ensure_etna() {
   ensure_python
   local etna="$BIN_HOME/etna"
+  progress_task_start etna cli "Checking Etna CLI"
   if [[ ! -x "$etna" ]] || ! "$etna" --help >/dev/null 2>&1; then
     say "Repairing Etna"
     "$BIN_HOME/uv" tool install --force --python 3.12 etna-mcp >/dev/null
+    progress_task_finish etna cli done "Etna CLI ready"
+  else
+    progress_task_finish etna cli skipped "Etna CLI already ready"
   fi
   [[ -x "$etna" ]] || fail "Etna installation did not produce $etna"
 
   # Etna's own install command is state-convergent for its venv/service.
+  progress_task_start etna runtime "Converging Etna runtime"
   "$etna" install >/dev/null || fail "Etna self-repair failed"
+  progress_task_finish etna runtime done "Etna runtime ready"
 
   local py
   py="$($BIN_HOME/uv python find --managed-python 3.12)"
   for kit in web playwright ntfy; do
+    progress_task_start etna "kit-$kit" "Checking Etna kit: $kit"
     if ! "$py" - "$kit" <<'PY' >/dev/null 2>&1
 import json, pathlib, sys
 kit = sys.argv[1]
@@ -383,18 +544,25 @@ PY
     then
       say "Installing missing Etna kit: $kit"
       "$etna" install "$kit" >/dev/null
+      progress_task_finish etna "kit-$kit" done "Etna kit ready: $kit"
+    else
+      progress_task_finish etna "kit-$kit" skipped "Etna kit already ready: $kit"
     fi
   done
 
   # Keep the local Etna endpoint alive.  If the OS service already owns it,
   # `etna start` simply reports that it is running.
+  progress_task_start etna endpoint "Checking Etna endpoint"
   if ! "$py" - <<'PY' >/dev/null 2>&1
 import socket
 s=socket.socket(); s.settimeout(.4)
 raise SystemExit(0 if s.connect_ex(('127.0.0.1',8467)) == 0 else 1)
 PY
   then
-    "$etna" start >/dev/null || true
+    "$etna" start >/dev/null 2>&1 || true
+    progress_task_finish etna endpoint done "Etna endpoint started"
+  else
+    progress_task_finish etna endpoint skipped "Etna endpoint already running"
   fi
 
   # On native Linux, repair Etna's user-service environment so the service can
@@ -476,6 +644,8 @@ ensure_vulcan_runtime() {
   [[ -f "$installed_source/pyproject.toml" ]] && payload_ready=1
 
   if [[ "$current" == "$wanted" && "$healthy" -eq 1 && "$payload_ready" -eq 1 ]]; then
+    progress_task_finish server payload skipped "Server payload already current"
+    progress_task_finish server runtime skipped "Server runtime already healthy"
     return
   fi
 
@@ -490,6 +660,7 @@ ensure_vulcan_runtime() {
     installed_real="$(cd "$installed_source" && pwd -P)"
   fi
 
+  progress_task_start server payload "Synchronizing server payload"
   if [[ "$source_real" != "$installed_real" ]]; then
     staged_source="$PAYLOAD_HOME/.server.$$"
     rm -rf "$staged_source"
@@ -502,8 +673,12 @@ ensure_vulcan_runtime() {
 
     rm -rf "$installed_source"
     mv "$staged_source" "$installed_source"
+    progress_task_finish server payload done "Server payload synchronized"
+  else
+    progress_task_finish server payload skipped "Server payload already staged"
   fi
 
+  progress_task_start server runtime "Installing Vulcan server runtime"
   if [[ -n "$GUEST" || "$SERVER_ONLY" -eq 1 ]]; then
     run_privileged systemctl stop vulcan.service >/dev/null 2>&1 || true
   else
@@ -518,6 +693,7 @@ ensure_vulcan_runtime() {
   fi
 
   printf '%s\n' "$wanted" > "$SERVER_INSTALLED_HASH"
+  progress_task_finish server runtime done "Vulcan server runtime ready"
 }
 
 install_docker_linux_host() {
@@ -540,11 +716,17 @@ install_docker_linux_host() {
 }
 
 ensure_docker_linux() {
-  local relogin=0
-  if [[ -z "$GUEST" ]]; then install_docker_linux_host; fi
+  DOCKER_RELOGIN=0
+  local changed=0
+  progress_task_start workspace docker "Checking Docker"
+  if [[ -z "$GUEST" ]] && ! have docker; then
+    install_docker_linux_host
+    changed=1
+  fi
   have docker || fail "Docker Engine is not available"
 
   if ! docker info >/dev/null 2>&1; then
+    changed=1
     if [[ -z "$GUEST" ]]; then
       if have systemctl; then run_privileged systemctl enable --now docker.service >/dev/null || true; fi
 
@@ -560,14 +742,18 @@ ensure_docker_linux() {
       # A normal desktop process needs one fresh login session to inherit the new
       # supplementary group. A headless systemd service is a new process and gets
       # the durable group membership immediately, so --server-only can continue.
-      if [[ "$durable" -eq 1 && "$current" -eq 0 && "$SERVER_ONLY" -eq 0 ]]; then relogin=1; fi
+      if [[ "$durable" -eq 1 && "$current" -eq 0 && "$SERVER_ONLY" -eq 0 ]]; then DOCKER_RELOGIN=1; fi
     else
       # WSL/Colima guest provisioning is expected to have configured Docker.
       if have sudo; then sudo systemctl enable --now docker.service >/dev/null 2>&1 || true; fi
       docker info >/dev/null 2>&1 || fail "Docker Engine is installed in the Vulcan guest but is not usable"
     fi
   fi
-  printf '%s' "$relogin"
+  if [[ "$changed" -eq 1 ]]; then
+    progress_task_finish workspace docker done "Docker ready"
+  else
+    progress_task_finish workspace docker skipped "Docker already ready"
+  fi
 }
 
 ensure_vulcan_service_linux() {
@@ -678,9 +864,17 @@ DESKTOP
 
 linux_converge() {
   local relogin=0
+  progress_plan 15 1 2 2 6 2 2
+
   # Persist/update the stable AppImage and desktop metadata for future launches,
   # but keep the Electron process the user actually opened as this first session.
-  if [[ -z "$GUEST" && "$SERVER_ONLY" -eq 0 ]]; then install_linux_desktop >/dev/null; fi
+  progress_task_start checking integration "Checking installation"
+  if [[ -z "$GUEST" && "$SERVER_ONLY" -eq 0 ]]; then
+    install_linux_desktop >/dev/null
+    progress_task_finish checking integration done "Desktop integration ready"
+  else
+    progress_task_finish checking integration skipped "Desktop integration not required"
+  fi
   ensure_vulcan_runtime
   # Etna is deliberately host-side. On native headless Linux, the host is also
   # the server machine, so the same Etna + kit runtime is retained.
@@ -691,24 +885,43 @@ linux_converge() {
     run_privileged loginctl enable-linger "$USER" >/dev/null 2>&1 || true
     systemctl --user enable --now etna.service >/dev/null 2>&1 || true
   fi
-  relogin="$(ensure_docker_linux)"
+  ensure_docker_linux
+  relogin="$DOCKER_RELOGIN"
   # Build/repair the workspace image whenever Docker is usable. A headless install
   # can immediately adopt newly-added docker-group membership via `sg` instead of
   # forcing an SSH logout/login cycle.
+  progress_task_start workspace image "Preparing Docker workspace image"
   if docker info >/dev/null 2>&1; then
     say "Preparing Docker workspace image"
     "$RUNTIME/bin/vulcan" install --runtime-only >/dev/null
+    progress_task_finish workspace image done "Docker workspace image ready"
   elif [[ "$SERVER_ONLY" -eq 1 ]] && have sg && id -nG "$USER" | tr ' ' '\n' | grep -qx docker; then
     say "Preparing Docker workspace image"
     sg docker -c "$(printf '%q' "$RUNTIME/bin/vulcan") install --runtime-only" >/dev/null || fail "Could not prepare the Docker workspace image with the newly-added docker group"
+    progress_task_finish workspace image done "Docker workspace image ready"
+  else
+    progress_task_finish workspace image skipped "Workspace image deferred until session refresh"
   fi
+
+  progress_task_start services service "Starting Vulcan service"
   say "Starting Vulcan services"
   ensure_vulcan_service_linux
-  if [[ "$relogin" == 0 ]] && ! wait_server; then fail "Vulcan server did not become healthy on port 8468"; fi
+  progress_task_finish services service done "Vulcan service running"
+
+  progress_task_start services health "Checking Vulcan server health"
+  if [[ "$relogin" == 0 ]]; then
+    wait_server || fail "Vulcan server did not become healthy on port 8468"
+    progress_task_finish services health done "Vulcan server healthy on port 8468"
+  else
+    progress_task_finish services health skipped "Health check deferred until new login session"
+  fi
 
   # Successful desktop convergence continues in the launching Electron process.
   # The persisted AppImage is used naturally by later desktop/app-menu launches.
   emit_ok "" "$relogin"
+  if [[ "$SERVER_ONLY" -eq 1 && "$relogin" == 0 ]]; then
+    progress_conclusion "Vulcan server ready on http://localhost:8468"
+  fi
 }
 
 macos_host_converge() {

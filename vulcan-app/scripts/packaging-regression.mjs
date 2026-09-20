@@ -76,7 +76,7 @@ assert.match(
 );
 
 assert.match(setupWindow, /width: 560, height: 124/);
-assert.match(setupWindow, /width: 560, height: 300/);
+assert.match(setupWindow, /width: 560, height: 390/);
 assert.match(setupWindow, /SHOW_DELAY_MS = 400/);
 assert.match(setupWindow, /setContentSize\(size\.width, size\.height\)/);
 assert.match(setupPreload, /vulcan-setup-details/);

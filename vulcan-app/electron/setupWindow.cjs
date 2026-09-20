@@ -2,7 +2,7 @@ const { BrowserWindow, ipcMain } = require('electron');
 const path = require('path');
 
 const COLLAPSED = { width: 560, height: 124 };
-const EXPANDED = { width: 560, height: 300 };
+const EXPANDED = { width: 560, height: 390 };
 const SHOW_DELAY_MS = 400;
 const COMPLETE_HOLD_MS = 240;
 

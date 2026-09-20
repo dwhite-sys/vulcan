@@ -11,6 +11,17 @@ function parseResult(output) {
   return null;
 }
 
+function parseProgressLine(line) {
+  const value = String(line || '').trim();
+  if (!value.startsWith('VULCAN_PROGRESS=')) return null;
+  try {
+    const payload = JSON.parse(value.slice('VULCAN_PROGRESS='.length));
+    return payload && typeof payload === 'object' ? payload : null;
+  } catch {
+    return null;
+  }
+}
+
 const STAGE_COPY = {
   checking: {
     title: 'Preparing local runtime',
@@ -189,17 +200,36 @@ async function ensurePackagedRuntime({ app, dialog, shell, onProgress }) {
     }
   }
 
+  let sawStructuredProgress = false;
+
   const execution = await run(command, args, {
     onLine: (_stream, line) => {
       const clean = String(line || '').trimEnd();
       if (!clean) return;
 
-      if (!clean.startsWith('VULCAN_RESULT=')) {
-        reportProgress(onProgress, { type: 'log', line: clean });
+      const progress = parseProgressLine(clean);
+      if (progress) {
+        sawStructuredProgress = true;
+        if (progress.type === 'task' && progress.group) {
+          const copy = STAGE_COPY[progress.group] || {};
+          reportProgress(onProgress, {
+            ...progress,
+            title: copy.title,
+            detail: progress.label || copy.detail,
+          });
+        } else {
+          reportProgress(onProgress, progress);
+        }
+        return;
       }
 
-      const stage = installerStageForLine(clean);
-      if (stage) reportProgress(onProgress, stage);
+      if (clean.startsWith('VULCAN_RESULT=')) return;
+      reportProgress(onProgress, { type: 'log', line: clean });
+
+      if (!sawStructuredProgress) {
+        const stage = installerStageForLine(clean);
+        if (stage) reportProgress(onProgress, stage);
+      }
     },
   });
   const result = parseResult(execution.stdout);
@@ -244,7 +274,9 @@ async function ensurePackagedRuntime({ app, dialog, shell, onProgress }) {
     return { ok: true, quit: true, needsRelogin: true };
   }
 
-  reportProgress(onProgress, stagePayload('services'));
+  if (!sawStructuredProgress) {
+    reportProgress(onProgress, stagePayload('services'));
+  }
 
   if (process.platform === 'win32' || process.platform === 'darwin') {
     app.setLoginItemSettings({ openAtLogin: true, args: ['--hidden'] });
@@ -253,4 +285,4 @@ async function ensurePackagedRuntime({ app, dialog, shell, onProgress }) {
   return { ok: true, ...result };
 }
 
-module.exports = { ensurePackagedRuntime, parseResult };
+module.exports = { ensurePackagedRuntime, parseResult, parseProgressLine };

@@ -12,6 +12,21 @@ const pkg = JSON.parse(read(path.join(appRoot, 'package.json')));
 assert.deepEqual(pkg.build.linux.target, ['AppImage']);
 assert.deepEqual(pkg.build.win.target, ['nsis']);
 assert.deepEqual(pkg.build.mac.target, ['dmg']);
+assert.equal(pkg.build.linux.desktop?.entry?.Name, 'Vulcan');
+assert.equal(pkg.build.linux.desktop?.entry?.StartupWMClass, 'Vulcan');
+assert.equal(pkg.build.linux.desktop?.Name, undefined, 'desktop metadata must live under linux.desktop.entry');
+assert.match(pkg.scripts['electron:build'], /electron-builder --publish never/);
+assert.equal(pkg.engines?.node, '>=22.12.0');
+
+for (const asset of ['icon.png', 'icon.ico', 'icon.icns', 'icon-titlebar.png']) {
+  assert(fs.existsSync(path.join(appRoot, 'build', asset)), `missing packaging asset: build/${asset}`);
+}
+const gitignore = read(path.join(root, '.gitignore'));
+assert.match(gitignore, /^\/build\/$/m, 'root build output must be ignored with /build/');
+assert.doesNotMatch(gitignore, /^build\/$/m, 'bare build/ would swallow vulcan-app/build icons');
+assert(fs.existsSync(path.join(root, 'vulcan', 'pyproject.toml')), 'backend pyproject.toml must be at vulcan/pyproject.toml');
+assert(!fs.existsSync(path.join(root, 'vulcan', 'vulcan-app')), 'backend directory must not contain a duplicate repository/vulcan-app');
+assert(!fs.existsSync(path.join(root, 'vulcan', 'install.sh')), 'backend directory must not contain a duplicate repository/install.sh');
 const extraTargets = new Set(pkg.build.extraResources.map((x) => x.to));
 for (const required of ['vulcan-server', 'install.sh', 'install.ps1', 'server-payload.sha256', 'vulcan-icon.png']) {
   assert(extraTargets.has(required), `missing packaged resource: ${required}`);
@@ -62,6 +77,11 @@ assert.match(workflow, /Vulcan-Setup\.exe/);
 assert.match(workflow, /Vulcan\.dmg/);
 assert.match(workflow, /Vulcan-Server\.tar\.gz/);
 assert.match(workflow, /softprops\/action-gh-release@v2/);
+assert.match(workflow, /actions\/checkout@v6/);
+assert.match(workflow, /actions\/setup-node@v7/);
+assert.match(workflow, /node-version: 24/);
+assert.doesNotMatch(workflow, /GH_TOKEN:\s*\$\{\{ secrets\.GITHUB_TOKEN \}\}/);
+assert.match(workflow, /if-no-files-found: error/);
 
 const ps1 = read(path.join(root, 'install.ps1'));
 assert.match(ps1, /function Ensure-HostEtna/);
@@ -72,7 +92,10 @@ assert.match(ps1, /systemd=true/);
 assert.match(ps1, /docker\.io/);
 assert.match(ps1, /-d", \$DistroName/);
 
-const hash = read(path.join(appRoot, 'build', 'server-payload.sha256')).trim();
-assert.match(hash, /^[0-9a-f]{64}$/);
+const hashPath = path.join(appRoot, 'build', 'server-payload.sha256');
+if (fs.existsSync(hashPath)) {
+  const hash = read(hashPath).trim();
+  assert.match(hash, /^[0-9a-f]{64}$/);
+}
 
 console.log('Desktop packaging, headless server install, convergent repair, tray, notification, WSL2, and Colima wiring verified.');

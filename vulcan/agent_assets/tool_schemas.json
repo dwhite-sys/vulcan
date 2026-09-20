@@ -1,0 +1,1103 @@
+{
+  "discovery": [
+    {
+      "name": "list_kits",
+      "description": "Surface an overview of all available kits at once. Not the first move for finding a tool \u2014 search_tools handles that. Use this when a bird's-eye view of the whole kit landscape is itself what you need.",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    },
+    {
+      "name": "inspect_kit",
+      "description": "Check what a kit is and whether it has a skill before going deeper. One level above the tools \u2014 tells you if this branch is worth walking down, and if there's a skill that may be worth reading before you do.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "kit": {
+            "type": "string",
+            "description": "Kit name"
+          }
+        },
+        "required": [
+          "kit"
+        ]
+      }
+    },
+    {
+      "name": "search_tools",
+      "description": "Search available Etna tools by capability or keyword when you don't already know the tool you need. If a result's interface is already clear, invoke it with run_tool; use inspect_tool when you need the full schema first.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "Search query"
+          }
+        },
+        "required": [
+          "query"
+        ]
+      }
+    },
+    {
+      "name": "inspect_tool",
+      "description": "Get the full schema for a tool returned by search_tools. Use this when search identified the right capability but you need exact parameters, types, or kit metadata before calling it.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "tool": {
+            "type": "string",
+            "description": "Exact tool function name as returned by search_tools"
+          }
+        },
+        "required": [
+          "tool"
+        ]
+      }
+    },
+    {
+      "name": "run_tool",
+      "description": "Invoke an enabled Etna tool returned by search_tools, using its exact name and an arguments object matching the schema from inspect_tool. This is the normal execution path for discovered tools in search mode.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Exact tool function name returned by search_tools"
+          },
+          "arguments": {
+            "type": "object",
+            "description": "Arguments for the discovered tool, matching its declared parameter schema",
+            "additionalProperties": true
+          }
+        },
+        "required": [
+          "name",
+          "arguments"
+        ]
+      }
+    }
+  ],
+  "skills": [
+    {
+      "name": "list_skills",
+      "description": "List the skills currently available in this chat across Vulcan and Etna. Each skill includes its source: 'vulcan', 'skills', or 'kits/<kit-stem>'. Vulcan's built-in skill metadata is already present in system context, so this is most useful for discovering dynamic Etna skills.",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    },
+    {
+      "name": "search_skills",
+      "description": "Search available skill names and descriptions by keyword across both Vulcan and Etna. Use this when you suspect a specialized procedural reference may exist but don't know its exact name.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "Keyword search query"
+          }
+        },
+        "required": [
+          "query"
+        ]
+      }
+    },
+    {
+      "name": "read_skill",
+      "description": "Read a skill's SKILL.md body. Skills are directory-backed packages regardless of whether they come from Vulcan or Etna; use list_skill_files/read_skill_file when the skill points to bundled resources.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "skill": {
+            "type": "string",
+            "description": "Exact skill name from system context, list_skills/search_skills, or inspect_kit"
+          },
+          "source": {
+            "type": "string",
+            "description": "Optional source to disambiguate duplicate names: 'vulcan', 'skills', or 'kits/<kit-stem>'"
+          }
+        },
+        "required": [
+          "skill"
+        ]
+      }
+    },
+    {
+      "name": "list_skill_files",
+      "description": "List every file bundled with a skill package. Paths are relative to the skill root and SKILL.md is listed first.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "skill": {
+            "type": "string",
+            "description": "Exact skill name"
+          },
+          "source": {
+            "type": "string",
+            "description": "Optional source to disambiguate duplicate names"
+          }
+        },
+        "required": [
+          "skill"
+        ]
+      }
+    },
+    {
+      "name": "read_skill_file",
+      "description": "Read a bundled file from a skill package using a path returned by list_skill_files. Text files are returned as text; binary files are returned as base64 with their content type.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "skill": {
+            "type": "string",
+            "description": "Exact skill name"
+          },
+          "file": {
+            "type": "string",
+            "description": "Path relative to the skill root"
+          },
+          "source": {
+            "type": "string",
+            "description": "Optional source to disambiguate duplicate names"
+          }
+        },
+        "required": [
+          "skill",
+          "file"
+        ]
+      }
+    }
+  ],
+  "interaction": [
+    {
+      "name": "ask_user",
+      "description": "Ask the user one question when their input is needed before continuing. Provide concise suggested answers when useful. Prefer no more than 4 answer options. A maximum of 5 options is supported; any options beyond the first 5 will be discarded by Vulcan. For multiple independent questions, call this tool multiple times in the same response; Vulcan will present simultaneous calls together. If a later question depends on an earlier answer, wait for the answer before asking the follow-up. Do not provide 'Something else' or 'Skip' as options; Vulcan provides those automatically.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "question": {
+            "type": "string",
+            "description": "The question to ask the user."
+          },
+          "options": {
+            "type": "array",
+            "description": "Suggested answers the user can select. Prefer 2\u20134 concise options. Maximum 5; additional options will be discarded.",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 5
+          }
+        },
+        "required": [
+          "question",
+          "options"
+        ]
+      }
+    }
+  ],
+  "memory": [
+    {
+      "name": "recall",
+      "description": "Search previous conversations by default when earlier work, a decision, or remembered wording would help. Set scope to current to search only earlier messages in this conversation; the triggering user message and active response are excluded. Lexical mode requires at least three meaningful query words and expands keyword seed groups. Semantic mode finds the nearest BGE-embedded messages for vague descriptions or paraphrased memories without expanding keywords.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "What to find in previous conversations or earlier in the current conversation. Lexical mode requires at least three meaningful words; semantic mode has no word minimum."
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "lexical",
+              "semantic"
+            ],
+            "description": "lexical for three or more specific names, terms, and expandable keyword groups; semantic for direct nearest-neighbor matching of vague descriptions or paraphrased memories. Defaults to lexical."
+          },
+          "scope": {
+            "type": "string",
+            "enum": [
+              "previous",
+              "current"
+            ],
+            "default": "previous",
+            "description": "previous searches other conversations and excludes this one; current searches only earlier messages in this conversation, excluding the triggering request and active response. Defaults to previous."
+          },
+          "keyword_seed_groups": {
+            "type": "array",
+            "description": "Optional groups of related seed words for lexical expansion; each group represents one part of the remembered topic.",
+            "items": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "limit": {
+            "type": "integer",
+            "description": "Maximum matching messages to return; defaults to 8 and cannot exceed 20."
+          }
+        },
+        "required": [
+          "query"
+        ]
+      }
+    }
+  ],
+  "library": [
+    {
+      "name": "library_search",
+      "description": "Search shared library files plus every conversation's attachments and workspaces. A non-empty query is required: ordinary keywords all match one path, while multiple filenames such as 'bella.py decode.py' match either file. Returns identifiers and metadata, not contents; use library_attach for selected results.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "Required non-empty filename, folder, conversation ID, extension, keywords, or wildcard such as *.pdf. Multiple filenames match any named file; ordinary keywords all match one path."
+          },
+          "limit": {
+            "type": "integer",
+            "description": "Maximum files or directories to return; default 20, maximum 100."
+          }
+        },
+        "required": [
+          "query"
+        ]
+      }
+    },
+    {
+      "name": "library_attach",
+      "description": "Attach a file, directory, or complete conversation workspace returned by library_search as a read-only reference to a stable Vulcan-owned Library object. Workspace/attachment sources are promoted once into canonical Library storage; their original paths become aliases, so moving, deleting, or replacing an alias does not strand existing attachments.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "file_id": {
+            "type": "string",
+            "description": "Exact file_id returned by library_search."
+          },
+          "destination": {
+            "type": "string",
+            "description": "Optional workspace-relative destination; defaults to the original file, folder, or conversation workspace name."
+          }
+        },
+        "required": [
+          "file_id"
+        ]
+      }
+    }
+  ],
+  "render": [
+    {
+      "name": "visualize",
+      "description": "Show rather than tell with a quick conversational visual \u2014 a diagram, flow, layout, or other demonstrative sketch. Visualization is elective, casual, and disposable: use it when a picture communicates the answer better than prose. When a concrete interpretation of prospective interface or frontend work would help the user shape what should be built, use preview instead. The visualization skill goes deeper on the boundary and output types.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "content": {
+            "type": "string",
+            "description": "The SVG, HTML, or Mermaid source to render"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "svg",
+              "html",
+              "mermaid"
+            ],
+            "description": "Content type (default: svg)"
+          }
+        },
+        "required": [
+          "content"
+        ]
+      }
+    },
+    {
+      "name": "preview",
+      "description": "Render a concrete, interactive interpretation of proposed interface or frontend work inline so the user can see how you are understanding what they want and react to it. Elect Preview when an idea, feature, mode, workflow, page, component, layout, or interaction is still being defined and a visible candidate would help the user confirm, correct, or sharpen that interpretation; this can be useful even when the user has not explicitly asked for a preview. A Preview can be polished and functional; what makes it a Preview is that it represents a proposal or interpretation, not the authoritative running application. If the actual runnable frontend exists and the task is to refine it with precision, use Design instead. For visuals whose purpose is to explain an answer rather than shape what should be built, use visualize. Preview uses an isolated HTML/CSS/JavaScript bundle inline and does not become an Artifact or Dashboard.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "html": {
+            "type": "string",
+            "description": "HTML body markup or a complete HTML document for the preview."
+          },
+          "css": {
+            "type": "string",
+            "description": "CSS for the preview bundle."
+          },
+          "js": {
+            "type": "string",
+            "description": "JavaScript for preview behavior and interaction."
+          }
+        },
+        "required": [
+          "html"
+        ]
+      }
+    },
+    {
+      "name": "get_visualization_width",
+      "description": "Returns the current pixel width of the inline visualization area. Call this before rendering anything layout-sensitive \u2014 charts, multi-column layouts, anything where the available width would change how you design it.",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    },
+    {
+      "name": "open_dashboard",
+      "description": "Open a finished dashboard in the user's workspace. Call this when you're satisfied with what you've built \u2014 it's the moment you hand it to them. Build with dashboard_create, refine with dashboard_update if needed, and open it when it's ready. The dashboard-authoring skill goes deeper if you want guidance on building something polished.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The panel name to present."
+          }
+        },
+        "required": [
+          "name"
+        ]
+      }
+    }
+  ],
+  "workspace": [
+    {
+      "name": "present",
+      "description": "Surface a file to the user \u2014 opens it in the workspace editor and adds it to the Artifacts list. Use this when you've created or changed something worth showing: a finished script, a generated report, a config the user needs to review.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Path to the file within /workspace"
+          }
+        },
+        "required": [
+          "path"
+        ]
+      }
+    },
+    {
+      "name": "view_file",
+      "description": "Read a workspace file into context. Text files return their content. Images are for vision models only: omit region for a whole-image overview fitted within 512x512, or set region.x and region.y to inspect a 512x512 detail window in original-image pixels. The overview reports the original dimensions so you can choose a closer view. For other binary files, use the terminal.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Path to the file within /workspace"
+          },
+          "region": {
+            "type": "object",
+            "description": "Vision models only. Optional 512x512 detail window for raster images, addressed in original-image pixels. Omit for the whole-image overview.",
+            "properties": {
+              "x": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Left edge of the detail window in original-image pixels"
+              },
+              "y": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Top edge of the detail window in original-image pixels"
+              }
+            },
+            "required": [
+              "x",
+              "y"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "path"
+        ]
+      }
+    },
+    {
+      "name": "use_terminal",
+      "description": "Run a shell command in the focused agent terminal. The shell is stateful \u2014 working directory and environment carry forward between commands. Returns promptly with available output; a still-running command remains active in the terminal. Use read_output to inspect it or wait with its slot to await completion.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "cmd": {
+            "type": "string",
+            "description": "Shell command to run"
+          }
+        },
+        "required": [
+          "cmd"
+        ]
+      }
+    },
+    {
+      "name": "send_input",
+      "description": "Interact with an already-running terminal program when it needs a specific response or keyboard action: confirmation prompts, interactive menus, REPL input, or control keys such as Ctrl+C. Default to use_terminal for any other terminal input needs. Ask the user to enter passwords or other sensitive credentials directly.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "description": "Text to send to the running interactive program. Provide text or key, not both."
+          },
+          "key": {
+            "type": "string",
+            "description": "Named keyboard key such as ENTER, TAB, UP, DOWN, ESCAPE, or C. Provide key or text, not both."
+          },
+          "modifiers": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "CTRL",
+                "ALT",
+                "SHIFT",
+                "META"
+              ]
+            },
+            "description": "Optional modifiers for key, for example [\"CTRL\"] with key \"C\"."
+          },
+          "submit": {
+            "type": "boolean",
+            "description": "Press Enter after text. Applies only when text is supplied."
+          }
+        },
+        "required": []
+      }
+    },
+    {
+      "name": "kill_process",
+      "description": "Terminate the running process in the focused terminal.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "pid": {
+            "type": "string",
+            "description": "Process ID returned by use_terminal"
+          }
+        },
+        "required": [
+          "pid"
+        ]
+      }
+    },
+    {
+      "name": "wait",
+      "description": "Pause for the specified duration. When a terminal slot is provided, return as soon as its foreground command finishes or the timeout expires. Useful for installations, builds, downloads, and other operations that may take a few minutes.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "seconds": {
+            "type": "number",
+            "description": "Maximum number of seconds to wait."
+          },
+          "slot": {
+            "type": "number",
+            "description": "Optional agent terminal slot. Return early when its foreground command finishes."
+          }
+        },
+        "required": [
+          "seconds"
+        ]
+      }
+    },
+    {
+      "name": "open_terminal",
+      "description": "Allocate an agent terminal when you need a persistent shell or additional parallel capacity. Opening a terminal does not change focus; call switch_terminal with its returned slot before using it. Use list_terminals when you are unsure which slots are already open.",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    },
+    {
+      "name": "close_terminal",
+      "description": "Close an agent terminal and kill anything running in it. Use this when the work a terminal was opened for is done. Omit slot to close the currently focused one.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "slot": {
+            "type": "number",
+            "description": "Terminal slot to close (1-3). Omit to close the focused terminal."
+          }
+        },
+        "required": []
+      }
+    },
+    {
+      "name": "switch_terminal",
+      "description": "Select which terminal subsequent commands run in. Call this after open_terminal, or to move between slots when managing parallel work.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "slot": {
+            "type": "number",
+            "description": "Terminal slot to switch to (1-3)"
+          }
+        },
+        "required": [
+          "slot"
+        ]
+      }
+    },
+    {
+      "name": "read_output",
+      "description": "Read recent output and running state from a terminal without switching focus or waiting for its foreground process to finish. Use this to check on an interactive prompt, server, install, or background job.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "lines": {
+            "type": "number",
+            "description": "Number of lines to read (default: 50)"
+          },
+          "slot": {
+            "type": "number",
+            "description": "Terminal slot to read from (1-3). Omit to read from the focused terminal."
+          }
+        },
+        "required": []
+      }
+    },
+    {
+      "name": "list_terminals",
+      "description": "List currently open agent terminal slots and their state. Check this when you're not sure what's already open before deciding whether to open a new terminal.",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    },
+    {
+      "name": "find_in_file",
+      "description": "Search a file for a string and get back every matching line with its line number. Use this to locate something before editing it, or to verify placement after. Returns [{line, content}] \u2014 exact line numbers you can use directly in an edit call.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Path to the file within /workspace"
+          },
+          "query": {
+            "type": "string",
+            "description": "Exact string to search for"
+          }
+        },
+        "required": [
+          "path",
+          "query"
+        ]
+      }
+    },
+    {
+      "name": "edit",
+      "description": "Make one or more targeted changes to a workspace file without rewriting it entirely. Pass an array of edits \u2014 each with a line range, an anchor string that proves you read the current content, and the replacement. Edits are applied top-to-bottom with line numbers adjusted between each, so batching multiple changes in one call is safe. Each edit returns its new line range so you know where things landed.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Path to the file within /workspace"
+          },
+          "edits": {
+            "type": "array",
+            "description": "Anchored line-range replacements, expressed against the current file before this edit call.",
+            "items": {
+              "type": "object",
+              "properties": {
+                "start_line": {
+                  "type": "number",
+                  "description": "First line of the range (1-indexed, inclusive)"
+                },
+                "end_line": {
+                  "type": "number",
+                  "description": "Last line of the range (1-indexed, inclusive)"
+                },
+                "anchor": {
+                  "type": "string",
+                  "description": "Distinctive text that must occur somewhere inside this range"
+                },
+                "replacement": {
+                  "type": "string",
+                  "description": "Replacement content for the range"
+                }
+              },
+              "required": [
+                "start_line",
+                "end_line",
+                "anchor",
+                "replacement"
+              ]
+            }
+          }
+        },
+        "required": [
+          "path",
+          "edits"
+        ]
+      }
+    },
+    {
+      "name": "workspace_history",
+      "description": "Inspect git-backed workspace history. List recent commits, optionally for one file; provide both path and revision to read that file exactly as it existed in an earlier commit.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Optional workspace-relative file path"
+          },
+          "revision": {
+            "type": "string",
+            "description": "Optional commit hash; with path, returns that historical file content"
+          },
+          "limit": {
+            "type": "integer",
+            "description": "Maximum commits to list; defaults to 10"
+          }
+        },
+        "required": []
+      }
+    },
+    {
+      "name": "workspace_diff",
+      "description": "Compare the current workspace or one workspace file against an earlier git revision. Use this to inspect what changed before deciding whether a restore is warranted.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Optional workspace-relative file path"
+          },
+          "revision": {
+            "type": "string",
+            "description": "Commit to compare against; defaults to HEAD"
+          }
+        },
+        "required": []
+      }
+    },
+    {
+      "name": "workspace_restore",
+      "description": "Restore one workspace file from a specific previous git commit. Vulcan first snapshots the current workspace, so the restore remains reversible. Inspect history or a diff before replacing work.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Workspace-relative file to restore"
+          },
+          "revision": {
+            "type": "string",
+            "description": "Commit containing the desired previous file version"
+          }
+        },
+        "required": [
+          "path",
+          "revision"
+        ]
+      }
+    }
+  ],
+  "panels": [
+    {
+      "name": "dashboard_create",
+      "description": "Create a dashboard in the user's workspace. Reach for this when there's something worth controlling or monitoring \u2014 an API, a database, a running process. Build it right the first time: functional, clean, something the user would actually reach for. The dashboard-authoring skill has what you need for non-trivial builds \u2014 live workspace services, remote-safe connections, and dashboard structure. Update with dashboard_update, hand it off with open_dashboard.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Unique panel name within this chat"
+          },
+          "html": {
+            "type": "string",
+            "description": "HTML body content"
+          },
+          "css": {
+            "type": "string",
+            "description": "CSS styles (injected into <head>)"
+          },
+          "js": {
+            "type": "string",
+            "description": "JavaScript (injected before </body>)"
+          }
+        },
+        "required": [
+          "name",
+          "html"
+        ]
+      }
+    },
+    {
+      "name": "dashboard_update",
+      "description": "Refine a dashboard by replacing one part \u2014 html, css, or js \u2014 without rebuilding the whole thing. Faster and cleaner than scrapping it and starting fresh. Inspect first if you need to see what's currently there. The dashboard-authoring skill goes deeper if you're unsure how to approach a non-trivial change.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Dashboard name to update"
+          },
+          "part": {
+            "type": "string",
+            "enum": [
+              "html",
+              "css",
+              "js"
+            ],
+            "description": "Which part to replace"
+          },
+          "content": {
+            "type": "string",
+            "description": "New content for this part"
+          }
+        },
+        "required": [
+          "name",
+          "part",
+          "content"
+        ]
+      }
+    },
+    {
+      "name": "dashboard_inspect",
+      "description": "Check what's currently in a dashboard part before editing. Use this to make sure you know exactly what you're changing.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Dashboard name to inspect"
+          },
+          "part": {
+            "type": "string",
+            "enum": [
+              "html",
+              "css",
+              "js"
+            ],
+            "description": "Which part to read"
+          }
+        },
+        "required": [
+          "name",
+          "part"
+        ]
+      }
+    },
+    {
+      "name": "dashboard_list",
+      "description": "See what dashboards exist in this chat and when they were last updated.",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    },
+    {
+      "name": "dashboard_delete",
+      "description": "Delete a dashboard. Can't be undone.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Dashboard name to delete"
+          }
+        },
+        "required": [
+          "name"
+        ]
+      }
+    }
+  ],
+  "design": [
+    {
+      "name": "design_register",
+      "description": "Register a running HTTP(S) frontend as a named Design in this conversation. Design is Vulcan's precision frontend-development surface: use it while building or editing web-rendered applications (web apps, Electron-style renderers, and similar frontends) when the runnable result is becoming the real thing the user will use and exact rendered behavior or appearance matters. For proposed interface or frontend work that is still being defined, where a concrete interpretation would help clarify the target rather than inspect the authoritative running result, prefer preview. Build, edit, and run the app with normal workspace tools; this call only attaches its live URL as a persistent Design the user can reopen. It does not create or start the app. For workspace apps, register the server-local URL (for example http://localhost:5173); Vulcan handles transport to the user's Design pane.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Unique Design name in this conversation."
+          },
+          "url": {
+            "type": "string",
+            "description": "Reachable HTTP or HTTPS URL of the running app."
+          }
+        },
+        "required": [
+          "name",
+          "url"
+        ]
+      }
+    },
+    {
+      "name": "design_update",
+      "description": "Update the URL of a registered Design while preserving its identity. Use this when the same Design is now running at a different URL. If that Design is already open, call open_design afterward to bind the live surface to the updated URL.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Exact name of the registered Design."
+          },
+          "url": {
+            "type": "string",
+            "description": "New reachable HTTP or HTTPS URL."
+          }
+        },
+        "required": [
+          "name",
+          "url"
+        ]
+      }
+    },
+    {
+      "name": "design_info",
+      "description": "Get the stored metadata for a registered Design. Use this to confirm its identity or URL; this does not inspect the live page.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Exact name of the registered Design."
+          }
+        },
+        "required": [
+          "name"
+        ]
+      }
+    },
+    {
+      "name": "design_list",
+      "description": "List Designs registered in this conversation. Use this when you need to find an existing Design by name or URL.",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    },
+    {
+      "name": "design_remove",
+      "description": "Remove a registered Design from this conversation. This removes only Vulcan's Design record; it does not stop the app or delete its files.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Exact name of the registered Design to remove."
+          }
+        },
+        "required": [
+          "name"
+        ]
+      }
+    },
+    {
+      "name": "open_design",
+      "description": "Open a registered Design as the shared live frontend-development surface. Use this when the real rendered app should be inspected, interacted with, or refined precisely by you and the user. A successful open is the transition into live-surface control: Design-specific controls then become discoverable through search_tools for inspecting, interacting with, and\u2014when vision is available\u2014screenshotting the actual running frontend.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Exact name of the registered Design to open."
+          }
+        },
+        "required": [
+          "name"
+        ]
+      }
+    }
+  ],
+  "design_surface": [
+    {
+      "name": "design_inspect",
+      "description": "Ground yourself in the actual current Design and return a compact view of its visible content and interactive elements. Use this when you need to understand what the running frontend shows, locate elements before interacting, or refresh your view after a change where current UI state matters. This observes the live surface; it does not inspect source files.",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    },
+    {
+      "name": "design_click",
+      "description": "Click a grounded element in the currently open Design. Use a target from Design inspection or a grounded element reference from the user when interaction with the actual running frontend matters.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "target": {
+            "type": "string",
+            "description": "Stable Design locator, inspection handle, or grounded element locator."
+          }
+        },
+        "required": [
+          "target"
+        ]
+      }
+    },
+    {
+      "name": "design_fill",
+      "description": "Set the value of an editable field in the currently open Design. Use this for text inputs and other controls whose value should be replaced while exercising the actual running frontend.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "target": {
+            "type": "string",
+            "description": "Stable Design locator, inspection handle, or grounded element locator."
+          },
+          "value": {
+            "type": "string",
+            "description": "Value to place in the field."
+          }
+        },
+        "required": [
+          "target",
+          "value"
+        ]
+      }
+    },
+    {
+      "name": "design_press",
+      "description": "Send a keyboard key or shortcut to the currently open Design. Use this when the live frontend interaction is inherently keyboard-driven rather than setting a field value directly.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "key": {
+            "type": "string",
+            "description": "Key or shortcut, such as Enter, Escape, Tab, or Control+K."
+          },
+          "target": {
+            "type": "string",
+            "description": "Optional Design locator, inspection handle, or grounded element locator to focus before pressing the key."
+          }
+        },
+        "required": [
+          "key"
+        ]
+      }
+    },
+    {
+      "name": "design_hover",
+      "description": "Hover an element in the currently open Design. Use this when the actual hover state matters or reveals additional controls, content, or styling.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "target": {
+            "type": "string",
+            "description": "Stable Design locator, inspection handle, or grounded element locator."
+          }
+        },
+        "required": [
+          "target"
+        ]
+      }
+    },
+    {
+      "name": "design_scroll",
+      "description": "Scroll the currently open Design or a specific scrollable element. Use this to reveal and inspect content outside the current viewport or move within a scrollable region of the running frontend.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "direction": {
+            "type": "string",
+            "enum": [
+              "up",
+              "down",
+              "left",
+              "right"
+            ],
+            "description": "Direction to scroll."
+          },
+          "amount": {
+            "type": "number",
+            "description": "Scroll distance in CSS pixels."
+          },
+          "target": {
+            "type": "string",
+            "description": "Optional Design locator, inspection handle, or grounded element locator for a specific scrollable region."
+          }
+        },
+        "required": [
+          "direction",
+          "amount"
+        ]
+      }
+    },
+    {
+      "name": "design_select_option",
+      "description": "Choose an option in a select-like control in the currently open Design. Use this instead of click or fill when exercising a live control with discrete selectable options.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "target": {
+            "type": "string",
+            "description": "Stable Design locator, inspection handle, or grounded element locator."
+          },
+          "value": {
+            "type": "string",
+            "description": "Option value or visible label to select."
+          }
+        },
+        "required": [
+          "target",
+          "value"
+        ]
+      }
+    },
+    {
+      "name": "design_get_text",
+      "description": "Get the rendered text of a specific element in the currently open Design. Use this when precision requires an exact targeted read from the running frontend rather than a broader Design inspection.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "target": {
+            "type": "string",
+            "description": "Stable Design locator, inspection handle, or grounded element locator."
+          }
+        },
+        "required": [
+          "target"
+        ]
+      }
+    },
+    {
+      "name": "design_get_attribute",
+      "description": "Get one attribute from a specific element in the currently open Design. Use this when precision requires exact live DOM state such as href, aria-expanded, disabled, data attributes, or similar values.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "target": {
+            "type": "string",
+            "description": "Stable Design locator, inspection handle, or grounded element locator."
+          },
+          "attribute": {
+            "type": "string",
+            "description": "Attribute name to read."
+          }
+        },
+        "required": [
+          "target",
+          "attribute"
+        ]
+      }
+    },
+    {
+      "name": "design_screenshot",
+      "description": "Capture the actual pixels of the currently visible Design frame. Use this when visual precision matters\u2014layout, spacing, alignment, clipping, overlap, styling, charts, canvas content, or other rendered state\u2014or when verifying a frontend change whose correctness is visual. When this capability is available, prefer visual evidence over inferring appearance from source or DOM alone.",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    }
+  ]
+}

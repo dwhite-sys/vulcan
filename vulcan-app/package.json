@@ -13,7 +13,7 @@
     "build": "vite build",
     "dev": "vite",
     "electron:dev": "concurrently \"npm run dev\" \"wait-on http://localhost:5173 && cross-env NODE_ENV=development electron .\"",
-    "electron:build": "npm run runtime:hash && vite build && electron-builder",
+    "electron:build": "npm run runtime:hash && npm run test:packaging && vite build && electron-builder --publish never",
     "electron:preview": "vite build && cross-env NODE_ENV=production electron .",
     "test:transcript": "node --experimental-strip-types scripts/transcript-regression.ts",
     "test:sidebar": "node --experimental-strip-types scripts/sidebar-ordering-regression.ts",
@@ -249,5 +249,9 @@
     "overrides": {
       "vite": "6.3.5"
     }
+  },
+  "description": "AI harness with local server and workspaces.",
+  "engines": {
+    "node": ">=22.12.0"
   }
 }

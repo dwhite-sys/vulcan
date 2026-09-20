@@ -45,3 +45,33 @@ Validated after adding the headless path:
 - Native Linux `--server-only` uses a system-level `vulcan.service` and prefers `sudo` for privileged operations, while normal graphical repair retains the Polkit-first path. The installer enables systemd user lingering so Etna's user service can survive logout.
 
 Still requires real-machine validation: Docker installation/group transition and the resulting boot-persistent systemd service on a headless Arch/Ubuntu/Fedora host.
+
+## GitHub Actions upstream hardening (repackage v3)
+
+The first GitHub Actions run (`35482298763`) was inspected through the GitHub connector. All three runners reached Vite successfully and then failed at the same electron-builder schema validation: Linux desktop-entry keys were placed directly under `linux.desktop` instead of `linux.desktop.entry`.
+
+Run `35484266021` confirmed that the desktop-entry schema fix works and that Node 24 reaches real Electron packaging on Linux, macOS, and Windows. All three then failed because electron-builder implicitly entered publish mode under CI and could not infer repository metadata from the nested app package. That run also exposed that the live repository's broad `build/` ignore rule had prevented the application icon assets from ever being committed.
+
+This repackage fixes both issues and hardens them against regression:
+
+- `linux.desktop.entry` now uses the electron-builder v26 schema.
+- `vulcan-app/build/` is no longer swallowed by the repository's generic `build/` ignore rule, so `icon.png`, `icon.ico`, `icon.icns`, and tray icon assets can actually be committed.
+- generated Python `vulcan/build/`, `vulcan/dist/`, and `*.egg-info/` remain ignored instead.
+- the repository layout is guarded so `vulcan/` must be the Python backend itself, not a nested duplicate of the whole repository.
+- `electron:build` runs the packaging regression and explicitly passes `--publish never`; GitHub Releases are published only by the dedicated release job, avoiding electron-builder v26 CI auto-publishing.
+- the workflow no longer injects `GH_TOKEN` into electron-builder.
+- GitHub actions are moved off their Node-20-based action runtimes (`actions/checkout@v6`, `actions/setup-node@v7`).
+- the build runtime is Node 24, while package metadata requires `>=22.12.0`; the locked Electron 43.3.0 package itself requires Node `>=22.12.0`.
+- a dependency-free packaging preflight runs before `npm ci`, so missing PNG/ICO/ICNS/tray icons, an icon-swallowing `.gitignore`, a duplicated repo tree, or malformed builder metadata fail immediately instead of after dependency installation.
+- artifact uploads use `if-no-files-found: error`, and the release step fails if its file glob matches nothing.
+
+Revalidated after these changes:
+
+- `bash -n install.sh`
+- Electron CommonJS syntax
+- packaging preflight with no generated server hash present
+- runtime hash generation followed by packaging regression
+- workflow YAML parse
+- Python suite: **200 passed, 22 subtests passed**
+
+A complete local `npm ci`/electron-builder build is still not claimed from this container; npm registry access stalled here. GitHub Actions remains the authoritative full packaging test for Linux, Windows, and macOS.

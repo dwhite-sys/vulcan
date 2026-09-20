@@ -50,6 +50,27 @@ jobs:
       - name: Build packaged desktop artifact
         run: npm run electron:build
 
+      - name: Validate Linux AppImage integration metadata
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          src="$(find electron-dist -maxdepth 1 -type f -name '*.AppImage' ! -name 'Vulcan.AppImage' -print -quit)"
+          test -n "$src"
+          chmod +x "$src"
+
+          inspect="$(mktemp -d)"
+          trap 'rm -rf "$inspect"' EXIT
+
+          (
+            cd "$inspect"
+            "$GITHUB_WORKSPACE/vulcan-app/$src" --appimage-extract >/dev/null
+          )
+
+          desktop="$(find "$inspect/squashfs-root" -type f -name '*.desktop' -print -quit)"
+          test -n "$desktop"
+          grep -Fxq 'X-AppImage-Integrate=false' "$desktop"
+
       - name: Prepare stable Linux release asset
         if: matrix.os == 'ubuntu-latest'
         shell: bash

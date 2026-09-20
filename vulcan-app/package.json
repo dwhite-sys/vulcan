@@ -1,7 +1,7 @@
 {
   "name": "vulcan",
   "private": true,
-  "version": "1.0.0-rc.4",
+  "version": "1.0.0-rc.5",
   "type": "module",
   "main": "electron/main.cjs",
   "author": {
@@ -88,7 +88,8 @@
           "Name": "Vulcan",
           "Comment": "AI harness with local server and workspaces",
           "StartupWMClass": "Vulcan",
-          "Categories": "Development;Utility;"
+          "Categories": "Development;Utility;",
+          "X-AppImage-Integrate": "false"
         }
       }
     },

@@ -558,6 +558,7 @@ Terminal=false
 Type=Application
 Categories=Development;Utility;
 StartupWMClass=Vulcan
+X-AppImage-Integrate=false
 DESKTOP
   cat > "$autostart_home/vulcan.desktop" <<DESKTOP
 [Desktop Entry]
@@ -570,6 +571,7 @@ Terminal=false
 Type=Application
 X-GNOME-Autostart-enabled=true
 X-KDE-autostart-after=panel
+X-AppImage-Integrate=false
 DESKTOP
   chmod +x "$desktop_home/vulcan.desktop" "$autostart_home/vulcan.desktop"
   have update-desktop-database && update-desktop-database "$desktop_home" >/dev/null 2>&1 || true

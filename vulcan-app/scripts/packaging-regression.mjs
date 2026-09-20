@@ -19,6 +19,11 @@ assert.deepEqual(pkg.build.win.target, ['nsis']);
 assert.deepEqual(pkg.build.mac.target, ['dmg']);
 assert.equal(pkg.build.linux.desktop?.entry?.Name, 'Vulcan');
 assert.equal(pkg.build.linux.desktop?.entry?.StartupWMClass, 'Vulcan');
+assert.equal(
+  pkg.build.linux.desktop?.entry?.['X-AppImage-Integrate'],
+  'false',
+  'Vulcan owns its Linux integration; AppImageLauncher must not intercept it',
+);
 assert.equal(pkg.build.linux.desktop?.Name, undefined, 'desktop metadata must live under linux.desktop.entry');
 assert.match(pkg.scripts['electron:build'], /electron-builder --publish never/);
 assert.equal(pkg.engines?.node, '>=22.12.0');

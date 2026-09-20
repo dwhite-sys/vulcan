@@ -84,10 +84,12 @@
       "category": "Development",
       "icon": "build/icon.png",
       "desktop": {
-        "Name": "Vulcan",
-        "Comment": "AI harness with local server and workspaces",
-        "StartupWMClass": "Vulcan",
-        "Categories": "Development;Utility;"
+        "entry": {
+          "Name": "Vulcan",
+          "Comment": "AI harness with local server and workspaces",
+          "StartupWMClass": "Vulcan",
+          "Categories": "Development;Utility;"
+        }
       }
     },
     "win": {

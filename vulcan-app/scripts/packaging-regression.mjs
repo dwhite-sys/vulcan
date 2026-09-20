@@ -10,6 +10,11 @@ const read = (p) => fs.readFileSync(p, 'utf8');
 
 const pkg = JSON.parse(read(path.join(appRoot, 'package.json')));
 assert.deepEqual(pkg.build.linux.target, ['AppImage']);
+assert.equal(
+  pkg.build.toolsets?.appimage,
+  '1.0.3',
+  'Linux AppImage must use the static runtime so host FUSE2 is not required',
+);
 assert.deepEqual(pkg.build.win.target, ['nsis']);
 assert.deepEqual(pkg.build.mac.target, ['dmg']);
 assert.equal(pkg.build.linux.desktop?.entry?.Name, 'Vulcan');

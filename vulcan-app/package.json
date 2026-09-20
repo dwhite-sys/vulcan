@@ -1,7 +1,7 @@
 {
   "name": "vulcan",
   "private": true,
-  "version": "1.0.0-rc.2",
+  "version": "1.0.0-rc.3",
   "type": "module",
   "main": "electron/main.cjs",
   "author": {
@@ -149,7 +149,10 @@
         "from": "build/icon.png",
         "to": "vulcan-icon.png"
       }
-    ]
+    ],
+    "toolsets": {
+      "appimage": "1.0.3"
+    }
   },
   "dependencies": {
     "@emotion/react": "11.14.0",

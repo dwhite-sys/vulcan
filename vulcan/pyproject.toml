@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vulcan"
-version = "1.0.0rc2"
+version = "1.0.0rc3"
 description = "Vulcan — LLM orchestration server with workspace management and Docker container lifecycle."
 requires-python = ">=3.11"
 authors = [{ name = "dwhite-sys" }]

@@ -12,7 +12,7 @@ The desktop artifact is the entry point:
 
 Every packaged launch runs the same desired-state repair pass. There is no authoritative `firstRun` flag. Healthy components are left alone; missing or damaged components are recreated.
 
-Electron owns application installation/integration, tray behavior, login startup where appropriate, native notifications, and window lifecycle. `install.sh` and `install.ps1` own CLI-oriented backend setup.
+Electron owns the desktop process, tray behavior, native notifications, and window lifecycle. The platform install scripts own desired-state convergence: desktop integration where applicable, Vulcan's backend/runtime, Docker/workspace state, and service setup.
 
 
 ## One-command Linux install
@@ -23,7 +23,7 @@ Once a tagged GitHub release exists, Linux users can install the same AppImage u
 curl -fsSL https://raw.githubusercontent.com/dwhite-sys/vulcan/main/install.sh | bash
 ```
 
-The public script does not build Vulcan from source. It downloads the stable `Vulcan.AppImage` release asset, verifies it against the SHA-256 digest published by GitHub's release API, installs it at `~/.local/share/vulcan/app/Vulcan.AppImage`, extracts its bundled resources without requiring FUSE, and invokes the exact same self-repairing converger Electron invokes on normal launches. The installed desktop entry, icon, autostart entry, backend runtime, Etna kits, Docker state, and Vulcan service therefore converge through one implementation regardless of whether installation started by double-clicking the AppImage or piping the GitHub script to Bash.
+The public script does not build Vulcan from source. It downloads the stable `Vulcan.AppImage` release asset, verifies its SHA-256 from GitHub release metadata, atomically installs it at `~/.local/share/vulcan/app/Vulcan.AppImage`, and launches it. The packaged application then runs the same self-repairing convergence pass used on every normal launch.
 
 A specific release can be selected without changing the script:
 
@@ -39,7 +39,7 @@ A Linux server does not need to download or install Electron at all:
 curl -fsSL https://raw.githubusercontent.com/dwhite-sys/vulcan/main/install.sh | bash -s -- --server-only
 ```
 
-`--server-only` resolves the selected GitHub release tag, downloads GitHub's source tarball for that exact tag, and runs the tagged installer against only its `vulcan` server package. It installs/repairs uv, managed Python, Etna + required kits, Docker, the Vulcan runtime, and the workspace image, but creates no AppImage, `.desktop` entry, icon, tray autostart, or other desktop integration. Native Linux server-only installs use `/etc/systemd/system/vulcan.service` so the backend starts at boot and survives SSH logout; Etna remains a user service and the installer enables systemd user lingering for that account.
+`--server-only` resolves the selected GitHub release tag, downloads GitHub's source tarball for that exact tag, and runs the tagged installer against only its `vulcan` server package. It converges Vulcan's managed Python/runtime, Docker/workspace state, and system service without creating desktop integration. Etna remains an independent host-level product: Vulcan may use Etna's public CLI to establish or repair Etna and required kits, but Vulcan does not own Etna's runtime or service lifecycle.
 
 A specific headless release is selected the same way:
 
@@ -55,7 +55,7 @@ For development/private testing, `VULCAN_APPIMAGE_URL` together with `VULCAN_APP
 - Windows: native Electron + native Etna + dedicated `Vulcan` WSL2 Ubuntu 24.04 distro. Docker Engine and the Vulcan server run inside WSL2 under systemd.
 - macOS: native Electron `.app` + native Etna + named Colima profile. Only the Vulcan server/runtime lives inside the Colima Linux VM; Colima/Lima automatically forwards guest port 8468 back to macOS localhost.
 
-Etna deliberately stays on the desktop host on all three platforms so client-POV kits such as Playwright can interact with the user's real desktop/browser. The repair scripts establish uv-managed Python, Etna plus required kits (`web`, `playwright`, `ntfy`), the packaged Vulcan server runtime, Docker availability, and the Vulcan service.
+Etna deliberately stays on the host on all three platforms so client-POV kits such as Playwright can interact with the user's real desktop/browser. Vulcan owns its own managed Python/server runtime, Docker/workspace state, and Vulcan service. Etna owns its own lifecycle and is consumed by Vulcan over HTTP after any required public-CLI setup or repair.
 
 ## Build
 
@@ -69,6 +69,6 @@ npm run electron:build
 
 ## Linux smoke test
 
-Run the AppImage from Downloads. It should copy itself to `~/.local/share/vulcan/app/Vulcan.AppImage`, create a launcher and autostart entry, repair the backend, relaunch from the stable copy, and appear in the desktop application launcher. Closing the window hides it to the tray; tray **Exit** terminates only the desktop process, not the supervised backend service.
+Run the AppImage from Downloads. It should persist itself at `~/.local/share/vulcan/app/Vulcan.AppImage`, create or repair its launcher and autostart entry, converge the backend, and appear in the desktop application launcher. The process the user opened remains the first session; later launches use the persisted AppImage. Closing the window hides it to the tray; tray **Exit** terminates only the desktop process, not the supervised backend service.
 
 `VULCAN_SKIP_REPAIR=1` skips packaged repair for development/debugging only.

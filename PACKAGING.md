@@ -18,13 +18,13 @@ The Vulcan server is supervised by `~/.config/systemd/user/vulcan.service` and e
 
 ## Windows
 
-NSIS installs the Electron application. `install.ps1` first repairs native Windows uv/Python/Etna plus the required kits, then verifies WSL2, creates a dedicated WSL2 distro named `Vulcan` from Canonical's Ubuntu 24.04 WSL rootfs with SHA-256 verification, enables systemd, installs Docker Engine inside that distro, creates an unprivileged `vulcan` account, then runs the Linux converger there for the Vulcan server only. All WSL commands target `-d Vulcan`; existing user distros are untouched.
+NSIS installs the Electron application. Etna remains native to Windows and is discovered or repaired through its public CLI. Vulcan's managed Python/server runtime and Docker live inside the dedicated WSL2 distro named `Vulcan`. The installer verifies or repairs that Ubuntu 24.04 substrate, then delegates backend convergence to the same Linux converger used elsewhere. All WSL commands target `-d Vulcan`; existing user distros are untouched.
 
 If Windows has just enabled WSL2 and requires a reboot, repair exits cleanly. Opening Vulcan after reboot resumes from observed state.
 
 ## macOS
 
-Electron uses `app.moveToApplicationsFolder()` for the native `.app`. `install.sh` keeps uv/Python/Etna native on macOS, then uses a named Colima profile (`vulcan`) for the Vulcan Linux backend. This keeps Playwright and other client-POV Etna tools attached to the real host browser. Homebrew is the only prerequisite that is not silently installed, because its own installer may require interactive host setup. Once Homebrew exists, the repair script installs/starts Colima, transfers only the bundled Vulcan server payload into the VM, runs the Linux converger there, and installs a LaunchAgent that starts the named Colima profile at login. Colima/Lima owns the VM lifecycle and automatic localhost port forwarding.
+Electron uses `app.moveToApplicationsFolder()` for the native `.app`. Etna remains native to macOS while Vulcan's managed Python/server runtime and Docker live inside the named Colima profile `vulcan`. This keeps Playwright and other client-POV Etna tools attached to the real host browser. A small host uv bootstrap exists only as an Etna installation fallback. Homebrew is required only when Colima itself is absent. Healthy Colima and LaunchAgent state are skipped; the Linux guest converger owns Vulcan backend repair. Colima/Lima owns VM lifecycle and localhost port forwarding.
 
 ## Desktop lifecycle
 
@@ -40,24 +40,20 @@ Electron uses `app.moveToApplicationsFolder()` for the native `.app`. `install.s
 
 ## Direct Linux bootstrap from GitHub
 
-The repository-root `install.sh` also acts as a public bootstrap when it is not invoked from Electron, a WSL/Colima guest, or an explicit server payload. The intended command is:
+The repository-root `install.sh` also acts as the public desktop bootstrap.
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/dwhite-sys/vulcan/main/install.sh | bash
-```
+    curl -fsSL https://raw.githubusercontent.com/dwhite-sys/vulcan/main/install.sh | bash
 
-That path downloads the stable `Vulcan.AppImage` release alias and its SHA-256 file, verifies it, stores it at the normal Vulcan AppImage location, then runs `--appimage-extract` into a temporary directory and invokes the `resources/install.sh` embedded in that exact artifact. This deliberately avoids maintaining a second backend-install implementation in the network bootstrap. The release artifact itself supplies the server payload, icon, runtime hash, and converger.
+It downloads the stable `Vulcan.AppImage` release asset, obtains its SHA-256 from GitHub release metadata, verifies the download, atomically installs it at the normal Vulcan AppImage location, and launches it. The packaged application's embedded converger owns backend repair on that launch and every later launch.
 
-The GitHub Actions build preserves electron-builder's versioned outputs and additionally emits stable release aliases: `Vulcan.AppImage`, `Vulcan-Setup.exe`, and `Vulcan.dmg`, each with a SHA-256 sidecar. The Linux bootstrap depends only on the stable AppImage alias.
+The release publishes stable aliases `Vulcan.AppImage`, `Vulcan-Setup.exe`, and `Vulcan.dmg`. Their SHA-256 values are included in the GitHub release body; standalone bootstrap code also accepts GitHub's per-asset digest when the API supplies one. Separate SHA-256 sidecar assets are not required.
 
 ## Headless / `--server-only`
 
-The repository-root installer also supports a desktop-free desired state:
+The repository-root installer also supports a desktop-free desired state.
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/dwhite-sys/vulcan/main/install.sh | bash -s -- --server-only
-```
+    curl -fsSL https://raw.githubusercontent.com/dwhite-sys/vulcan/main/install.sh | bash -s -- --server-only
 
-The release workflow emits `Vulcan-Server.tar.gz` plus `Vulcan-Server.tar.gz.sha256`. The bundle contains only `install.sh`, the filtered `vulcan-server/` payload, and its deterministic payload hash. The public script verifies and extracts that bundle, then invokes the bundled converger with `--server-only`; Electron is never downloaded or installed.
+The bootstrap resolves the selected release tag, downloads GitHub's source tarball for that exact tag, and delegates to that tagged installer with only the Vulcan server package. Electron and desktop integration are never installed.
 
-On native Linux, server-only mode uses a system-level `vulcan.service` rather than the desktop user's systemd unit. This lets the service start at boot and survive SSH logout. Etna stays per-user so its existing lifecycle remains intact; `loginctl enable-linger` keeps that user service available without an interactive login. Privileged operations prefer `sudo` in server-only mode (appropriate for an SSH/TTY install) and retain Polkit for normal graphical desktop repair. The server-only path still uses the same uv/Python/Etna/Docker/Vulcan repair primitives as the desktop path.
+Native Linux server-only mode uses `/etc/systemd/system/vulcan.service`, so the Vulcan backend starts at boot and survives SSH logout. Etna remains separately host-owned: Vulcan uses Etna's public CLI only when setup or repair is required and does not install a private Etna runtime, run a second Etna process, or manage Etna's service lifecycle.

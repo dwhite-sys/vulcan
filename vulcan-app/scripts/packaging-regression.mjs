@@ -152,7 +152,10 @@ assert.match(shell, /SERVER_ONLY/);
 assert(shell.includes('VULCAN_HOME="${VULCAN_CONFIG_DIR:-$HOME/.vulcan}"'));
 assert(shell.includes('APP_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}/vulcan"'));
 assert(shell.includes('installed_source="$PAYLOAD_HOME/server"'));
-assert(shell.includes('"$BIN_HOME/uv" pip install --python "$RUNTIME/bin/python" "$installed_source"'));
+assert.match(
+  shell,
+  /"\$BIN_HOME\/uv"\s+pip install[\s\\]+--python "\$RUNTIME\/bin\/python"[\s\\]+"\$installed_source"/,
+);
 assert(!shell.includes('"$BIN_HOME/uv" pip install --python "$RUNTIME/bin/python" "$SERVER_SOURCE"'));
 
 const workflow = read(path.join(root, '.github', 'workflows', 'build.yml'));

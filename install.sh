@@ -697,56 +697,69 @@ server_payload_hash() {
 
 ensure_vulcan_runtime() {
   ensure_python
-  [[ -n "$SERVER_SOURCE" && -d "$SERVER_SOURCE" ]] || fail "Vulcan server payload is missing"
+  [[ -n "$SERVER_SOURCE" && -d "$SERVER_SOURCE" ]] \
+    || fail "Vulcan server payload is missing"
 
   local wanted current="" py="$RUNTIME/bin/python"
   local installed_source="$PAYLOAD_HOME/server"
+  local payload_ready=0 payload_changed=0 healthy=0
 
   wanted="$(server_payload_hash)"
-  [[ -f "$SERVER_INSTALLED_HASH" ]] && current="$(tr -d '[:space:]' < "$SERVER_INSTALLED_HASH")"
+  [[ -f "$SERVER_INSTALLED_HASH" ]] \
+    && current="$(tr -d '[:space:]' < "$SERVER_INSTALLED_HASH")"
 
-  local healthy=0 payload_ready=0
-  if [[ -x "$py" ]] && "$py" -c 'import vulcan, fastapi, uvicorn, cryptography, numpy, sklearn, fastembed, spacy, PIL' >/dev/null 2>&1; then
-    healthy=1
-  fi
   [[ -f "$installed_source/pyproject.toml" ]] && payload_ready=1
 
-  if [[ "$current" == "$wanted" && "$healthy" -eq 1 && "$payload_ready" -eq 1 ]]; then
+  progress_task_start server payload "Checking server payload"
+
+  if [[ "$current" == "$wanted" && "$payload_ready" -eq 1 ]]; then
     progress_task_finish server payload skipped "Server payload already current"
+  else
+    say "Synchronizing Vulcan server payload"
+
+    local source_real installed_real="" staged_source
+    source_real="$(cd "$SERVER_SOURCE" && pwd -P)"
+
+    if [[ -d "$installed_source" ]]; then
+      installed_real="$(cd "$installed_source" && pwd -P)"
+    fi
+
+    if [[ "$source_real" != "$installed_real" ]]; then
+      staged_source="$PAYLOAD_HOME/.server.$$"
+      rm -rf "$staged_source"
+      mkdir -p "$staged_source"
+
+      cp -R "$SERVER_SOURCE"/. "$staged_source"/ \
+        || fail "Could not persist Vulcan server payload under $VULCAN_HOME"
+
+      rm -rf "$installed_source"
+      mv "$staged_source" "$installed_source"
+    fi
+
+    [[ -f "$installed_source/pyproject.toml" ]] \
+      || fail "Persisted Vulcan server payload is incomplete"
+
+    printf '%s\n' "$wanted" > "$SERVER_INSTALLED_HASH"
+    payload_changed=1
+
+    progress_task_finish server payload done "Server payload synchronized"
+  fi
+
+  if [[ -x "$py" ]] \
+    && "$py" -c 'import vulcan, fastapi, uvicorn, cryptography, numpy, sklearn, fastembed, spacy, PIL' >/dev/null 2>&1
+  then
+    healthy=1
+  fi
+
+  progress_task_start server runtime "Checking Vulcan server runtime"
+
+  if [[ "$payload_changed" -eq 0 && "$healthy" -eq 1 ]]; then
     progress_task_finish server runtime skipped "Server runtime already healthy"
     return
   fi
 
   say "Repairing Vulcan server runtime"
 
-  # Packaged resources are delivery media, not Vulcan's persistent home.
-  # Persist the server payload under ~/.vulcan before setuptools/uv builds it.
-  local source_real installed_real="" staged_source
-  source_real="$(cd "$SERVER_SOURCE" && pwd -P)"
-
-  if [[ -d "$installed_source" ]]; then
-    installed_real="$(cd "$installed_source" && pwd -P)"
-  fi
-
-  progress_task_start server payload "Synchronizing server payload"
-  if [[ "$source_real" != "$installed_real" ]]; then
-    staged_source="$PAYLOAD_HOME/.server.$$"
-    rm -rf "$staged_source"
-    mkdir -p "$staged_source"
-
-    if ! cp -R "$SERVER_SOURCE"/. "$staged_source"/; then
-      rm -rf "$staged_source"
-      fail "Could not persist Vulcan server payload under $VULCAN_HOME"
-    fi
-
-    rm -rf "$installed_source"
-    mv "$staged_source" "$installed_source"
-    progress_task_finish server payload done "Server payload synchronized"
-  else
-    progress_task_finish server payload skipped "Server payload already staged"
-  fi
-
-  progress_task_start server runtime "Installing Vulcan server runtime"
   if [[ -n "$GUEST" || "$SERVER_ONLY" -eq 1 ]]; then
     run_privileged systemctl stop vulcan.service >/dev/null 2>&1 || true
   else
@@ -756,11 +769,11 @@ ensure_vulcan_runtime() {
   rm -rf "$RUNTIME"
   "$BIN_HOME/uv" venv --python 3.12 "$RUNTIME" >/dev/null
 
-  if ! "$BIN_HOME/uv" pip install --python "$RUNTIME/bin/python" "$installed_source" >/dev/null; then
-    fail "Could not install Vulcan server runtime"
-  fi
+  "$BIN_HOME/uv" pip install \
+    --python "$RUNTIME/bin/python" \
+    "$installed_source" >/dev/null \
+    || fail "Could not install Vulcan server runtime"
 
-  printf '%s\n' "$wanted" > "$SERVER_INSTALLED_HASH"
   progress_task_finish server runtime done "Vulcan server runtime ready"
 }
 

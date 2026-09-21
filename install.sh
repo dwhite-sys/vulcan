@@ -930,6 +930,12 @@ DESKTOP
   printf '%s' "$installed"
 }
 
+workspace_runtime_ready() {
+  "$RUNTIME/bin/python" -c \
+    'from vulcan import docker, recall; s=recall.status(); raise SystemExit(0 if docker.image_current() and s["semantic_downloaded"] and s["lexical_ready"] else 1)' \
+    >/dev/null 2>&1
+}
+
 linux_converge() {
   local relogin=0
   progress_plan 15 1 2 2 6 2 2
@@ -949,18 +955,21 @@ linux_converge() {
   if [[ -z "$GUEST" ]]; then ensure_etna; fi
   ensure_docker_linux
   relogin="$DOCKER_RELOGIN"
-  # Build/repair the workspace image whenever Docker is usable. A headless install
-  # can immediately adopt newly-added docker-group membership via `sg` instead of
-  # forcing an SSH logout/login cycle.
-  progress_task_start workspace image "Preparing Docker workspace image"
+  progress_task_start workspace image "Checking Docker workspace"
   if docker info >/dev/null 2>&1; then
-    say "Preparing Docker workspace image"
-    "$RUNTIME/bin/vulcan" install --runtime-only >/dev/null
-    progress_task_finish workspace image done "Docker workspace image ready"
+    if workspace_runtime_ready; then
+      progress_task_finish workspace image skipped "Docker workspace already ready"
+    else
+      say "Preparing Docker workspace image"
+      "$RUNTIME/bin/vulcan" install --runtime-only >/dev/null
+      workspace_runtime_ready || fail "Workspace repair did not converge"
+      progress_task_finish workspace image done "Docker workspace repaired"
+    fi
   elif [[ "$SERVER_ONLY" -eq 1 ]] && have sg && id -nG "$USER" | tr ' ' '\n' | grep -qx docker; then
     say "Preparing Docker workspace image"
-    sg docker -c "$(printf '%q' "$RUNTIME/bin/vulcan") install --runtime-only" >/dev/null || fail "Could not prepare the Docker workspace image with the newly-added docker group"
-    progress_task_finish workspace image done "Docker workspace image ready"
+    sg docker -c "$(printf '%q' "$RUNTIME/bin/vulcan") install --runtime-only" >/dev/null \
+      || fail "Could not prepare the Docker workspace image"
+    progress_task_finish workspace image done "Docker workspace repaired"
   else
     progress_task_finish workspace image skipped "Workspace image deferred until session refresh"
   fi

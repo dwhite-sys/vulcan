@@ -13,8 +13,14 @@ $LocalRoot = Join-Path $env:LOCALAPPDATA "Vulcan"
 $WslRoot = Join-Path $LocalRoot "wsl"
 $CacheRoot = Join-Path $LocalRoot "cache"
 $BinRoot = Join-Path $LocalRoot "bin"
-New-Item -ItemType Directory -Force -Path $LocalRoot,$CacheRoot,$BinRoot | Out-Null
+$PythonRoot = Join-Path $LocalRoot "python"
+$UvToolRoot = Join-Path $LocalRoot "uv-tools"
+New-Item -ItemType Directory -Force -Path $LocalRoot,$CacheRoot,$BinRoot,$PythonRoot,$UvToolRoot | Out-Null
 
+$env:UV_PYTHON_INSTALL_DIR = $PythonRoot
+$env:UV_TOOL_DIR = $UvToolRoot
+$env:UV_TOOL_BIN_DIR = $BinRoot
+if (($env:Path -split ';') -notcontains $BinRoot) { $env:Path = "$BinRoot;$env:Path" }
 
 function Write-Step([string]$Message) { Write-Host "Vulcan: $Message" }
 function Emit-Result([hashtable]$Value) {
@@ -72,23 +78,12 @@ function Start-StandaloneWindowsInstall {
     }
 
     $digest = [string]$asset.digest
-    $expected = $null
 
-    if ($digest -match '^sha256:([0-9A-Fa-f]{64})$') {
-        $expected = $Matches[1].ToLowerInvariant()
+    if ($digest -notmatch '^sha256:([0-9A-Fa-f]{64})$') {
+        Fail "Vulcan-Setup.exe does not have a valid SHA-256 digest"
     }
-    else {
-        $bodyMatch = [regex]::Match(
-            [string]$release.body,
-            '(?m)^\|\s*`?Vulcan-Setup\.exe`?\s*\|\s*`?([0-9A-Fa-f]{64})`?\s*\|'
-        )
 
-        if (-not $bodyMatch.Success) {
-            Fail "GitHub release metadata did not contain a SHA-256 digest for Vulcan-Setup.exe"
-        }
-
-        $expected = $bodyMatch.Groups[1].Value.ToLowerInvariant()
-    }
+    $expected = $Matches[1].ToLowerInvariant()
     $tmp = Join-Path `
         ([IO.Path]::GetTempPath()) `
         ("Vulcan-Setup-{0}.exe" -f [Guid]::NewGuid())
@@ -128,172 +123,98 @@ if (-not $FromApp -and -not $ResourcesDir -and -not $ElevatedWslBootstrap) {
     exit 0
 }
 
-function Test-EtnaHealthy {
-    try {
-        $health = Invoke-RestMethod `
-            -UseBasicParsing `
-            -TimeoutSec 2 `
-            -Uri "http://127.0.0.1:8467/health"
-
-        return (
-            $health.service -eq "etna-mcp" -and
-            $health.status -eq "ok"
-        )
-    }
-    catch {
-        return $false
-    }
-}
-
-function Invoke-Etna([string[]]$EtnaArgs) {
-    $etna = Get-Command etna `
-        -CommandType Application `
-        -ErrorAction SilentlyContinue
-
-    if ($etna) {
-        & $etna.Source @EtnaArgs *> $null
-        if ($LASTEXITCODE -eq 0) { return $true }
-    }
-
-    if ($env:USERPROFILE) {
-        $localEtna = Join-Path $env:USERPROFILE ".local\bin\etna.exe"
-
-        if (Test-Path $localEtna) {
-            & $localEtna @EtnaArgs *> $null
-            if ($LASTEXITCODE -eq 0) { return $true }
-        }
-    }
-
-    $python = Get-Command python `
-        -CommandType Application `
-        -ErrorAction SilentlyContinue
-
-    if ($python) {
-        & $python.Source -m etna @EtnaArgs *> $null
-        if ($LASTEXITCODE -eq 0) { return $true }
-    }
-
-    $py = Get-Command py `
-        -CommandType Application `
-        -ErrorAction SilentlyContinue
-
-    if ($py) {
-        & $py.Source -3 -m etna @EtnaArgs *> $null
-        if ($LASTEXITCODE -eq 0) { return $true }
-    }
-
-    return $false
-}
-
-function Install-HostEtna {
-    $pip = Get-Command pip `
-        -CommandType Application `
-        -ErrorAction SilentlyContinue
-
-    if ($pip) {
-        & $pip.Source install "etna-mcp>=1.0.0b41" *> $null
-
-        if ($LASTEXITCODE -eq 0 -and (Invoke-Etna @("--help"))) {
-            return $true
-        }
-    }
-
-    $pipx = Get-Command pipx `
-        -CommandType Application `
-        -ErrorAction SilentlyContinue
-
-    if ($pipx) {
-        & $pipx.Source install "etna-mcp>=1.0.0b41" *> $null
-
-        if ($LASTEXITCODE -eq 0 -and (Invoke-Etna @("--help"))) {
-            return $true
-        }
-    }
-
-    $uv = Get-Command uv `
-        -CommandType Application `
-        -ErrorAction SilentlyContinue
-
-    if (-not $uv) {
-        $uvPath = Join-Path $BinRoot "uv.exe"
-
-        if (-not (Test-Path $uvPath)) {
-            $env:UV_UNMANAGED_INSTALL = $BinRoot
-            $env:UV_NO_MODIFY_PATH = "1"
-
-            try {
-                $installer = Invoke-RestMethod `
-                    -UseBasicParsing `
-                    -Uri "https://astral.sh/uv/install.ps1"
-
-                Invoke-Expression $installer
-            }
-            finally {
-                Remove-Item Env:UV_UNMANAGED_INSTALL -ErrorAction SilentlyContinue
-                Remove-Item Env:UV_NO_MODIFY_PATH -ErrorAction SilentlyContinue
-            }
-        }
-
-        if (Test-Path $uvPath) {
-            $uv = @{ Source = $uvPath }
-        }
-    }
-
-    if ($uv) {
-        & $uv.Source tool install `
-            --force `
-            "etna-mcp>=1.0.0b41" *> $null
-
-        if ($LASTEXITCODE -eq 0 -and (Invoke-Etna @("--help"))) {
-            return $true
-        }
-    }
-
-    return $false
-}
-
 function Ensure-HostEtna {
+    # If Etna is already healthy, leave it completely alone.
+    if (Test-TcpPort "127.0.0.1" 8467 500) {
+        Write-Step "Etna already healthy; skipping Etna setup"
+        return
+    }
+
     # Etna is intentionally native Windows. Its Playwright kit drives the user's
-    # visible host Chrome. Vulcan uses the running Etna service through HTTP.
+    # visible host Chrome, while Vulcan's server remains isolated inside WSL2.
+    $uv = Join-Path $BinRoot "uv.exe"
 
-    # Remove artifacts created by older Vulcan-owned Etna installs.
-    $legacyEtna = Join-Path $BinRoot "etna.exe"
-    $legacyTools = Join-Path $LocalRoot "uv-tools"
-    $legacyPython = Join-Path $LocalRoot "python"
+    if (-not (Test-Path $uv)) {
+        Write-Step "Repairing uv runtime"
 
-    if (Test-Path $legacyEtna) {
-        Remove-Item -Force $legacyEtna
-    }
+        $env:UV_UNMANAGED_INSTALL = $BinRoot
+        $env:UV_NO_MODIFY_PATH = "1"
 
-    if (Test-Path $legacyTools) {
-        Remove-Item -Recurse -Force $legacyTools
-    }
+        try {
+            $installer = Invoke-RestMethod `
+                -UseBasicParsing `
+                -Uri "https://astral.sh/uv/install.ps1"
 
-    if (Test-Path $legacyPython) {
-        Remove-Item -Recurse -Force $legacyPython
-    }
-
-    if (-not (Invoke-Etna @("--help"))) {
-        Write-Step "Installing Etna"
-
-        if (-not (Install-HostEtna)) {
-            Fail "Could not install Etna with pip, pipx, or uv"
+            Invoke-Expression $installer
+        }
+        catch {
+            Fail "Could not install uv: $($_.Exception.Message)"
         }
     }
 
-    if (-not (Test-EtnaHealthy)) {
-        if (-not (Invoke-Etna @("init"))) {
-            if (-not (Install-HostEtna)) {
-                Fail "Could not repair Etna"
-            }
+    if (-not (Test-Path $uv)) {
+        Fail "uv installer did not create $uv"
+    }
 
-            if (-not (Invoke-Etna @("init"))) {
-                Fail "Etna init failed"
-            }
+    & $uv python find --managed-python 3.12 *> $null
+
+    if ($LASTEXITCODE -ne 0) {
+        Write-Step "Installing Vulcan-managed Python 3.12"
+
+        & $uv python install 3.12 *> $null
+
+        if ($LASTEXITCODE -ne 0) {
+            Fail "Could not install Vulcan-managed Python 3.12"
+        }
+    }
+
+    $etna = Join-Path $BinRoot "etna.exe"
+    $etnaHealthy = $false
+
+    if (Test-Path $etna) {
+        & $etna --help *> $null
+        $etnaHealthy = ($LASTEXITCODE -eq 0)
+    }
+
+    if (-not $etnaHealthy) {
+        Write-Step "Repairing native Etna"
+
+        & $uv tool install `
+            --force `
+            --python 3.12 `
+            "etna-mcp" *> $null
+
+        if (
+            $LASTEXITCODE -ne 0 -or
+            -not (Test-Path $etna)
+        ) {
+            Fail "Could not install Etna"
+        }
+    }
+
+    # Etna now owns its managed runtime and Task Scheduler lifecycle.
+    & $etna init *> $null
+
+    if ($LASTEXITCODE -ne 0) {
+        # Covers b38, which has no `init`, and repairs stale pre-b40 installs.
+        Write-Step "Refreshing native Etna"
+
+        & $uv tool install `
+            --force `
+            --python 3.12 `
+            "etna-mcp" *> $null
+
+        if (
+            $LASTEXITCODE -ne 0 -or
+            -not (Test-Path $etna)
+        ) {
+            Fail "Could not refresh Etna"
         }
 
-        if (-not (Test-EtnaHealthy)) {
-            Fail "Etna init completed but Etna is not healthy on port 8467"
+        & $etna init *> $null
+
+        if ($LASTEXITCODE -ne 0) {
+            Fail "Etna self-repair failed"
         }
     }
 
@@ -306,11 +227,13 @@ function Ensure-HostEtna {
         try {
             if (Test-Path $configPath) {
                 $cfg = Get-Content -Raw $configPath | ConvertFrom-Json
-                $installed = (
-                    @($cfg.kits.PSObject.Properties.Name) -contains $kit
-                ) -and (
-                    Test-Path (Join-Path $etnaRoot "kits\$kit.py")
+                $hasConfig = @($cfg.kits.PSObject.Properties.Name) -contains $kit
+                $hasFile = Test-Path (
+                    Join-Path (
+                        Join-Path $etnaRoot "kits"
+                    ) "$kit.py"
                 )
+                $installed = $hasConfig -and $hasFile
             }
         }
         catch {
@@ -318,14 +241,18 @@ function Ensure-HostEtna {
         }
 
         if (-not $installed) {
-            if (-not (Invoke-Etna @("install", $kit))) {
+            Write-Step "Installing missing Etna kit: $kit"
+
+            & $etna install $kit *> $null
+
+            if ($LASTEXITCODE -ne 0) {
                 Fail "Could not install Etna kit '$kit'"
             }
         }
     }
 
-    if (-not (Test-EtnaHealthy)) {
-        Fail "Etna is not healthy on port 8467"
+    if (-not (Test-TcpPort "127.0.0.1" 8467 500)) {
+        Fail "Etna init completed but Etna is not healthy on port 8467"
     }
 }
 
@@ -352,6 +279,10 @@ if (-not (Test-WslAvailable)) {
         exit 20
     }
 }
+
+# Do not silently move a user onto a preview WSL build. Use the installed stable WSL.
+try { & wsl.exe --set-default-version 2 *> $null } catch { }
+
 
 $distros = @()
 try { $distros = @(& wsl.exe --list --quiet | ForEach-Object { $_.Trim([char]0).Trim() } | Where-Object { $_ }) } catch { }
@@ -384,108 +315,43 @@ if ($distros -notcontains $DistroName) {
     if ($LASTEXITCODE -ne 0) { Fail "Could not import the Vulcan WSL2 distro" }
 }
 
-$wslConfig = ""
-
-try {
-    $wslConfig = (
-        & wsl.exe -d $DistroName -u root -- cat /etc/wsl.conf 2>$null
-    ) -join "`n"
-}
-catch { }
-
-$needsWslRestart = -not (
-    $wslConfig -match "(?m)^systemd=true\s*$" -and
-    $wslConfig -match "(?m)^default=vulcan\s*$"
-)
-
-$baseCheck = @'
-set -e
-command -v sudo >/dev/null 2>&1
-command -v curl >/dev/null 2>&1
-[ -r /etc/ssl/certs/ca-certificates.crt ]
-command -v docker >/dev/null 2>&1
-id vulcan >/dev/null 2>&1
-id -nG vulcan | tr " " "\n" | grep -qx docker
-grep -Fxq "vulcan ALL=(ALL) NOPASSWD: /usr/bin/install, /usr/bin/systemctl, /usr/bin/tee" /etc/sudoers.d/vulcan
-grep -Eq "^[[:space:]]*systemd=true[[:space:]]*$" /etc/wsl.conf
-grep -Eq "^[[:space:]]*default=vulcan[[:space:]]*$" /etc/wsl.conf
-systemctl is-enabled --quiet docker.service
-'@
-
-& wsl.exe -d $DistroName -u root -- bash -lc $baseCheck *> $null
-
-if ($LASTEXITCODE -ne 0) {
-    Write-Step "Repairing WSL2 base state"
-
-    $bootstrap = @'
+Write-Step "Repairing WSL2 base state"
+# Initial distro configuration is intentionally root-owned. It creates a dedicated
+# unprivileged account and uses stock Ubuntu packages only inside the Vulcan distro.
+$bootstrap = @'
 set -e
 export DEBIAN_FRONTEND=noninteractive
-
 need_pkgs=()
 command -v sudo >/dev/null 2>&1 || need_pkgs+=(sudo)
 command -v curl >/dev/null 2>&1 || need_pkgs+=(curl)
 [ -r /etc/ssl/certs/ca-certificates.crt ] || need_pkgs+=(ca-certificates)
 command -v docker >/dev/null 2>&1 || need_pkgs+=(docker.io)
-
 if [ "${#need_pkgs[@]}" -gt 0 ]; then
   apt-get update -qq
   apt-get install -y -qq "${need_pkgs[@]}" >/dev/null
 fi
-
-id vulcan >/dev/null 2>&1 || useradd -m -s /bin/bash vulcan
-
-id -nG vulcan | tr " " "\n" | grep -qx docker \
-  || usermod -aG docker vulcan
-
-sudoers='vulcan ALL=(ALL) NOPASSWD: /usr/bin/install, /usr/bin/systemctl, /usr/bin/tee'
-
-if ! grep -Fxq "$sudoers" /etc/sudoers.d/vulcan 2>/dev/null; then
-  printf '%s\n' "$sudoers" >/etc/sudoers.d/vulcan
-fi
-
-[ "$(stat -c %a /etc/sudoers.d/vulcan 2>/dev/null || true)" = 440 ] \
-  || chmod 0440 /etc/sudoers.d/vulcan
-
-if ! grep -Eq "^[[:space:]]*systemd=true[[:space:]]*$" /etc/wsl.conf 2>/dev/null \
-  || ! grep -Eq "^[[:space:]]*default=vulcan[[:space:]]*$" /etc/wsl.conf 2>/dev/null
-then
-  cat >/etc/wsl.conf <<'EOF'
+if ! id vulcan >/dev/null 2>&1; then useradd -m -s /bin/bash vulcan; fi
+usermod -aG docker vulcan
+cat >/etc/sudoers.d/vulcan <<'EOF'
+vulcan ALL=(ALL) NOPASSWD: /usr/bin/systemctl, /usr/bin/tee
+EOF
+chmod 0440 /etc/sudoers.d/vulcan
+cat >/etc/wsl.conf <<'EOF'
 [boot]
 systemd=true
 [user]
 default=vulcan
 EOF
-fi
-
-systemctl is-enabled --quiet docker.service 2>/dev/null \
-  || systemctl enable docker.service >/dev/null 2>&1 \
-  || true
+systemctl enable docker.service >/dev/null 2>&1 || true
 '@
+& wsl.exe -d $DistroName -u root -- bash -lc $bootstrap
+if ($LASTEXITCODE -ne 0) { Fail "Could not configure the Vulcan WSL2 distro" }
 
-    & wsl.exe -d $DistroName -u root -- bash -lc $bootstrap
-
-    if ($LASTEXITCODE -ne 0) {
-        Fail "Could not repair the Vulcan WSL2 base state"
-    }
-
-    if ($needsWslRestart) {
-        & wsl.exe --terminate $DistroName *> $null
-        Start-Sleep -Milliseconds 500
-
-        & wsl.exe -d $DistroName -u root -- true
-
-        if ($LASTEXITCODE -ne 0) {
-            Fail "Vulcan WSL2 distro would not restart"
-        }
-    }
-
-    & wsl.exe -d $DistroName -u root -- bash -lc `
-        'systemctl is-enabled --quiet docker.service || systemctl enable docker.service >/dev/null'
-
-    if ($LASTEXITCODE -ne 0) {
-        Fail "Could not enable Docker in the Vulcan WSL2 distro"
-    }
-}
+# Make sure wsl.conf/systemd changes are active, then wake the dedicated distro.
+& wsl.exe --terminate $DistroName *> $null
+Start-Sleep -Milliseconds 500
+& wsl.exe -d $DistroName -u root -- true
+if ($LASTEXITCODE -ne 0) { Fail "Vulcan WSL2 distro would not start" }
 
 if (-not $ResourcesDir) {
     $candidate = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -504,7 +370,7 @@ $serverSource = "$guestResources/vulcan-server"
 $guestScript = "$guestResources/install.sh"
 $hashFile = "$guestResources/server-payload.sha256"
 
-Write-Step "Checking Vulcan Linux runtime inside WSL2"
+Write-Step "Repairing Vulcan Linux runtime inside WSL2"
 $guestArgs = @(
     "-d", $DistroName, "-u", "vulcan", "--",
     "bash", $guestScript,
@@ -517,7 +383,8 @@ $guestArgs = @(
 & wsl.exe @guestArgs
 if ($LASTEXITCODE -ne 0) { Fail "Vulcan Linux runtime repair failed inside WSL2" }
 
-# The guest converger owns service state. Verify Windows localhost forwarding.
+# Wake systemd-managed services and verify Windows localhost forwarding.
+& wsl.exe -d $DistroName -u root -- systemctl start docker.service vulcan.service *> $null
 $ready = $false
 for ($i = 0; $i -lt 60; $i++) {
     try {

@@ -124,16 +124,7 @@ for (const marker of ['ensure_uv()', 'ensure_python()', 'ensure_etna()', 'ensure
   assert(shell.includes(marker), `missing shell repair primitive: ${marker}`);
 }
 assert.match(shell, /pacman -S --needed --noconfirm docker/);
-assert.doesNotMatch(shell, /systemctl enable --now docker\.service/);
 assert.match(shell, /Keep Etna native on macOS/);
-assert.match(
-  shell,
-  /install_host_etna\(\)[\s\S]*ensure_uv[\s\S]*UV_TOOL_DIR/,
-);
-assert.doesNotMatch(
-  shell,
-  /ensure_etna\(\) \{\s*local kit\s*ensure_uv/,
-);
 assert.match(shell, /colima start vulcan --runtime docker/);
 assert.match(shell, /VULCAN_RESULT=/);
 assert.match(
@@ -141,14 +132,8 @@ assert.match(
   /install_linux_desktop >\/dev\/null/,
   'Linux must persist its stable AppImage without forcing a process handoff',
 );
-assert.match(
-  shell,
-  /-f "\$installed" && ! -x "\$installed"/,
-);
 assert.match(shell, /say "Preparing Docker workspace image"/);
-assert.match(shell, /SERVICE_CHANGED/);
-assert.match(shell, /SERVICE_TOUCHED/);
-assert.match(shell, /progress_plan 9 1 2 2 0 2 2/);
+assert.match(shell, /say "Starting Vulcan services"/);
 assert.match(shell, /standalone_linux_bootstrap\(\)/);
 assert.match(shell, /releases\/latest\/download\/%s/);
 assert.match(shell, /release_asset_digest\(\)/);
@@ -162,25 +147,12 @@ assert.match(shell, /--server-only/);
 assert.match(shell, /standalone_server_bootstrap\(\)/);
 assert.match(shell, /api\.github\.com\/repos\/dwhite-sys\/vulcan\/tarball/);
 assert.doesNotMatch(shell, /Vulcan-Server\.tar\.gz/);
-
+assert.match(shell, /loginctl enable-linger/);
 assert.match(shell, /SERVER_ONLY/);
-assert.match(
-  shell,
-  /cd "\$SERVER_SOURCE"[\s\S]*find \. [\s\\]+-type f/,
-  'fallback server payload hashing must use paths relative to SERVER_SOURCE',
-);
-assert.doesNotMatch(
-  shell,
-  /find "\$SERVER_SOURCE" -type f/,
-  'server payload hashes must not include random extraction-directory prefixes',
-);
 assert(shell.includes('VULCAN_HOME="${VULCAN_CONFIG_DIR:-$HOME/.vulcan}"'));
 assert(shell.includes('APP_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}/vulcan"'));
 assert(shell.includes('installed_source="$PAYLOAD_HOME/server"'));
-assert.match(
-  shell,
-  /"\$BIN_HOME\/uv"\s+pip install[\s\\]+--python "\$RUNTIME\/bin\/python"[\s\\]+"\$installed_source"/,
-);
+assert(shell.includes('"$BIN_HOME/uv" pip install --python "$RUNTIME/bin/python" "$installed_source"'));
 assert(!shell.includes('"$BIN_HOME/uv" pip install --python "$RUNTIME/bin/python" "$SERVER_SOURCE"'));
 
 const workflow = read(path.join(root, '.github', 'workflows', 'build.yml'));
@@ -206,21 +178,12 @@ const ps1 = read(path.join(root, 'install.ps1'));
 assert.match(ps1, /function Start-StandaloneWindowsInstall/);
 assert.match(ps1, /Vulcan-Setup\.exe/);
 assert.match(ps1, /Start-Process/);
-assert.match(ps1, /release\.body/);
-assert.match(ps1, /\$localEtna = Join-Path \$env:USERPROFILE/);
-assert.match(ps1, /Test-Path \$localEtna/);
-assert.doesNotMatch(ps1, /systemctl start docker\.service vulcan\.service/);
 assert.match(ps1, /function Ensure-HostEtna/);
 assert.match(ps1, /visible host Chrome/);
 assert.match(ps1, /\$DistroName = "Vulcan"/);
 assert.match(ps1, /--import \$DistroName/);
 assert.match(ps1, /systemd=true/);
 assert.match(ps1, /docker\.io/);
-assert.match(
-  ps1,
-  /NOPASSWD: \/usr\/bin\/install, \/usr\/bin\/systemctl, \/usr\/bin\/tee/,
-  'WSL guest must be able to install the system-level Vulcan service unit',
-);
 assert.match(ps1, /-d", \$DistroName/);
 
 const hashPath = path.join(appRoot, 'build', 'server-payload.sha256');

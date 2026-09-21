@@ -232,12 +232,15 @@ APP_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}/vulcan"
 CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
 BIN_HOME="$VULCAN_HOME/bin"
 PYTHON_HOME="$VULCAN_HOME/python"
+UV_TOOL_HOME="$VULCAN_HOME/uv-tools"
 RUNTIME="$VULCAN_HOME/runtime"
 PAYLOAD_HOME="$VULCAN_HOME/payload"
 SERVER_INSTALLED_HASH="$PAYLOAD_HOME/server-payload.sha256"
-mkdir -p "$VULCAN_HOME" "$BIN_HOME" "$PYTHON_HOME" "$PAYLOAD_HOME"
+mkdir -p "$VULCAN_HOME" "$BIN_HOME" "$PYTHON_HOME" "$UV_TOOL_HOME" "$PAYLOAD_HOME"
 
 export UV_PYTHON_INSTALL_DIR="$PYTHON_HOME"
+export UV_TOOL_DIR="$UV_TOOL_HOME"
+export UV_TOOL_BIN_DIR="$BIN_HOME"
 HOST_PATH="${PATH:-/usr/bin:/bin}"
 export PATH="$BIN_HOME:$HOST_PATH"
 
@@ -567,113 +570,109 @@ etna_kit_ready() {
   grep -Eq "\"$kit\"[[:space:]]*:" "$config"
 }
 
-run_etna() {
-  local etna py name
-
-  etna="$(PATH="$HOST_PATH:$HOME/.local/bin" command -v etna 2>/dev/null || true)"
-
-  if [[ -n "$etna" && -x "$etna" ]] && "$etna" "$@"; then
-    return
-  fi
-
-  for name in python3 python; do
-    py="$(PATH="$HOST_PATH" command -v "$name" 2>/dev/null || true)"
-    [[ -n "$py" ]] || continue
-
-    if "$py" -m etna "$@"; then
-      return
-    fi
-  done
-
-  return 1
-}
-
-install_host_etna() {
-  local installer
-
-  installer="$(PATH="$HOST_PATH" command -v pip 2>/dev/null || true)"
-  if [[ -n "$installer" ]] \
-    && "$installer" install 'etna-mcp>=1.0.0b41' >/dev/null 2>&1 \
-    && run_etna --help >/dev/null 2>&1
-  then
-    return
-  fi
-
-  installer="$(PATH="$HOST_PATH:$HOME/.local/bin" command -v pipx 2>/dev/null || true)"
-  if [[ -n "$installer" ]] \
-    && "$installer" install 'etna-mcp>=1.0.0b41' >/dev/null 2>&1 \
-    && run_etna --help >/dev/null 2>&1
-  then
-    return
-  fi
-
-  ensure_uv
-
-  env \
-    -u UV_PYTHON_INSTALL_DIR \
-    -u UV_TOOL_DIR \
-    -u UV_TOOL_BIN_DIR \
-    PATH="$HOST_PATH:$HOME/.local/bin" \
-    "$BIN_HOME/uv" tool install --force 'etna-mcp>=1.0.0b41' >/dev/null 2>&1 \
-    && run_etna --help >/dev/null 2>&1
-}
-
 ensure_etna() {
-  local kit
+  local etna="" kit
 
-  # Remove the obsolete Vulcan-owned Etna installation.
-  [[ ! -e "$BIN_HOME/etna" ]] || rm -f "$BIN_HOME/etna"
-  [[ ! -d "$VULCAN_HOME/uv-tools/etna-mcp" ]]     || rm -rf "$VULCAN_HOME/uv-tools/etna-mcp"
-  [[ ! -d "$VULCAN_HOME/uv-tools" ]]     || rmdir "$VULCAN_HOME/uv-tools" >/dev/null 2>&1 || true
+  # If Etna is already healthy, leave it completely alone.
+  if etna_endpoint_healthy; then
+    progress_task_finish etna cli skipped "Etna already healthy"
+    progress_task_finish etna runtime skipped "Etna already healthy"
+    for kit in web playwright ntfy; do
+      progress_task_finish etna "kit-$kit" skipped "Etna already healthy"
+    done
+    progress_task_finish etna endpoint skipped "Etna already healthy"
+    return
+  fi
+
+  ensure_python
+  etna="$BIN_HOME/etna"
 
   progress_task_start etna cli "Checking Etna CLI"
-
-  if run_etna --help >/dev/null 2>&1; then
-    progress_task_finish etna cli skipped "Host Etna already installed"
+  if [[ ! -x "$etna" ]] || ! "$etna" --help >/dev/null 2>&1; then
+    say "Repairing Etna"
+    "$BIN_HOME/uv" tool install \
+      --force \
+      --python 3.12 \
+      'etna-mcp' >/dev/null
+    progress_task_finish etna cli done "Etna CLI ready"
   else
-    say "Installing Etna"
-    install_host_etna \
-      || fail "Could not install Etna with pip, pipx, or uv"
-    progress_task_finish etna cli done "Host Etna installed"
+    progress_task_finish etna cli skipped "Etna CLI already ready"
   fi
 
-  progress_task_start etna runtime "Checking Etna runtime"
+  [[ -x "$etna" ]] || fail "Etna installation did not produce $etna"
 
-  if etna_endpoint_healthy; then
-    progress_task_finish etna runtime skipped "Etna runtime already healthy"
-  else
-    if ! run_etna init >/dev/null 2>&1; then
-      say "Repairing Etna installation"
-      install_host_etna \
-        || fail "Could not repair Etna"
-      run_etna init >/dev/null 2>&1 \
-        || fail "Etna init failed"
-    fi
-
-    etna_endpoint_healthy \
-      || fail "Etna init completed but Etna is not healthy on port 8467"
-
-    progress_task_finish etna runtime done "Etna runtime repaired"
+  # Old Vulcan builds modified Etna's systemd unit with a drop-in. Etna now
+  # owns its own service lifecycle, so remove that migration artifact before
+  # asking Etna to converge itself.
+  if [[ "$OS" == "Linux" && -z "$GUEST" ]] && have systemctl; then
+    local legacy_dropin="$CONFIG_HOME/systemd/user/etna.service.d/10-vulcan-runtime.conf"
+    rm -f "$legacy_dropin"
+    rmdir "$(dirname "$legacy_dropin")" >/dev/null 2>&1 || true
+    systemctl --user daemon-reload >/dev/null 2>&1 || true
   fi
+
+  progress_task_start etna runtime "Converging Etna runtime"
+
+  if ! "$etna" init >/dev/null; then
+    # b38 has no `etna init`, and b39 contained a Linux venv-service path bug.
+    # Refresh to the lifecycle-owning Etna release and retry once.
+    say "Refreshing Etna"
+    "$BIN_HOME/uv" tool install \
+      --force \
+      --python 3.12 \
+      'etna-mcp' >/dev/null \
+      || fail "Could not refresh Etna"
+
+    [[ -x "$etna" ]] || fail "Etna refresh did not produce $etna"
+
+    "$etna" init >/dev/null \
+      || fail "Etna self-repair failed"
+  fi
+
+  progress_task_finish etna runtime done "Etna runtime ready"
+
+  local py
+  py="$("$BIN_HOME/uv" python find --managed-python 3.12)"
 
   for kit in web playwright ntfy; do
     progress_task_start etna "kit-$kit" "Checking Etna kit: $kit"
 
-    if etna_kit_ready "$kit"; then
-      progress_task_finish etna "kit-$kit" skipped "Etna kit already ready: $kit"
-    else
-      run_etna install "$kit" >/dev/null 2>&1 \
+    if ! "$py" - "$kit" <<'PYKIT' >/dev/null 2>&1
+import json, pathlib, sys
+kit = sys.argv[1]
+p = pathlib.Path.home() / ".etna_server" / "config.json"
+if not p.exists():
+    raise SystemExit(1)
+data = json.loads(p.read_text())
+if kit not in data.get("kits", {}):
+    raise SystemExit(1)
+kitfile = pathlib.Path.home() / ".etna_server" / "kits" / f"{kit}.py"
+raise SystemExit(0 if kitfile.exists() else 1)
+PYKIT
+    then
+      say "Installing missing Etna kit: $kit"
+      "$etna" install "$kit" >/dev/null \
         || fail "Could not install Etna kit: $kit"
       progress_task_finish etna "kit-$kit" done "Etna kit ready: $kit"
+    else
+      progress_task_finish etna "kit-$kit" skipped "Etna kit already ready: $kit"
     fi
   done
 
+  # `etna init` owns startup and verifies health. Vulcan must not create a
+  # second independently-managed Etna process if the endpoint is absent.
   progress_task_start etna endpoint "Checking Etna endpoint"
 
-  etna_endpoint_healthy \
-    || fail "Etna is not healthy on port 8467"
-
-  progress_task_finish etna endpoint skipped "Etna endpoint healthy"
+  if "$py" - <<'PYHEALTH' >/dev/null 2>&1
+import urllib.request
+with urllib.request.urlopen("http://127.0.0.1:8467/health", timeout=1) as r:
+    raise SystemExit(0 if r.status == 200 else 1)
+PYHEALTH
+  then
+    progress_task_finish etna endpoint skipped "Etna endpoint already running"
+  else
+    fail "Etna init completed but Etna is not healthy on port 8467"
+  fi
 }
 
 server_payload_hash() {
@@ -684,15 +683,9 @@ server_payload_hash() {
   # Development/manual fallback: stable hash of server source contents.
   if [[ -n "$SERVER_SOURCE" && -d "$SERVER_SOURCE" ]]; then
     if have sha256sum; then
-      (
-        cd "$SERVER_SOURCE"
-        find .           -type f           ! -path '*/tests/*'           ! -path '*/__pycache__/*'           -print0           | LC_ALL=C sort -z           | xargs -0 sha256sum           | sha256sum           | awk '{print $1}'
-      )
+      find "$SERVER_SOURCE" -type f ! -path '*/tests/*' ! -path '*/__pycache__/*' -print0 | sort -z | xargs -0 sha256sum | sha256sum | awk '{print $1}'
     elif have shasum; then
-      (
-        cd "$SERVER_SOURCE"
-        find .           -type f           ! -path '*/tests/*'           ! -path '*/__pycache__/*'           -print           | LC_ALL=C sort           | xargs shasum -a 256           | shasum -a 256           | awk '{print $1}'
-      )
+      find "$SERVER_SOURCE" -type f ! -path '*/tests/*' ! -path '*/__pycache__/*' -print | LC_ALL=C sort | xargs shasum -a 256 | shasum -a 256 | awk '{print $1}'
     else
       printf '%s' "$VERSION"
     fi
@@ -703,69 +696,56 @@ server_payload_hash() {
 
 ensure_vulcan_runtime() {
   ensure_python
-  [[ -n "$SERVER_SOURCE" && -d "$SERVER_SOURCE" ]] \
-    || fail "Vulcan server payload is missing"
+  [[ -n "$SERVER_SOURCE" && -d "$SERVER_SOURCE" ]] || fail "Vulcan server payload is missing"
 
   local wanted current="" py="$RUNTIME/bin/python"
   local installed_source="$PAYLOAD_HOME/server"
-  local payload_ready=0 payload_changed=0 healthy=0
 
   wanted="$(server_payload_hash)"
-  [[ -f "$SERVER_INSTALLED_HASH" ]] \
-    && current="$(tr -d '[:space:]' < "$SERVER_INSTALLED_HASH")"
+  [[ -f "$SERVER_INSTALLED_HASH" ]] && current="$(tr -d '[:space:]' < "$SERVER_INSTALLED_HASH")"
 
-  [[ -f "$installed_source/pyproject.toml" ]] && payload_ready=1
-
-  progress_task_start server payload "Checking server payload"
-
-  if [[ "$current" == "$wanted" && "$payload_ready" -eq 1 ]]; then
-    progress_task_finish server payload skipped "Server payload already current"
-  else
-    say "Synchronizing Vulcan server payload"
-
-    local source_real installed_real="" staged_source
-    source_real="$(cd "$SERVER_SOURCE" && pwd -P)"
-
-    if [[ -d "$installed_source" ]]; then
-      installed_real="$(cd "$installed_source" && pwd -P)"
-    fi
-
-    if [[ "$source_real" != "$installed_real" ]]; then
-      staged_source="$PAYLOAD_HOME/.server.$$"
-      rm -rf "$staged_source"
-      mkdir -p "$staged_source"
-
-      cp -R "$SERVER_SOURCE"/. "$staged_source"/ \
-        || fail "Could not persist Vulcan server payload under $VULCAN_HOME"
-
-      rm -rf "$installed_source"
-      mv "$staged_source" "$installed_source"
-    fi
-
-    [[ -f "$installed_source/pyproject.toml" ]] \
-      || fail "Persisted Vulcan server payload is incomplete"
-
-    printf '%s\n' "$wanted" > "$SERVER_INSTALLED_HASH"
-    payload_changed=1
-
-    progress_task_finish server payload done "Server payload synchronized"
-  fi
-
-  if [[ -x "$py" ]] \
-    && "$py" -c 'import vulcan, fastapi, uvicorn, cryptography, numpy, sklearn, fastembed, spacy, PIL' >/dev/null 2>&1
-  then
+  local healthy=0 payload_ready=0
+  if [[ -x "$py" ]] && "$py" -c 'import vulcan, fastapi, uvicorn, cryptography, numpy, sklearn, fastembed, spacy, PIL' >/dev/null 2>&1; then
     healthy=1
   fi
+  [[ -f "$installed_source/pyproject.toml" ]] && payload_ready=1
 
-  progress_task_start server runtime "Checking Vulcan server runtime"
-
-  if [[ "$payload_changed" -eq 0 && "$healthy" -eq 1 ]]; then
+  if [[ "$current" == "$wanted" && "$healthy" -eq 1 && "$payload_ready" -eq 1 ]]; then
+    progress_task_finish server payload skipped "Server payload already current"
     progress_task_finish server runtime skipped "Server runtime already healthy"
     return
   fi
 
   say "Repairing Vulcan server runtime"
 
+  # Packaged resources are delivery media, not Vulcan's persistent home.
+  # Persist the server payload under ~/.vulcan before setuptools/uv builds it.
+  local source_real installed_real="" staged_source
+  source_real="$(cd "$SERVER_SOURCE" && pwd -P)"
+
+  if [[ -d "$installed_source" ]]; then
+    installed_real="$(cd "$installed_source" && pwd -P)"
+  fi
+
+  progress_task_start server payload "Synchronizing server payload"
+  if [[ "$source_real" != "$installed_real" ]]; then
+    staged_source="$PAYLOAD_HOME/.server.$$"
+    rm -rf "$staged_source"
+    mkdir -p "$staged_source"
+
+    if ! cp -R "$SERVER_SOURCE"/. "$staged_source"/; then
+      rm -rf "$staged_source"
+      fail "Could not persist Vulcan server payload under $VULCAN_HOME"
+    fi
+
+    rm -rf "$installed_source"
+    mv "$staged_source" "$installed_source"
+    progress_task_finish server payload done "Server payload synchronized"
+  else
+    progress_task_finish server payload skipped "Server payload already staged"
+  fi
+
+  progress_task_start server runtime "Installing Vulcan server runtime"
   if [[ -n "$GUEST" || "$SERVER_ONLY" -eq 1 ]]; then
     run_privileged systemctl stop vulcan.service >/dev/null 2>&1 || true
   else
@@ -775,11 +755,11 @@ ensure_vulcan_runtime() {
   rm -rf "$RUNTIME"
   "$BIN_HOME/uv" venv --python 3.12 "$RUNTIME" >/dev/null
 
-  "$BIN_HOME/uv" pip install \
-    --python "$RUNTIME/bin/python" \
-    "$installed_source" >/dev/null \
-    || fail "Could not install Vulcan server runtime"
+  if ! "$BIN_HOME/uv" pip install --python "$RUNTIME/bin/python" "$installed_source" >/dev/null; then
+    fail "Could not install Vulcan server runtime"
+  fi
 
+  printf '%s\n' "$wanted" > "$SERVER_INSTALLED_HASH"
   progress_task_finish server runtime done "Vulcan server runtime ready"
 }
 
@@ -815,11 +795,7 @@ ensure_docker_linux() {
   if ! docker info >/dev/null 2>&1; then
     changed=1
     if [[ -z "$GUEST" ]]; then
-      if have systemctl; then
-        systemctl is-enabled --quiet docker.service 2>/dev/null           || run_privileged systemctl enable docker.service >/dev/null || true
-
-        systemctl is-active --quiet docker.service 2>/dev/null           || run_privileged systemctl start docker.service >/dev/null || true
-      fi
+      if have systemctl; then run_privileged systemctl enable --now docker.service >/dev/null || true; fi
 
       # `id -nG "$USER"` reflects durable group-database membership; bare
       # `id -nG` reflects this process's current supplementary groups.
@@ -836,11 +812,7 @@ ensure_docker_linux() {
       if [[ "$durable" -eq 1 && "$current" -eq 0 && "$SERVER_ONLY" -eq 0 ]]; then DOCKER_RELOGIN=1; fi
     else
       # WSL/Colima guest provisioning is expected to have configured Docker.
-      if have sudo; then
-        systemctl is-enabled --quiet docker.service 2>/dev/null           || sudo systemctl enable docker.service >/dev/null 2>&1 || true
-
-        systemctl is-active --quiet docker.service 2>/dev/null           || sudo systemctl start docker.service >/dev/null 2>&1 || true
-      fi
+      if have sudo; then sudo systemctl enable --now docker.service >/dev/null 2>&1 || true; fi
       docker info >/dev/null 2>&1 || fail "Docker Engine is installed in the Vulcan guest but is not usable"
     fi
   fi
@@ -852,74 +824,22 @@ ensure_docker_linux() {
 }
 
 ensure_vulcan_service_linux() {
-  SERVICE_CHANGED=0
-  SERVICE_TOUCHED=0
-
-  local tmp_unit
-  local changed=0
-  local restart_needed=0
-  local touched=0
-
-  tmp_unit="$(mktemp)"
-
+  local py="$RUNTIME/bin/python"
   if [[ -n "$GUEST" || "$SERVER_ONLY" -eq 1 ]]; then
-    cat > "$tmp_unit" <<UNIT
-[Unit]
-Description=Vulcan Server
-After=network-online.target docker.service
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=$USER
-Environment=HOME=$HOME
-Environment=PATH=$BIN_HOME:/usr/local/bin:/usr/bin:/bin
-Environment=PYTHONUNBUFFERED=1
-ExecStart=$RUNTIME/bin/vulcan serve
-Restart=on-failure
-RestartSec=2
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-
-    if ! cmp -s \
-      "$tmp_unit" \
-      /etc/systemd/system/vulcan.service \
-      2>/dev/null
-    then
-      run_privileged install -m 0644 \
-        "$tmp_unit" \
-        /etc/systemd/system/vulcan.service
-
-      run_privileged systemctl daemon-reload
-
-      changed=1
-      restart_needed=1
-    fi
-
+    # Dedicated VM/distro and native --server-only installs use a system service
+    # so the backend survives logout and starts at boot without a desktop session.
+    local unit tmp_unit
+    unit="[Unit]\nDescription=Vulcan Server\nAfter=network-online.target docker.service\nWants=network-online.target\n\n[Service]\nType=simple\nUser=$USER\nEnvironment=HOME=$HOME\nEnvironment=PATH=$BIN_HOME:/usr/local/bin:/usr/bin:/bin\nEnvironment=PYTHONUNBUFFERED=1\nExecStart=$RUNTIME/bin/vulcan serve\nRestart=on-failure\nRestartSec=2\n\n[Install]\nWantedBy=multi-user.target\n"
+    tmp_unit="$(mktemp)"
+    printf '%b' "$unit" > "$tmp_unit"
+    run_privileged install -m 0644 "$tmp_unit" /etc/systemd/system/vulcan.service
     rm -f "$tmp_unit"
-
-    if ! systemctl is-enabled --quiet vulcan.service 2>/dev/null; then
-      run_privileged systemctl enable vulcan.service >/dev/null
-      changed=1
-    fi
-
-    if [[ "$restart_needed" -eq 1 ]]; then
-      run_privileged systemctl restart vulcan.service >/dev/null
-      touched=1
-    elif ! systemctl is-active --quiet vulcan.service 2>/dev/null; then
-      run_privileged systemctl start vulcan.service >/dev/null
-      changed=1
-      touched=1
-    fi
+    run_privileged systemctl daemon-reload
+    run_privileged systemctl enable --now vulcan.service >/dev/null
   else
-    local dir="$CONFIG_HOME/systemd/user"
-    local file="$dir/vulcan.service"
-
+    local dir="$CONFIG_HOME/systemd/user" file="$CONFIG_HOME/systemd/user/vulcan.service"
     mkdir -p "$dir"
-
-    cat > "$tmp_unit" <<UNIT
+    cat > "$file" <<UNIT
 [Unit]
 Description=Vulcan Server
 After=network-online.target
@@ -937,49 +857,9 @@ RestartSec=2
 [Install]
 WantedBy=default.target
 UNIT
-
-    if ! cmp -s "$tmp_unit" "$file" 2>/dev/null; then
-      mv -f "$tmp_unit" "$file"
-      systemctl --user daemon-reload
-
-      changed=1
-      restart_needed=1
-    else
-      rm -f "$tmp_unit"
-    fi
-
-    if ! systemctl --user is-enabled --quiet vulcan.service 2>/dev/null; then
-      systemctl --user enable vulcan.service >/dev/null
-      changed=1
-    fi
-
-    if [[ "$restart_needed" -eq 1 ]]; then
-      systemctl --user restart vulcan.service >/dev/null
-      touched=1
-    elif ! systemctl --user is-active --quiet vulcan.service 2>/dev/null; then
-      systemctl --user start vulcan.service >/dev/null
-      changed=1
-      touched=1
-    fi
+    systemctl --user daemon-reload
+    systemctl --user enable --now vulcan.service >/dev/null
   fi
-
-  SERVICE_CHANGED="$changed"
-  SERVICE_TOUCHED="$touched"
-}
-
-restart_vulcan_service_linux() {
-  if [[ -n "$GUEST" || "$SERVER_ONLY" -eq 1 ]]; then
-    run_privileged systemctl restart vulcan.service >/dev/null
-  else
-    systemctl --user restart vulcan.service >/dev/null
-  fi
-}
-
-server_healthy() {
-  "$RUNTIME/bin/python" - <<'PY' >/dev/null 2>&1
-import urllib.request
-urllib.request.urlopen('http://127.0.0.1:8468/meta', timeout=.6).read()
-PY
 }
 
 wait_server() {
@@ -996,56 +876,29 @@ PY
 }
 
 install_linux_desktop() {
-  DESKTOP_CHANGED=0
-
   [[ "$SERVER_ONLY" -eq 0 ]] || return 0
   [[ "$FROM_APP" -eq 1 ]] || return 0
-
   local app_home="$APP_DATA_HOME/app"
   local desktop_home="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
   local icon_home="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/512x512/apps"
   local autostart_home="$CONFIG_HOME/autostart"
-
   mkdir -p "$app_home" "$desktop_home" "$icon_home" "$autostart_home"
 
   local installed="$app_home/Vulcan.AppImage"
-
-  if [[ -n "$APP_PATH" && -f "$APP_PATH" ]] \
-    && [[ "$(readlink -f "$APP_PATH")" != "$(readlink -f "$installed" 2>/dev/null || true)" ]]
-  then
-    if [[ ! -f "$installed" ]] || ! cmp -s "$APP_PATH" "$installed"; then
+  if [[ -n "$APP_PATH" && -f "$APP_PATH" ]]; then
+    if [[ "$(readlink -f "$APP_PATH")" != "$(readlink -f "$installed" 2>/dev/null || true)" ]]; then
       local tmp="$installed.new"
       cp -f "$APP_PATH" "$tmp"
       chmod 0755 "$tmp"
       mv -f "$tmp" "$installed"
-      DESKTOP_CHANGED=1
     fi
   fi
-
-  if [[ -f "$installed" && ! -x "$installed" ]]; then
-    chmod 0755 "$installed"
-    DESKTOP_CHANGED=1
-  fi
-
-  [[ -x "$installed" ]] \
-    || fail "Could not establish installed AppImage at $installed"
-
-  local icon="$icon_home/vulcan.png"
+  [[ -x "$installed" ]] || fail "Could not establish installed AppImage at $installed"
 
   if [[ -n "$RESOURCES_DIR" && -f "$RESOURCES_DIR/vulcan-icon.png" ]]; then
-    if [[ ! -f "$icon" ]] \
-      || ! cmp -s "$RESOURCES_DIR/vulcan-icon.png" "$icon"
-    then
-      cp -f "$RESOURCES_DIR/vulcan-icon.png" "$icon"
-      DESKTOP_CHANGED=1
-    fi
+    cp -f "$RESOURCES_DIR/vulcan-icon.png" "$icon_home/vulcan.png"
   fi
-
-  local desktop_file="$desktop_home/vulcan.desktop"
-  local desktop_tmp
-  desktop_tmp="$(mktemp)"
-
-  cat > "$desktop_tmp" <<DESKTOP
+  cat > "$desktop_home/vulcan.desktop" <<DESKTOP
 [Desktop Entry]
 Name=Vulcan
 Comment=AI harness with local server and workspaces
@@ -1058,19 +911,7 @@ Categories=Development;Utility;
 StartupWMClass=Vulcan
 X-AppImage-Integrate=false
 DESKTOP
-
-  if ! cmp -s "$desktop_tmp" "$desktop_file" 2>/dev/null; then
-    mv -f "$desktop_tmp" "$desktop_file"
-    DESKTOP_CHANGED=1
-  else
-    rm -f "$desktop_tmp"
-  fi
-
-  local autostart_file="$autostart_home/vulcan.desktop"
-  local autostart_tmp
-  autostart_tmp="$(mktemp)"
-
-  cat > "$autostart_tmp" <<DESKTOP
+  cat > "$autostart_home/vulcan.desktop" <<DESKTOP
 [Desktop Entry]
 Name=Vulcan
 Comment=Start Vulcan in the system tray
@@ -1083,57 +924,21 @@ X-GNOME-Autostart-enabled=true
 X-KDE-autostart-after=panel
 X-AppImage-Integrate=false
 DESKTOP
-
-  if ! cmp -s "$autostart_tmp" "$autostart_file" 2>/dev/null; then
-    mv -f "$autostart_tmp" "$autostart_file"
-    DESKTOP_CHANGED=1
-  else
-    rm -f "$autostart_tmp"
-  fi
-
-  if [[ ! -x "$desktop_file" ]]; then
-    chmod +x "$desktop_file"
-    DESKTOP_CHANGED=1
-  fi
-
-  if [[ ! -x "$autostart_file" ]]; then
-    chmod +x "$autostart_file"
-    DESKTOP_CHANGED=1
-  fi
-
-  if [[ "$DESKTOP_CHANGED" -eq 1 ]] && have update-desktop-database; then
-    update-desktop-database "$desktop_home" >/dev/null 2>&1 || true
-  fi
-
+  chmod +x "$desktop_home/vulcan.desktop" "$autostart_home/vulcan.desktop"
+  have update-desktop-database && update-desktop-database "$desktop_home" >/dev/null 2>&1 || true
   printf '%s' "$installed"
-}
-
-workspace_runtime_ready() {
-  "$RUNTIME/bin/python" -c \
-    'from vulcan import docker, recall; s=recall.status(); raise SystemExit(0 if docker.image_current() and s["semantic_downloaded"] and s["lexical_ready"] else 1)' \
-    >/dev/null 2>&1
 }
 
 linux_converge() {
   local relogin=0
-
-  if [[ -n "$GUEST" ]]; then
-    progress_plan 9 1 2 2 0 2 2
-  else
-    progress_plan 15 1 2 2 6 2 2
-  fi
+  progress_plan 15 1 2 2 6 2 2
 
   # Persist/update the stable AppImage and desktop metadata for future launches,
   # but keep the Electron process the user actually opened as this first session.
   progress_task_start checking integration "Checking installation"
   if [[ -z "$GUEST" && "$SERVER_ONLY" -eq 0 ]]; then
     install_linux_desktop >/dev/null
-
-    if [[ "$DESKTOP_CHANGED" -eq 1 ]]; then
-      progress_task_finish checking integration done "Desktop integration repaired"
-    else
-      progress_task_finish checking integration skipped "Desktop integration already ready"
-    fi
+    progress_task_finish checking integration done "Desktop integration ready"
   else
     progress_task_finish checking integration skipped "Desktop integration not required"
   fi
@@ -1141,49 +946,39 @@ linux_converge() {
   # Etna is deliberately host-side. On native headless Linux, the host is also
   # the server machine, so the same Etna + kit runtime is retained.
   if [[ -z "$GUEST" ]]; then ensure_etna; fi
+  if [[ -z "$GUEST" && "$SERVER_ONLY" -eq 1 ]] && have loginctl; then
+    # Etna is a systemd user service. Linger keeps that user manager available
+    # after SSH logout while Vulcan itself is supervised by a system service.
+    run_privileged loginctl enable-linger "$USER" >/dev/null 2>&1 || true
+    systemctl --user enable --now etna.service >/dev/null 2>&1 || true
+  fi
   ensure_docker_linux
   relogin="$DOCKER_RELOGIN"
-  progress_task_start workspace image "Checking Docker workspace"
+  # Build/repair the workspace image whenever Docker is usable. A headless install
+  # can immediately adopt newly-added docker-group membership via `sg` instead of
+  # forcing an SSH logout/login cycle.
+  progress_task_start workspace image "Preparing Docker workspace image"
   if docker info >/dev/null 2>&1; then
-    if workspace_runtime_ready; then
-      progress_task_finish workspace image skipped "Docker workspace already ready"
-    else
-      say "Preparing Docker workspace image"
-      "$RUNTIME/bin/vulcan" install --runtime-only >/dev/null
-      workspace_runtime_ready || fail "Workspace repair did not converge"
-      progress_task_finish workspace image done "Docker workspace repaired"
-    fi
+    say "Preparing Docker workspace image"
+    "$RUNTIME/bin/vulcan" install --runtime-only >/dev/null
+    progress_task_finish workspace image done "Docker workspace image ready"
   elif [[ "$SERVER_ONLY" -eq 1 ]] && have sg && id -nG "$USER" | tr ' ' '\n' | grep -qx docker; then
     say "Preparing Docker workspace image"
-    sg docker -c "$(printf '%q' "$RUNTIME/bin/vulcan") install --runtime-only" >/dev/null \
-      || fail "Could not prepare the Docker workspace image"
-    progress_task_finish workspace image done "Docker workspace repaired"
+    sg docker -c "$(printf '%q' "$RUNTIME/bin/vulcan") install --runtime-only" >/dev/null || fail "Could not prepare the Docker workspace image with the newly-added docker group"
+    progress_task_finish workspace image done "Docker workspace image ready"
   else
     progress_task_finish workspace image skipped "Workspace image deferred until session refresh"
   fi
 
-  progress_task_start services service "Checking Vulcan service"
+  progress_task_start services service "Starting Vulcan service"
+  say "Starting Vulcan services"
   ensure_vulcan_service_linux
-
-  if [[ "$SERVICE_CHANGED" -eq 1 ]]; then
-    progress_task_finish services service done "Vulcan service repaired"
-  else
-    progress_task_finish services service skipped "Vulcan service already ready"
-  fi
+  progress_task_finish services service done "Vulcan service running"
 
   progress_task_start services health "Checking Vulcan server health"
   if [[ "$relogin" == 0 ]]; then
-    if server_healthy; then
-      progress_task_finish services health skipped "Vulcan server already healthy"
-    else
-      if [[ "$SERVICE_TOUCHED" -eq 0 ]]; then
-        restart_vulcan_service_linux
-      fi
-
-      wait_server         || fail "Vulcan server did not become healthy on port 8468"
-
-      progress_task_finish services health done "Vulcan server health repaired"
-    fi
+    wait_server || fail "Vulcan server did not become healthy on port 8468"
+    progress_task_finish services health done "Vulcan server healthy on port 8468"
   else
     progress_task_finish services health skipped "Health check deferred until new login session"
   fi
@@ -1197,25 +992,20 @@ linux_converge() {
 }
 
 macos_host_converge() {
+  # Electron itself handles moving Vulcan.app into Applications.  This script
+  # owns the Linux backend substrate.
+  if ! have brew; then
+    warn "Homebrew is required to install Colima automatically on macOS"
+    if [[ "$JSON_MODE" -eq 1 ]]; then printf 'VULCAN_RESULT={"ok":false,"needsHomebrew":true,"message":"Homebrew is required for the Colima backend"}\n'; fi
+    exit 30
+  fi
   # Keep Etna native on macOS so Playwright can drive the user's visible Chrome
   # and client-POV tools remain truly host-local. Only the Vulcan server lives in Colima.
   ensure_etna
+  if ! have colima; then say "Installing Colima"; brew install colima >/dev/null; fi
 
-  if ! have colima; then
-    if ! have brew; then
-      warn "Homebrew is required to install Colima automatically on macOS"
-      if [[ "$JSON_MODE" -eq 1 ]]; then printf 'VULCAN_RESULT={"ok":false,"needsHomebrew":true,"message":"Homebrew is required for the Colima backend"}\n'; fi
-      exit 30
-    fi
-
-    say "Installing Colima"
-    brew install colima >/dev/null
-  fi
-
-  if ! colima status -p vulcan >/dev/null 2>&1; then
-    say "Starting Vulcan Colima profile"
-    colima start vulcan --runtime docker >/dev/null
-  fi
+  say "Starting Vulcan Colima profile"
+  colima start vulcan --runtime docker >/dev/null
 
   [[ -n "$SERVER_SOURCE" && -d "$SERVER_SOURCE" ]] || fail "Packaged Vulcan server payload is missing"
   local wanted_hash guest_hash
@@ -1250,17 +1040,16 @@ macos_host_converge() {
     --server-hash-file "$guest_home/.vulcan/payload/server-payload.sha256" \
     --version "$VERSION" < "$0"
 
-  # Colima/Lima automatically forwards guest listening ports to the macOS host.
-  local launch_dir launch_file colima_bin launch_tmp launch_changed=0
+  # Colima/Lima automatically forwards guest listening ports to the macOS host,
+  # so a Vulcan server on guest :8468 is available at host localhost:8468.
+  # A LaunchAgent starts the named profile at login; Colima owns its own VM and
+  # port-forwarding lifecycle after the start command returns.
+  local launch_dir launch_file colima_bin
   colima_bin="$(command -v colima)"
   launch_dir="$HOME/Library/LaunchAgents"
   launch_file="$launch_dir/com.vulcan.backend.plist"
-
   mkdir -p "$launch_dir"
-
-  launch_tmp="$(mktemp)"
-
-  cat > "$launch_tmp" <<PLIST
+  cat > "$launch_file" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
@@ -1273,25 +1062,8 @@ macos_host_converge() {
   <key>KeepAlive</key><false/>
 </dict></plist>
 PLIST
-
-  if ! cmp -s "$launch_tmp" "$launch_file" 2>/dev/null; then
-    mv -f "$launch_tmp" "$launch_file"
-    launch_changed=1
-  else
-    rm -f "$launch_tmp"
-  fi
-
-  if ! launchctl print "gui/$(id -u)/com.vulcan.backend" >/dev/null 2>&1; then
-    launch_changed=1
-  fi
-
-  if [[ "$launch_changed" -eq 1 ]]; then
-    launchctl bootout "gui/$(id -u)" "$launch_file" >/dev/null 2>&1 || true
-
-    launchctl bootstrap "gui/$(id -u)" "$launch_file" >/dev/null 2>&1 \
-      || launchctl load "$launch_file" >/dev/null 2>&1 \
-      || fail "Could not register Vulcan Colima startup"
-  fi
+  launchctl bootout "gui/$(id -u)" "$launch_file" >/dev/null 2>&1 || true
+  launchctl bootstrap "gui/$(id -u)" "$launch_file" >/dev/null 2>&1 || launchctl load "$launch_file" >/dev/null 2>&1 || true
 
   # Validate the actual desktop-side contract before declaring convergence.
   local mac_ready=0

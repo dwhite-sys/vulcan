@@ -12,6 +12,7 @@ Directory layout:
     runtime/             — Vulcan-managed Python environment
     python/              — Vulcan-managed Python installation
     bin/                 — Vulcan-private launchers/tools
+    uv-tools/            — Vulcan-owned uv tool state
     payload/             — persisted packaged server payload + payload hash
     chats/               — also bind-mounted read-only at /chats for cross-chat file references
       <chat-uuid>/       — per-conversation data

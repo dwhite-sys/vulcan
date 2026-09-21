@@ -286,24 +286,15 @@ def cmd_install(args):
             fail("Failed to build Docker image")
             return
 
-    # Repair only missing recall assets.
+    # Recall is a standard server capability, not an optional post-install step.
     print()
+    info("Preparing built-in semantic and lexical recall models...")
     try:
         from vulcan import recall
 
-        state = recall.status()
-
-        if state["semantic_downloaded"]:
-            info("Semantic recall model already ready")
-        else:
-            semantic = recall.download_semantic_model()
-            ok(f"BGE-small semantic encoder ready ({semantic['dimensions']} dimensions)")
-
-        if state["lexical_ready"]:
-            info("Lexical recall bank already ready")
-        else:
-            lexical = recall.build_lexical_bank()
-            ok(f"spaCy lexical embedding bank ready: {lexical['path']}")
+        assets = recall.provision_models()
+        ok(f"BGE-small semantic encoder ready ({assets['semantic']['dimensions']} dimensions)")
+        ok(f"spaCy lexical embedding bank ready: {assets['lexical']['path']}")
     except Exception as exc:
         warn(f"Recall models could not be prepared: {exc}")
         info("The server will retry automatically when it starts.")

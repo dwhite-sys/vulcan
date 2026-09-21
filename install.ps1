@@ -329,10 +329,6 @@ if (-not (Test-WslAvailable)) {
     }
 }
 
-# Do not silently move a user onto a preview WSL build. Use the installed stable WSL.
-try { & wsl.exe --set-default-version 2 *> $null } catch { }
-
-
 $distros = @()
 try { $distros = @(& wsl.exe --list --quiet | ForEach-Object { $_.Trim([char]0).Trim() } | Where-Object { $_ }) } catch { }
 if ($distros -notcontains $DistroName) {
@@ -364,43 +360,108 @@ if ($distros -notcontains $DistroName) {
     if ($LASTEXITCODE -ne 0) { Fail "Could not import the Vulcan WSL2 distro" }
 }
 
-Write-Step "Repairing WSL2 base state"
-# Initial distro configuration is intentionally root-owned. It creates a dedicated
-# unprivileged account and uses stock Ubuntu packages only inside the Vulcan distro.
-$bootstrap = @'
+$wslConfig = ""
+
+try {
+    $wslConfig = (
+        & wsl.exe -d $DistroName -u root -- cat /etc/wsl.conf 2>$null
+    ) -join "`n"
+}
+catch { }
+
+$needsWslRestart = -not (
+    $wslConfig -match "(?m)^systemd=true\s*$" -and
+    $wslConfig -match "(?m)^default=vulcan\s*$"
+)
+
+$baseCheck = @'
+set -e
+command -v sudo >/dev/null 2>&1
+command -v curl >/dev/null 2>&1
+[ -r /etc/ssl/certs/ca-certificates.crt ]
+command -v docker >/dev/null 2>&1
+id vulcan >/dev/null 2>&1
+id -nG vulcan | tr " " "\n" | grep -qx docker
+grep -Fxq "vulcan ALL=(ALL) NOPASSWD: /usr/bin/systemctl, /usr/bin/tee" /etc/sudoers.d/vulcan
+grep -Eq "^[[:space:]]*systemd=true[[:space:]]*$" /etc/wsl.conf
+grep -Eq "^[[:space:]]*default=vulcan[[:space:]]*$" /etc/wsl.conf
+systemctl is-enabled --quiet docker.service
+'@
+
+& wsl.exe -d $DistroName -u root -- bash -lc $baseCheck *> $null
+
+if ($LASTEXITCODE -ne 0) {
+    Write-Step "Repairing WSL2 base state"
+
+    $bootstrap = @'
 set -e
 export DEBIAN_FRONTEND=noninteractive
+
 need_pkgs=()
 command -v sudo >/dev/null 2>&1 || need_pkgs+=(sudo)
 command -v curl >/dev/null 2>&1 || need_pkgs+=(curl)
 [ -r /etc/ssl/certs/ca-certificates.crt ] || need_pkgs+=(ca-certificates)
 command -v docker >/dev/null 2>&1 || need_pkgs+=(docker.io)
+
 if [ "${#need_pkgs[@]}" -gt 0 ]; then
   apt-get update -qq
   apt-get install -y -qq "${need_pkgs[@]}" >/dev/null
 fi
-if ! id vulcan >/dev/null 2>&1; then useradd -m -s /bin/bash vulcan; fi
-usermod -aG docker vulcan
-cat >/etc/sudoers.d/vulcan <<'EOF'
-vulcan ALL=(ALL) NOPASSWD: /usr/bin/systemctl, /usr/bin/tee
-EOF
-chmod 0440 /etc/sudoers.d/vulcan
-cat >/etc/wsl.conf <<'EOF'
+
+id vulcan >/dev/null 2>&1 || useradd -m -s /bin/bash vulcan
+
+id -nG vulcan | tr " " "\n" | grep -qx docker \
+  || usermod -aG docker vulcan
+
+sudoers='vulcan ALL=(ALL) NOPASSWD: /usr/bin/systemctl, /usr/bin/tee'
+
+if ! grep -Fxq "$sudoers" /etc/sudoers.d/vulcan 2>/dev/null; then
+  printf '%s\n' "$sudoers" >/etc/sudoers.d/vulcan
+fi
+
+[ "$(stat -c %a /etc/sudoers.d/vulcan 2>/dev/null || true)" = 440 ] \
+  || chmod 0440 /etc/sudoers.d/vulcan
+
+if ! grep -Eq "^[[:space:]]*systemd=true[[:space:]]*$" /etc/wsl.conf 2>/dev/null \
+  || ! grep -Eq "^[[:space:]]*default=vulcan[[:space:]]*$" /etc/wsl.conf 2>/dev/null
+then
+  cat >/etc/wsl.conf <<'EOF'
 [boot]
 systemd=true
 [user]
 default=vulcan
 EOF
-systemctl enable docker.service >/dev/null 2>&1 || true
-'@
-& wsl.exe -d $DistroName -u root -- bash -lc $bootstrap
-if ($LASTEXITCODE -ne 0) { Fail "Could not configure the Vulcan WSL2 distro" }
+fi
 
-# Make sure wsl.conf/systemd changes are active, then wake the dedicated distro.
-& wsl.exe --terminate $DistroName *> $null
-Start-Sleep -Milliseconds 500
-& wsl.exe -d $DistroName -u root -- true
-if ($LASTEXITCODE -ne 0) { Fail "Vulcan WSL2 distro would not start" }
+systemctl is-enabled --quiet docker.service 2>/dev/null \
+  || systemctl enable docker.service >/dev/null 2>&1 \
+  || true
+'@
+
+    & wsl.exe -d $DistroName -u root -- bash -lc $bootstrap
+
+    if ($LASTEXITCODE -ne 0) {
+        Fail "Could not repair the Vulcan WSL2 base state"
+    }
+
+    if ($needsWslRestart) {
+        & wsl.exe --terminate $DistroName *> $null
+        Start-Sleep -Milliseconds 500
+
+        & wsl.exe -d $DistroName -u root -- true
+
+        if ($LASTEXITCODE -ne 0) {
+            Fail "Vulcan WSL2 distro would not restart"
+        }
+    }
+
+    & wsl.exe -d $DistroName -u root -- bash -lc `
+        'systemctl is-enabled --quiet docker.service || systemctl enable docker.service >/dev/null'
+
+    if ($LASTEXITCODE -ne 0) {
+        Fail "Could not enable Docker in the Vulcan WSL2 distro"
+    }
+}
 
 if (-not $ResourcesDir) {
     $candidate = Split-Path -Parent $MyInvocation.MyCommand.Path

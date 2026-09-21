@@ -425,63 +425,75 @@ standalone_server_bootstrap() {
 }
 
 standalone_linux_bootstrap() {
-  [[ "$OS" == "Linux" ]] || fail "The direct curl installer currently installs the Linux AppImage; macOS should launch the Vulcan DMG/app"
   ensure_downloader
 
-  local app_home="$APP_DATA_HOME/app" installed="$APP_DATA_HOME/app/Vulcan.AppImage"
-  local tmp_app extract_root resources packaged_installer app_url expected_sha result
-  mkdir -p "$app_home"
+  local installed="$APP_DATA_HOME/app/Vulcan.AppImage"
+  local tmp_app expected_sha
+
+  mkdir -p "$(dirname "$installed")"
   tmp_app="$(mktemp "${TMPDIR:-/tmp}/vulcan-appimage.XXXXXX")"
-  extract_root="$(mktemp -d "${TMPDIR:-/tmp}/vulcan-appimage-extract.XXXXXX")"
-  trap 'rm -f "${tmp_app:-}"; rm -rf "${extract_root:-}"' EXIT
+  trap 'rm -f "${tmp_app:-}"' EXIT
 
-  app_url="${APPIMAGE_URL_OVERRIDE:-$(release_asset_url Vulcan.AppImage)}"
+  say "Downloading Vulcan"
+  download_file "$(release_asset_url Vulcan.AppImage)" "$tmp_app" \
+    || fail "Could not download Vulcan.AppImage"
 
-  if [[ -n "$APPIMAGE_SHA256_OVERRIDE" ]]; then
-    expected_sha="$APPIMAGE_SHA256_OVERRIDE"
-  elif [[ -n "$APPIMAGE_URL_OVERRIDE" ]]; then
-    fail "Custom VULCAN_APPIMAGE_URL requires VULCAN_APPIMAGE_SHA256"
-  else
-    expected_sha="$(release_asset_digest Vulcan.AppImage)"
-  fi
-
-  say "Downloading Vulcan AppImage (${RELEASE_TAG})"
-  download_file "$app_url" "$tmp_app"     || fail "Could not download Vulcan AppImage from $app_url"
+  expected_sha="$(release_asset_digest Vulcan.AppImage)"
   verify_sha256 "$tmp_app" "$expected_sha"
+
   chmod 0755 "$tmp_app"
-
-  # The release artifact is the source of truth. Extract its bundled resources
-  # and run the exact same converger Electron runs on every packaged launch.
-  say "Extracting packaged Vulcan installer"
-  (cd "$extract_root" && "$tmp_app" --appimage-extract >/dev/null) || fail "Could not extract the Vulcan AppImage"
-  packaged_installer="$(find "$extract_root/squashfs-root" -type f -path '*/resources/install.sh' -print -quit)"
-  [[ -n "$packaged_installer" ]] || fail "The Vulcan AppImage does not contain resources/install.sh"
-  resources="$(dirname "$packaged_installer")"
-  [[ -d "$resources/vulcan-server" ]] || fail "The Vulcan AppImage does not contain the server payload"
-
-  # Put the verified artifact at its permanent path before convergence. The
-  # packaged installer therefore sees the same stable AppImage path as normal
-  # subsequent launches and will create the desktop entry/icon/autostart files.
-  local staged="$installed.new"
-  cp -f "$tmp_app" "$staged"
-  chmod 0755 "$staged"
-  mv -f "$staged" "$installed"
-
-  say "Converging Vulcan runtime"
-  local cmd=(/bin/bash "$packaged_installer" --from-app --app-path "$installed" --resources "$resources" --version "$VERSION")
-  [[ "$JSON_MODE" -eq 1 ]] && cmd+=(--json)
-  if "${cmd[@]}"; then
-    result=0
-  else
-    result=$?
-  fi
-  [[ "$result" -eq 0 ]] || exit "$result"
-
-  rm -f "$tmp_app"
-  rm -rf "$extract_root"
+  mv -f "$tmp_app" "$installed"
   trap - EXIT
-  say "Vulcan is installed at $installed"
-  say "Open Vulcan from your application launcher."
+
+  say "Launching Vulcan"
+  nohup "$installed" >/dev/null 2>&1 &
+}
+
+standalone_macos_bootstrap() {
+  ensure_downloader
+
+  have hdiutil || fail "hdiutil is required on macOS"
+  have ditto || fail "ditto is required on macOS"
+  have open || fail "open is required on macOS"
+
+  local tmp_dmg mount_dir source_app target_app expected_sha
+
+  tmp_dmg="$(mktemp "${TMPDIR:-/tmp}/vulcan-dmg.XXXXXX")"
+  mount_dir="$(mktemp -d "${TMPDIR:-/tmp}/vulcan-dmg-mount.XXXXXX")"
+
+  trap 'hdiutil detach "${mount_dir:-}" >/dev/null 2>&1 || true; rm -f "${tmp_dmg:-}"; rm -rf "${mount_dir:-}"' EXIT
+
+  say "Downloading Vulcan"
+  download_file "$(release_asset_url Vulcan.dmg)" "$tmp_dmg" \
+    || fail "Could not download Vulcan.dmg"
+
+  expected_sha="$(release_asset_digest Vulcan.dmg)"
+  verify_sha256 "$tmp_dmg" "$expected_sha"
+
+  hdiutil attach \
+    -nobrowse \
+    -readonly \
+    -mountpoint "$mount_dir" \
+    "$tmp_dmg" >/dev/null
+
+  source_app="$(find "$mount_dir" -maxdepth 2 -type d -name 'Vulcan.app' -print -quit)"
+  [[ -n "$source_app" ]] || fail "Vulcan.app was not found in the DMG"
+
+  mkdir -p "$HOME/Applications"
+  target_app="$HOME/Applications/Vulcan.app"
+
+  rm -rf "$target_app.new"
+  ditto "$source_app" "$target_app.new"
+  rm -rf "$target_app"
+  mv "$target_app.new" "$target_app"
+
+  hdiutil detach "$mount_dir" >/dev/null
+  rm -f "$tmp_dmg"
+  rm -rf "$mount_dir"
+  trap - EXIT
+
+  say "Launching Vulcan"
+  open "$target_app"
 }
 
 ensure_uv() {
@@ -1015,9 +1027,17 @@ if [[ "$SERVER_ONLY" -eq 1 && "$FROM_APP" -eq 0 && -z "$GUEST" && "$SERVER_SOURC
   standalone_server_bootstrap
   exit 0
 fi
-if [[ "$OS" == "Linux" && "$FROM_APP" -eq 0 && -z "$GUEST" && "$SERVER_SOURCE_EXPLICIT" -eq 0 && -z "$RESOURCES_DIR" ]]; then
-  standalone_linux_bootstrap
-  exit 0
+if [[ "$FROM_APP" -eq 0 && -z "$GUEST" && "$SERVER_SOURCE_EXPLICIT" -eq 0 && -z "$RESOURCES_DIR" ]]; then
+  case "$OS" in
+    Linux)
+      standalone_linux_bootstrap
+      exit 0
+      ;;
+    Darwin)
+      standalone_macos_bootstrap
+      exit 0
+      ;;
+  esac
 fi
 
 # Source-tree/development fallback. Production AppImage/guest calls always pass a

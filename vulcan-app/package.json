@@ -115,7 +115,8 @@
       "allowToChangeInstallationDirectory": false,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
-      "shortcutName": "Vulcan"
+      "shortcutName": "Vulcan",
+      "runAfterFinish": true
     },
     "dmg": {
       "title": "Vulcan ${version}"

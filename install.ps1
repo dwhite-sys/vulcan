@@ -64,6 +64,65 @@ function Test-TcpPort([string]$HostName, [int]$Port, [int]$TimeoutMs = 500) {
     finally { $client.Dispose() }
 }
 
+function Start-StandaloneWindowsInstall {
+    $release = Invoke-RestMethod `
+        -UseBasicParsing `
+        -Uri "https://api.github.com/repos/dwhite-sys/vulcan/releases/latest"
+
+    $asset = $release.assets |
+        Where-Object { $_.name -eq "Vulcan-Setup.exe" } |
+        Select-Object -First 1
+
+    if (-not $asset) {
+        Fail "Vulcan-Setup.exe was not found in the latest release"
+    }
+
+    $digest = [string]$asset.digest
+
+    if ($digest -notmatch '^sha256:([0-9A-Fa-f]{64})$') {
+        Fail "Vulcan-Setup.exe does not have a valid SHA-256 digest"
+    }
+
+    $expected = $Matches[1].ToLowerInvariant()
+    $tmp = Join-Path `
+        ([IO.Path]::GetTempPath()) `
+        ("Vulcan-Setup-{0}.exe" -f [Guid]::NewGuid())
+
+    try {
+        Write-Step "Downloading Vulcan"
+
+        Invoke-WebRequest `
+            -UseBasicParsing `
+            -Uri $asset.browser_download_url `
+            -OutFile $tmp
+
+        $actual = (Get-FileHash -Algorithm SHA256 $tmp).Hash.ToLowerInvariant()
+
+        if ($actual -ne $expected) {
+            Fail "Vulcan installer checksum verification failed"
+        }
+
+        Write-Step "Launching Vulcan installer"
+
+        $proc = Start-Process `
+            -FilePath $tmp `
+            -Wait `
+            -PassThru
+
+        if ($proc.ExitCode -ne 0) {
+            Fail "Vulcan installer exited with code $($proc.ExitCode)"
+        }
+    }
+    finally {
+        Remove-Item -Force $tmp -ErrorAction SilentlyContinue
+    }
+}
+
+if (-not $FromApp -and -not $ResourcesDir -and -not $ElevatedWslBootstrap) {
+    Start-StandaloneWindowsInstall
+    exit 0
+}
+
 function Ensure-HostEtna {
     # Etna is intentionally native Windows. Its Playwright kit drives the user's
     # visible host Chrome, while Vulcan's server remains isolated inside WSL2.

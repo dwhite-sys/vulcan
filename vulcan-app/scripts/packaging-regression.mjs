@@ -27,6 +27,11 @@ assert.equal(
 assert.equal(pkg.build.linux.desktop?.Name, undefined, 'desktop metadata must live under linux.desktop.entry');
 assert.match(pkg.scripts['electron:build'], /electron-builder --publish never/);
 assert.equal(pkg.engines?.node, '>=22.12.0');
+assert.equal(
+  pkg.build.nsis?.runAfterFinish,
+  true,
+  'Windows installer must launch Vulcan after installation',
+);
 
 for (const asset of ['icon.png', 'icon.ico', 'icon.icns', 'icon-titlebar.png']) {
   assert(fs.existsSync(path.join(appRoot, 'build', asset)), `missing packaging asset: build/${asset}`);
@@ -134,7 +139,10 @@ assert.match(shell, /releases\/latest\/download\/%s/);
 assert.match(shell, /release_asset_digest\(\)/);
 assert.match(shell, /digest.*sha256/i);
 assert.doesNotMatch(shell, /Vulcan\.AppImage\.sha256/);
-assert.match(shell, /--appimage-extract/);
+assert.doesNotMatch(shell, /--appimage-extract/);
+assert.match(shell, /standalone_macos_bootstrap\(\)/);
+assert.match(shell, /nohup "\$installed"/);
+assert.match(shell, /open "\$target_app"/);
 assert.match(shell, /--server-only/);
 assert.match(shell, /standalone_server_bootstrap\(\)/);
 assert.match(shell, /api\.github\.com\/repos\/dwhite-sys\/vulcan\/tarball/);
@@ -167,6 +175,9 @@ assert.doesNotMatch(workflow, /GH_TOKEN:\s*\$\{\{ secrets\.GITHUB_TOKEN \}\}/);
 assert.match(workflow, /if-no-files-found: error/);
 
 const ps1 = read(path.join(root, 'install.ps1'));
+assert.match(ps1, /function Start-StandaloneWindowsInstall/);
+assert.match(ps1, /Vulcan-Setup\.exe/);
+assert.match(ps1, /Start-Process/);
 assert.match(ps1, /function Ensure-HostEtna/);
 assert.match(ps1, /visible host Chrome/);
 assert.match(ps1, /\$DistroName = "Vulcan"/);

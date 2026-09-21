@@ -406,7 +406,7 @@ command -v curl >/dev/null 2>&1
 command -v docker >/dev/null 2>&1
 id vulcan >/dev/null 2>&1
 id -nG vulcan | tr " " "\n" | grep -qx docker
-grep -Fxq "vulcan ALL=(ALL) NOPASSWD: /usr/bin/systemctl, /usr/bin/tee" /etc/sudoers.d/vulcan
+grep -Fxq "vulcan ALL=(ALL) NOPASSWD: /usr/bin/install, /usr/bin/systemctl, /usr/bin/tee" /etc/sudoers.d/vulcan
 grep -Eq "^[[:space:]]*systemd=true[[:space:]]*$" /etc/wsl.conf
 grep -Eq "^[[:space:]]*default=vulcan[[:space:]]*$" /etc/wsl.conf
 systemctl is-enabled --quiet docker.service
@@ -437,7 +437,7 @@ id vulcan >/dev/null 2>&1 || useradd -m -s /bin/bash vulcan
 id -nG vulcan | tr " " "\n" | grep -qx docker \
   || usermod -aG docker vulcan
 
-sudoers='vulcan ALL=(ALL) NOPASSWD: /usr/bin/systemctl, /usr/bin/tee'
+sudoers='vulcan ALL=(ALL) NOPASSWD: /usr/bin/install, /usr/bin/systemctl, /usr/bin/tee'
 
 if ! grep -Fxq "$sudoers" /etc/sudoers.d/vulcan 2>/dev/null; then
   printf '%s\n' "$sudoers" >/etc/sudoers.d/vulcan

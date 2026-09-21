@@ -164,6 +164,16 @@ assert.match(shell, /api\.github\.com\/repos\/dwhite-sys\/vulcan\/tarball/);
 assert.doesNotMatch(shell, /Vulcan-Server\.tar\.gz/);
 
 assert.match(shell, /SERVER_ONLY/);
+assert.match(
+  shell,
+  /cd "\$SERVER_SOURCE"[\s\S]*find \. [\s\\]+-type f/,
+  'fallback server payload hashing must use paths relative to SERVER_SOURCE',
+);
+assert.doesNotMatch(
+  shell,
+  /find "\$SERVER_SOURCE" -type f/,
+  'server payload hashes must not include random extraction-directory prefixes',
+);
 assert(shell.includes('VULCAN_HOME="${VULCAN_CONFIG_DIR:-$HOME/.vulcan}"'));
 assert(shell.includes('APP_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}/vulcan"'));
 assert(shell.includes('installed_source="$PAYLOAD_HOME/server"'));
@@ -206,6 +216,11 @@ assert.match(ps1, /\$DistroName = "Vulcan"/);
 assert.match(ps1, /--import \$DistroName/);
 assert.match(ps1, /systemd=true/);
 assert.match(ps1, /docker\.io/);
+assert.match(
+  ps1,
+  /NOPASSWD: \/usr\/bin\/install, \/usr\/bin\/systemctl, \/usr\/bin\/tee/,
+  'WSL guest must be able to install the system-level Vulcan service unit',
+);
 assert.match(ps1, /-d", \$DistroName/);
 
 const hashPath = path.join(appRoot, 'build', 'server-payload.sha256');

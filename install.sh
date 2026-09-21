@@ -684,9 +684,15 @@ server_payload_hash() {
   # Development/manual fallback: stable hash of server source contents.
   if [[ -n "$SERVER_SOURCE" && -d "$SERVER_SOURCE" ]]; then
     if have sha256sum; then
-      find "$SERVER_SOURCE" -type f ! -path '*/tests/*' ! -path '*/__pycache__/*' -print0 | sort -z | xargs -0 sha256sum | sha256sum | awk '{print $1}'
+      (
+        cd "$SERVER_SOURCE"
+        find .           -type f           ! -path '*/tests/*'           ! -path '*/__pycache__/*'           -print0           | LC_ALL=C sort -z           | xargs -0 sha256sum           | sha256sum           | awk '{print $1}'
+      )
     elif have shasum; then
-      find "$SERVER_SOURCE" -type f ! -path '*/tests/*' ! -path '*/__pycache__/*' -print | LC_ALL=C sort | xargs shasum -a 256 | shasum -a 256 | awk '{print $1}'
+      (
+        cd "$SERVER_SOURCE"
+        find .           -type f           ! -path '*/tests/*'           ! -path '*/__pycache__/*'           -print           | LC_ALL=C sort           | xargs shasum -a 256           | shasum -a 256           | awk '{print $1}'
+      )
     else
       printf '%s' "$VERSION"
     fi

@@ -241,7 +241,8 @@ mkdir -p "$VULCAN_HOME" "$BIN_HOME" "$PYTHON_HOME" "$UV_TOOL_HOME" "$PAYLOAD_HOM
 export UV_PYTHON_INSTALL_DIR="$PYTHON_HOME"
 export UV_TOOL_DIR="$UV_TOOL_HOME"
 export UV_TOOL_BIN_DIR="$BIN_HOME"
-export PATH="$BIN_HOME:${PATH:-/usr/bin:/bin}"
+HOST_PATH="${PATH:-/usr/bin:/bin}"
+export PATH="$BIN_HOME:$HOST_PATH"
 
 # Resolve packaged payload paths when launched from Electron.
 if [[ -z "$SERVER_SOURCE" && -n "$RESOURCES_DIR" && -d "$RESOURCES_DIR/vulcan-server" ]]; then
@@ -542,9 +543,77 @@ ensure_python() {
   progress_task_finish python python312 done "Python 3.12 ready"
 }
 
+etna_endpoint_healthy() {
+  local body=""
+
+  if have curl; then
+    body="$(curl -fsS --max-time 2 http://127.0.0.1:8467/health 2>/dev/null || true)"
+  elif have wget; then
+    body="$(wget -qO- --timeout=2 http://127.0.0.1:8467/health 2>/dev/null || true)"
+  else
+    return 1
+  fi
+
+  body="$(printf '%s' "$body" | tr -d '[:space:]')"
+
+  [[ "$body" == *'"service":"etna-mcp"'* \
+    && "$body" == *'"status":"ok"'* ]]
+}
+
+etna_kit_ready() {
+  local kit="$1"
+  local config="$HOME/.etna_server/config.json"
+
+  [[ -f "$config" ]] || return 1
+  [[ -f "$HOME/.etna_server/kits/$kit.py" ]] || return 1
+
+  grep -Eq "\"$kit\"[[:space:]]*:" "$config"
+}
+
 ensure_etna() {
+  local etna="" kit missing=0
+
+  if etna_endpoint_healthy; then
+    for kit in web playwright ntfy; do
+      etna_kit_ready "$kit" || missing=1
+    done
+
+    if [[ "$missing" -eq 0 ]]; then
+      progress_task_finish etna cli skipped "Existing Etna CLI already ready"
+      progress_task_finish etna runtime skipped "Etna runtime already healthy"
+
+      for kit in web playwright ntfy; do
+        progress_task_finish etna "kit-$kit" skipped "Etna kit already ready: $kit"
+      done
+
+      progress_task_finish etna endpoint skipped "Etna endpoint already running"
+      return
+    fi
+
+    etna="$(PATH="$HOST_PATH" command -v etna 2>/dev/null || true)"
+
+    if [[ -n "$etna" && -x "$etna" ]] && "$etna" --help >/dev/null 2>&1; then
+      progress_task_finish etna cli skipped "Existing host Etna CLI ready"
+      progress_task_finish etna runtime skipped "Etna runtime already healthy"
+
+      for kit in web playwright ntfy; do
+        if etna_kit_ready "$kit"; then
+          progress_task_finish etna "kit-$kit" skipped "Etna kit already ready: $kit"
+        else
+          say "Installing missing Etna kit: $kit"
+          "$etna" install "$kit" >/dev/null \
+            || fail "Could not install Etna kit: $kit"
+          progress_task_finish etna "kit-$kit" done "Etna kit ready: $kit"
+        fi
+      done
+
+      progress_task_finish etna endpoint skipped "Etna endpoint already running"
+      return
+    fi
+  fi
+
   ensure_python
-  local etna="$BIN_HOME/etna"
+  etna="$BIN_HOME/etna"
 
   progress_task_start etna cli "Checking Etna CLI"
   if [[ ! -x "$etna" ]] || ! "$etna" --help >/dev/null 2>&1; then
@@ -552,7 +621,7 @@ ensure_etna() {
     "$BIN_HOME/uv" tool install \
       --force \
       --python 3.12 \
-      'etna-mcp>=1.0.0b40' >/dev/null
+      'etna-mcp>=1.0.0b41' >/dev/null
     progress_task_finish etna cli done "Etna CLI ready"
   else
     progress_task_finish etna cli skipped "Etna CLI already ready"
@@ -579,7 +648,7 @@ ensure_etna() {
     "$BIN_HOME/uv" tool install \
       --force \
       --python 3.12 \
-      'etna-mcp>=1.0.0b40' >/dev/null \
+      'etna-mcp>=1.0.0b41' >/dev/null \
       || fail "Could not refresh Etna"
 
     [[ -x "$etna" ]] || fail "Etna refresh did not produce $etna"

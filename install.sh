@@ -1140,20 +1140,25 @@ linux_converge() {
 }
 
 macos_host_converge() {
-  # Electron itself handles moving Vulcan.app into Applications.  This script
-  # owns the Linux backend substrate.
-  if ! have brew; then
-    warn "Homebrew is required to install Colima automatically on macOS"
-    if [[ "$JSON_MODE" -eq 1 ]]; then printf 'VULCAN_RESULT={"ok":false,"needsHomebrew":true,"message":"Homebrew is required for the Colima backend"}\n'; fi
-    exit 30
-  fi
   # Keep Etna native on macOS so Playwright can drive the user's visible Chrome
   # and client-POV tools remain truly host-local. Only the Vulcan server lives in Colima.
   ensure_etna
-  if ! have colima; then say "Installing Colima"; brew install colima >/dev/null; fi
 
-  say "Starting Vulcan Colima profile"
-  colima start vulcan --runtime docker >/dev/null
+  if ! have colima; then
+    if ! have brew; then
+      warn "Homebrew is required to install Colima automatically on macOS"
+      if [[ "$JSON_MODE" -eq 1 ]]; then printf 'VULCAN_RESULT={"ok":false,"needsHomebrew":true,"message":"Homebrew is required for the Colima backend"}\n'; fi
+      exit 30
+    fi
+
+    say "Installing Colima"
+    brew install colima >/dev/null
+  fi
+
+  if ! colima status -p vulcan >/dev/null 2>&1; then
+    say "Starting Vulcan Colima profile"
+    colima start vulcan --runtime docker >/dev/null
+  fi
 
   [[ -n "$SERVER_SOURCE" && -d "$SERVER_SOURCE" ]] || fail "Packaged Vulcan server payload is missing"
   local wanted_hash guest_hash
@@ -1188,16 +1193,17 @@ macos_host_converge() {
     --server-hash-file "$guest_home/.vulcan/payload/server-payload.sha256" \
     --version "$VERSION" < "$0"
 
-  # Colima/Lima automatically forwards guest listening ports to the macOS host,
-  # so a Vulcan server on guest :8468 is available at host localhost:8468.
-  # A LaunchAgent starts the named profile at login; Colima owns its own VM and
-  # port-forwarding lifecycle after the start command returns.
-  local launch_dir launch_file colima_bin
+  # Colima/Lima automatically forwards guest listening ports to the macOS host.
+  local launch_dir launch_file colima_bin launch_tmp launch_changed=0
   colima_bin="$(command -v colima)"
   launch_dir="$HOME/Library/LaunchAgents"
   launch_file="$launch_dir/com.vulcan.backend.plist"
+
   mkdir -p "$launch_dir"
-  cat > "$launch_file" <<PLIST
+
+  launch_tmp="$(mktemp)"
+
+  cat > "$launch_tmp" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
@@ -1210,8 +1216,25 @@ macos_host_converge() {
   <key>KeepAlive</key><false/>
 </dict></plist>
 PLIST
-  launchctl bootout "gui/$(id -u)" "$launch_file" >/dev/null 2>&1 || true
-  launchctl bootstrap "gui/$(id -u)" "$launch_file" >/dev/null 2>&1 || launchctl load "$launch_file" >/dev/null 2>&1 || true
+
+  if ! cmp -s "$launch_tmp" "$launch_file" 2>/dev/null; then
+    mv -f "$launch_tmp" "$launch_file"
+    launch_changed=1
+  else
+    rm -f "$launch_tmp"
+  fi
+
+  if ! launchctl print "gui/$(id -u)/com.vulcan.backend" >/dev/null 2>&1; then
+    launch_changed=1
+  fi
+
+  if [[ "$launch_changed" -eq 1 ]]; then
+    launchctl bootout "gui/$(id -u)" "$launch_file" >/dev/null 2>&1 || true
+
+    launchctl bootstrap "gui/$(id -u)" "$launch_file" >/dev/null 2>&1 \
+      || launchctl load "$launch_file" >/dev/null 2>&1 \
+      || fail "Could not register Vulcan Colima startup"
+  fi
 
   # Validate the actual desktop-side contract before declaring convergence.
   local mac_ready=0

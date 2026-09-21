@@ -147,7 +147,7 @@ assert.match(shell, /--server-only/);
 assert.match(shell, /standalone_server_bootstrap\(\)/);
 assert.match(shell, /api\.github\.com\/repos\/dwhite-sys\/vulcan\/tarball/);
 assert.doesNotMatch(shell, /Vulcan-Server\.tar\.gz/);
-assert.match(shell, /loginctl enable-linger/);
+
 assert.match(shell, /SERVER_ONLY/);
 assert(shell.includes('VULCAN_HOME="${VULCAN_CONFIG_DIR:-$HOME/.vulcan}"'));
 assert(shell.includes('APP_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}/vulcan"'));

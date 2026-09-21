@@ -947,12 +947,6 @@ linux_converge() {
   # Etna is deliberately host-side. On native headless Linux, the host is also
   # the server machine, so the same Etna + kit runtime is retained.
   if [[ -z "$GUEST" ]]; then ensure_etna; fi
-  if [[ -z "$GUEST" && "$SERVER_ONLY" -eq 1 ]] && have loginctl; then
-    # Etna is a systemd user service. Linger keeps that user manager available
-    # after SSH logout while Vulcan itself is supervised by a system service.
-    run_privileged loginctl enable-linger "$USER" >/dev/null 2>&1 || true
-    systemctl --user enable --now etna.service >/dev/null 2>&1 || true
-  fi
   ensure_docker_linux
   relogin="$DOCKER_RELOGIN"
   # Build/repair the workspace image whenever Docker is usable. A headless install

@@ -124,6 +124,7 @@ for (const marker of ['ensure_uv()', 'ensure_python()', 'ensure_etna()', 'ensure
   assert(shell.includes(marker), `missing shell repair primitive: ${marker}`);
 }
 assert.match(shell, /pacman -S --needed --noconfirm docker/);
+assert.doesNotMatch(shell, /systemctl enable --now docker\.service/);
 assert.match(shell, /Keep Etna native on macOS/);
 assert.match(shell, /colima start vulcan --runtime docker/);
 assert.match(shell, /VULCAN_RESULT=/);

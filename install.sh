@@ -809,7 +809,11 @@ ensure_docker_linux() {
   if ! docker info >/dev/null 2>&1; then
     changed=1
     if [[ -z "$GUEST" ]]; then
-      if have systemctl; then run_privileged systemctl enable --now docker.service >/dev/null || true; fi
+      if have systemctl; then
+        systemctl is-enabled --quiet docker.service 2>/dev/null           || run_privileged systemctl enable docker.service >/dev/null || true
+
+        systemctl is-active --quiet docker.service 2>/dev/null           || run_privileged systemctl start docker.service >/dev/null || true
+      fi
 
       # `id -nG "$USER"` reflects durable group-database membership; bare
       # `id -nG` reflects this process's current supplementary groups.
@@ -826,7 +830,11 @@ ensure_docker_linux() {
       if [[ "$durable" -eq 1 && "$current" -eq 0 && "$SERVER_ONLY" -eq 0 ]]; then DOCKER_RELOGIN=1; fi
     else
       # WSL/Colima guest provisioning is expected to have configured Docker.
-      if have sudo; then sudo systemctl enable --now docker.service >/dev/null 2>&1 || true; fi
+      if have sudo; then
+        systemctl is-enabled --quiet docker.service 2>/dev/null           || sudo systemctl enable docker.service >/dev/null 2>&1 || true
+
+        systemctl is-active --quiet docker.service 2>/dev/null           || sudo systemctl start docker.service >/dev/null 2>&1 || true
+      fi
       docker info >/dev/null 2>&1 || fail "Docker Engine is installed in the Vulcan guest but is not usable"
     fi
   fi

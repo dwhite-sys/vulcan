@@ -512,100 +512,93 @@ ensure_python() {
 ensure_etna() {
   ensure_python
   local etna="$BIN_HOME/etna"
+
   progress_task_start etna cli "Checking Etna CLI"
   if [[ ! -x "$etna" ]] || ! "$etna" --help >/dev/null 2>&1; then
     say "Repairing Etna"
-    "$BIN_HOME/uv" tool install --force --python 3.12 etna-mcp >/dev/null
+    "$BIN_HOME/uv" tool install \
+      --force \
+      --python 3.12 \
+      'etna-mcp>=1.0.0b40' >/dev/null
     progress_task_finish etna cli done "Etna CLI ready"
   else
     progress_task_finish etna cli skipped "Etna CLI already ready"
   fi
+
   [[ -x "$etna" ]] || fail "Etna installation did not produce $etna"
 
-  # Etna's own install command is state-convergent for its venv/service.
+  # Old Vulcan builds modified Etna's systemd unit with a drop-in. Etna now
+  # owns its own service lifecycle, so remove that migration artifact before
+  # asking Etna to converge itself.
+  if [[ "$OS" == "Linux" && -z "$GUEST" ]] && have systemctl; then
+    local legacy_dropin="$CONFIG_HOME/systemd/user/etna.service.d/10-vulcan-runtime.conf"
+    rm -f "$legacy_dropin"
+    rmdir "$(dirname "$legacy_dropin")" >/dev/null 2>&1 || true
+    systemctl --user daemon-reload >/dev/null 2>&1 || true
+  fi
+
   progress_task_start etna runtime "Converging Etna runtime"
-  "$etna" install >/dev/null || fail "Etna self-repair failed"
+
+  if ! "$etna" init >/dev/null; then
+    # b38 has no `etna init`, and b39 contained a Linux venv-service path bug.
+    # Refresh to the lifecycle-owning Etna release and retry once.
+    say "Refreshing Etna"
+    "$BIN_HOME/uv" tool install \
+      --force \
+      --python 3.12 \
+      'etna-mcp>=1.0.0b40' >/dev/null \
+      || fail "Could not refresh Etna"
+
+    [[ -x "$etna" ]] || fail "Etna refresh did not produce $etna"
+
+    "$etna" init >/dev/null \
+      || fail "Etna self-repair failed"
+  fi
+
   progress_task_finish etna runtime done "Etna runtime ready"
 
   local py
-  py="$($BIN_HOME/uv python find --managed-python 3.12)"
+  py="$("$BIN_HOME/uv" python find --managed-python 3.12)"
+
   for kit in web playwright ntfy; do
     progress_task_start etna "kit-$kit" "Checking Etna kit: $kit"
-    if ! "$py" - "$kit" <<'PY' >/dev/null 2>&1
+
+    if ! "$py" - "$kit" <<'PYKIT' >/dev/null 2>&1
 import json, pathlib, sys
 kit = sys.argv[1]
-p = pathlib.Path.home()/'.etna_server'/'config.json'
-if not p.exists(): raise SystemExit(1)
+p = pathlib.Path.home() / ".etna_server" / "config.json"
+if not p.exists():
+    raise SystemExit(1)
 data = json.loads(p.read_text())
-if kit not in data.get('kits', {}): raise SystemExit(1)
-kitfile = pathlib.Path.home()/'.etna_server'/'kits'/f'{kit}.py'
+if kit not in data.get("kits", {}):
+    raise SystemExit(1)
+kitfile = pathlib.Path.home() / ".etna_server" / "kits" / f"{kit}.py"
 raise SystemExit(0 if kitfile.exists() else 1)
-PY
+PYKIT
     then
       say "Installing missing Etna kit: $kit"
-      "$etna" install "$kit" >/dev/null
+      "$etna" install "$kit" >/dev/null \
+        || fail "Could not install Etna kit: $kit"
       progress_task_finish etna "kit-$kit" done "Etna kit ready: $kit"
     else
       progress_task_finish etna "kit-$kit" skipped "Etna kit already ready: $kit"
     fi
   done
 
-  # Keep the local Etna endpoint alive.  If the OS service already owns it,
-  # `etna start` simply reports that it is running.
+  # `etna init` owns startup and verifies health. Vulcan must not create a
+  # second independently-managed Etna process if the endpoint is absent.
   progress_task_start etna endpoint "Checking Etna endpoint"
-  if ! "$py" - <<'PY' >/dev/null 2>&1
-import socket
-s=socket.socket(); s.settimeout(.4)
-raise SystemExit(0 if s.connect_ex(('127.0.0.1',8467)) == 0 else 1)
-PY
+
+  if "$py" - <<'PYHEALTH' >/dev/null 2>&1
+import urllib.request
+with urllib.request.urlopen("http://127.0.0.1:8467/health", timeout=1) as r:
+    raise SystemExit(0 if r.status == 200 else 1)
+PYHEALTH
   then
-    "$etna" start >/dev/null 2>&1 || true
-    progress_task_finish etna endpoint done "Etna endpoint started"
-  else
     progress_task_finish etna endpoint skipped "Etna endpoint already running"
+  else
+    fail "Etna init completed but Etna is not healthy on port 8467"
   fi
-
-  # On native Linux, repair Etna's user-service environment so the service can
-  # find the Vulcan-owned uv binary at login. Etna remains host-side because
-  # browser automation and other desktop-local kits are client-POV capabilities.
-  if [[ "$OS" == "Linux" && -z "$GUEST" ]] && have systemctl; then
-    local etna_dropin="$CONFIG_HOME/systemd/user/etna.service.d"
-    mkdir -p "$etna_dropin"
-    cat > "$etna_dropin/10-vulcan-runtime.conf" <<UNIT
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-Environment=PATH=$BIN_HOME:/usr/local/bin:/usr/bin:/bin
-ExecStop=$BIN_HOME/etna stop
-UNIT
-    systemctl --user daemon-reload >/dev/null 2>&1 || true
-    systemctl --user enable etna.service >/dev/null 2>&1 || true
-  elif [[ "$OS" == "Darwin" && -z "$GUEST" ]]; then
-    # launchd's default PATH does not include Vulcan's private uv directory.
-    # Rewrite Etna's LaunchAgent with an explicit PATH after Etna has converged.
-    local etna_agents="$HOME/Library/LaunchAgents"
-    local etna_plist="$etna_agents/net.etna-mcp.etna.plist"
-    mkdir -p "$etna_agents"
-    cat > "$etna_plist" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-  <key>Label</key><string>net.etna-mcp.etna</string>
-  <key>ProgramArguments</key><array>
-    <string>$etna</string><string>start</string>
-  </array>
-  <key>EnvironmentVariables</key><dict>
-    <key>PATH</key><string>$BIN_HOME:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
-  </dict>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-</dict></plist>
-PLIST
-    launchctl bootout "gui/$(id -u)" "$etna_plist" >/dev/null 2>&1 || true
-    launchctl bootstrap "gui/$(id -u)" "$etna_plist" >/dev/null 2>&1 || launchctl load "$etna_plist" >/dev/null 2>&1 || true
-  fi
-
 }
 
 server_payload_hash() {

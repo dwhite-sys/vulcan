@@ -619,12 +619,12 @@ install_host_etna() {
 ensure_etna() {
   local kit
 
-  ensure_python
+  ensure_uv
 
   # Remove the obsolete Vulcan-owned Etna installation.
-  rm -f "$BIN_HOME/etna"
-  rm -rf "$VULCAN_HOME/uv-tools/etna-mcp"
-  rmdir "$VULCAN_HOME/uv-tools" >/dev/null 2>&1 || true
+  [[ ! -e "$BIN_HOME/etna" ]] || rm -f "$BIN_HOME/etna"
+  [[ ! -d "$VULCAN_HOME/uv-tools/etna-mcp" ]]     || rm -rf "$VULCAN_HOME/uv-tools/etna-mcp"
+  [[ ! -d "$VULCAN_HOME/uv-tools" ]]     || rmdir "$VULCAN_HOME/uv-tools" >/dev/null 2>&1 || true
 
   progress_task_start etna cli "Checking Etna CLI"
 

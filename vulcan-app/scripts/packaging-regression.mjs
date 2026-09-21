@@ -133,7 +133,7 @@ assert.match(
   'Linux must persist its stable AppImage without forcing a process handoff',
 );
 assert.match(shell, /say "Preparing Docker workspace image"/);
-assert.match(shell, /say "Starting Vulcan services"/);
+assert.match(shell, /SERVICE_CHANGED/);
 assert.match(shell, /standalone_linux_bootstrap\(\)/);
 assert.match(shell, /releases\/latest\/download\/%s/);
 assert.match(shell, /release_asset_digest\(\)/);

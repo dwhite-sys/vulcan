@@ -825,22 +825,59 @@ ensure_docker_linux() {
 }
 
 ensure_vulcan_service_linux() {
-  local py="$RUNTIME/bin/python"
+  SERVICE_CHANGED=0
+  local tmp_unit changed=0
+
+  tmp_unit="$(mktemp)"
+
   if [[ -n "$GUEST" || "$SERVER_ONLY" -eq 1 ]]; then
-    # Dedicated VM/distro and native --server-only installs use a system service
-    # so the backend survives logout and starts at boot without a desktop session.
-    local unit tmp_unit
-    unit="[Unit]\nDescription=Vulcan Server\nAfter=network-online.target docker.service\nWants=network-online.target\n\n[Service]\nType=simple\nUser=$USER\nEnvironment=HOME=$HOME\nEnvironment=PATH=$BIN_HOME:/usr/local/bin:/usr/bin:/bin\nEnvironment=PYTHONUNBUFFERED=1\nExecStart=$RUNTIME/bin/vulcan serve\nRestart=on-failure\nRestartSec=2\n\n[Install]\nWantedBy=multi-user.target\n"
-    tmp_unit="$(mktemp)"
-    printf '%b' "$unit" > "$tmp_unit"
-    run_privileged install -m 0644 "$tmp_unit" /etc/systemd/system/vulcan.service
+    cat > "$tmp_unit" <<UNIT
+[Unit]
+Description=Vulcan Server
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=$USER
+Environment=HOME=$HOME
+Environment=PATH=$BIN_HOME:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONUNBUFFERED=1
+ExecStart=$RUNTIME/bin/vulcan serve
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+    if ! cmp -s "$tmp_unit" /etc/systemd/system/vulcan.service 2>/dev/null; then
+      run_privileged install -m 0644 \
+        "$tmp_unit" /etc/systemd/system/vulcan.service
+      run_privileged systemctl daemon-reload
+      changed=1
+    fi
+
     rm -f "$tmp_unit"
-    run_privileged systemctl daemon-reload
-    run_privileged systemctl enable --now vulcan.service >/dev/null
+
+    if ! systemctl is-enabled --quiet vulcan.service 2>/dev/null; then
+      run_privileged systemctl enable vulcan.service >/dev/null
+      changed=1
+    fi
+
+    if [[ "$changed" -eq 1 ]]; then
+      run_privileged systemctl restart vulcan.service >/dev/null
+    elif ! systemctl is-active --quiet vulcan.service 2>/dev/null; then
+      run_privileged systemctl start vulcan.service >/dev/null
+      changed=1
+    fi
   else
-    local dir="$CONFIG_HOME/systemd/user" file="$CONFIG_HOME/systemd/user/vulcan.service"
+    local dir="$CONFIG_HOME/systemd/user"
+    local file="$dir/vulcan.service"
+
     mkdir -p "$dir"
-    cat > "$file" <<UNIT
+
+    cat > "$tmp_unit" <<UNIT
 [Unit]
 Description=Vulcan Server
 After=network-online.target
@@ -858,9 +895,44 @@ RestartSec=2
 [Install]
 WantedBy=default.target
 UNIT
-    systemctl --user daemon-reload
-    systemctl --user enable --now vulcan.service >/dev/null
+
+    if ! cmp -s "$tmp_unit" "$file" 2>/dev/null; then
+      mv -f "$tmp_unit" "$file"
+      systemctl --user daemon-reload
+      changed=1
+    else
+      rm -f "$tmp_unit"
+    fi
+
+    if ! systemctl --user is-enabled --quiet vulcan.service 2>/dev/null; then
+      systemctl --user enable vulcan.service >/dev/null
+      changed=1
+    fi
+
+    if [[ "$changed" -eq 1 ]]; then
+      systemctl --user restart vulcan.service >/dev/null
+    elif ! systemctl --user is-active --quiet vulcan.service 2>/dev/null; then
+      systemctl --user start vulcan.service >/dev/null
+      changed=1
+    fi
   fi
+
+  SERVICE_CHANGED="$changed"
+}
+
+restart_vulcan_service_linux() {
+  if [[ -n "$GUEST" || "$SERVER_ONLY" -eq 1 ]]; then
+    run_privileged systemctl restart vulcan.service >/dev/null
+  else
+    systemctl --user restart vulcan.service >/dev/null
+  fi
+}
+
+server_healthy() {
+  "$RUNTIME/bin/python" - <<'PY' >/dev/null 2>&1
+import urllib.request
+urllib.request.urlopen('http://127.0.0.1:8468/meta', timeout=.6).read()
+PY
 }
 
 wait_server() {
@@ -974,15 +1046,28 @@ linux_converge() {
     progress_task_finish workspace image skipped "Workspace image deferred until session refresh"
   fi
 
-  progress_task_start services service "Starting Vulcan service"
-  say "Starting Vulcan services"
+  progress_task_start services service "Checking Vulcan service"
   ensure_vulcan_service_linux
-  progress_task_finish services service done "Vulcan service running"
+
+  if [[ "$SERVICE_CHANGED" -eq 1 ]]; then
+    progress_task_finish services service done "Vulcan service repaired"
+  else
+    progress_task_finish services service skipped "Vulcan service already ready"
+  fi
 
   progress_task_start services health "Checking Vulcan server health"
   if [[ "$relogin" == 0 ]]; then
-    wait_server || fail "Vulcan server did not become healthy on port 8468"
-    progress_task_finish services health done "Vulcan server healthy on port 8468"
+    if server_healthy; then
+      progress_task_finish services health skipped "Vulcan server already healthy"
+    else
+      if [[ "$SERVICE_CHANGED" -eq 0 ]]; then
+        restart_vulcan_service_linux
+      fi
+
+      wait_server         || fail "Vulcan server did not become healthy on port 8468"
+
+      progress_task_finish services health done "Vulcan server health repaired"
+    fi
   else
     progress_task_finish services health skipped "Health check deferred until new login session"
   fi

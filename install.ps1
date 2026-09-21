@@ -72,12 +72,23 @@ function Start-StandaloneWindowsInstall {
     }
 
     $digest = [string]$asset.digest
+    $expected = $null
 
-    if ($digest -notmatch '^sha256:([0-9A-Fa-f]{64})$') {
-        Fail "Vulcan-Setup.exe does not have a valid SHA-256 digest"
+    if ($digest -match '^sha256:([0-9A-Fa-f]{64})$') {
+        $expected = $Matches[1].ToLowerInvariant()
     }
+    else {
+        $bodyMatch = [regex]::Match(
+            [string]$release.body,
+            '(?m)^\|\s*`?Vulcan-Setup\.exe`?\s*\|\s*`?([0-9A-Fa-f]{64})`?\s*\|'
+        )
 
-    $expected = $Matches[1].ToLowerInvariant()
+        if (-not $bodyMatch.Success) {
+            Fail "GitHub release metadata did not contain a SHA-256 digest for Vulcan-Setup.exe"
+        }
+
+        $expected = $bodyMatch.Groups[1].Value.ToLowerInvariant()
+    }
     $tmp = Join-Path `
         ([IO.Path]::GetTempPath()) `
         ("Vulcan-Setup-{0}.exe" -f [Guid]::NewGuid())
@@ -142,6 +153,15 @@ function Invoke-Etna([string[]]$EtnaArgs) {
     if ($etna) {
         & $etna.Source @EtnaArgs *> $null
         if ($LASTEXITCODE -eq 0) { return $true }
+    }
+
+    if ($env:USERPROFILE) {
+        $localEtna = Join-Path $env:USERPROFILE ".local\bin\etna.exe"
+
+        if (Test-Path $localEtna) {
+            & $localEtna @EtnaArgs *> $null
+            if ($LASTEXITCODE -eq 0) { return $true }
+        }
     }
 
     $python = Get-Command python `
@@ -237,17 +257,21 @@ function Ensure-HostEtna {
     # visible host Chrome. Vulcan uses the running Etna service through HTTP.
 
     # Remove artifacts created by older Vulcan-owned Etna installs.
-    Remove-Item -Force `
-        (Join-Path $BinRoot "etna.exe") `
-        -ErrorAction SilentlyContinue
+    $legacyEtna = Join-Path $BinRoot "etna.exe"
+    $legacyTools = Join-Path $LocalRoot "uv-tools"
+    $legacyPython = Join-Path $LocalRoot "python"
 
-    Remove-Item -Recurse -Force `
-        (Join-Path $LocalRoot "uv-tools") `
-        -ErrorAction SilentlyContinue
+    if (Test-Path $legacyEtna) {
+        Remove-Item -Force $legacyEtna
+    }
 
-    Remove-Item -Recurse -Force `
-        (Join-Path $LocalRoot "python") `
-        -ErrorAction SilentlyContinue
+    if (Test-Path $legacyTools) {
+        Remove-Item -Recurse -Force $legacyTools
+    }
+
+    if (Test-Path $legacyPython) {
+        Remove-Item -Recurse -Force $legacyPython
+    }
 
     if (-not (Invoke-Etna @("--help"))) {
         Write-Step "Installing Etna"
@@ -480,7 +504,7 @@ $serverSource = "$guestResources/vulcan-server"
 $guestScript = "$guestResources/install.sh"
 $hashFile = "$guestResources/server-payload.sha256"
 
-Write-Step "Repairing Vulcan Linux runtime inside WSL2"
+Write-Step "Checking Vulcan Linux runtime inside WSL2"
 $guestArgs = @(
     "-d", $DistroName, "-u", "vulcan", "--",
     "bash", $guestScript,
@@ -493,8 +517,7 @@ $guestArgs = @(
 & wsl.exe @guestArgs
 if ($LASTEXITCODE -ne 0) { Fail "Vulcan Linux runtime repair failed inside WSL2" }
 
-# Wake systemd-managed services and verify Windows localhost forwarding.
-& wsl.exe -d $DistroName -u root -- systemctl start docker.service vulcan.service *> $null
+# The guest converger owns service state. Verify Windows localhost forwarding.
 $ready = $false
 for ($i = 0; $i -lt 60; $i++) {
     try {

@@ -639,14 +639,20 @@ ensure_etna() {
 
   progress_task_start etna runtime "Checking Etna runtime"
 
-  if run_etna init >/dev/null 2>&1; then
-    progress_task_finish etna runtime done "Etna runtime checked"
+  if etna_endpoint_healthy; then
+    progress_task_finish etna runtime skipped "Etna runtime already healthy"
   else
-    say "Repairing Etna installation"
-    install_host_etna \
-      || fail "Could not repair Etna"
-    run_etna init >/dev/null 2>&1 \
-      || fail "Etna init failed"
+    if ! run_etna init >/dev/null 2>&1; then
+      say "Repairing Etna installation"
+      install_host_etna \
+        || fail "Could not repair Etna"
+      run_etna init >/dev/null 2>&1 \
+        || fail "Etna init failed"
+    fi
+
+    etna_endpoint_healthy \
+      || fail "Etna init completed but Etna is not healthy on port 8467"
+
     progress_task_finish etna runtime done "Etna runtime repaired"
   fi
 

@@ -321,27 +321,26 @@ resolve_release_tag() {
 }
 
 release_asset_digest() {
-  local asset="$1" metadata line found=0
+  local asset="$1" metadata compact asset_record digest_tail digest
   metadata="$(release_metadata)"
 
-  while IFS= read -r line; do
-    if [[ "$line" == *"\"name\": \"$asset\""* ]]; then
-      found=1
-      continue
-    fi
+  compact="$(printf '%s' "$metadata" | tr -d '\r\n\t ')"
 
-    if [[ "$found" -eq 1 ]] \
-      && [[ "$line" =~ \"digest\"[[:space:]]*:[[:space:]]*\"sha256:([0-9A-Fa-f]{64})\" ]]; then
-      printf '%s' "${BASH_REMATCH[1],,}"
-      return
-    fi
+  asset_record="${compact#*\"name\":\"$asset\"}"
+  [[ "$asset_record" != "$compact" ]] \
+    || fail "GitHub release metadata did not contain asset $asset"
 
-    if [[ "$found" -eq 1 && "$line" == *"}"* ]]; then
-      found=0
-    fi
-  done <<< "$metadata"
+  asset_record="${asset_record%%\"browser_download_url\":*}"
 
-  fail "GitHub release metadata did not contain a SHA-256 digest for $asset"
+  digest_tail="${asset_record#*\"digest\":\"sha256:}"
+  [[ "$digest_tail" != "$asset_record" ]] \
+    || fail "GitHub release metadata did not contain a SHA-256 digest for $asset"
+
+  digest="${digest_tail%%\"*}"
+  [[ "$digest" =~ ^[0-9A-Fa-f]{64}$ ]] \
+    || fail "GitHub release metadata contained an invalid SHA-256 digest for $asset"
+
+  printf '%s' "${digest,,}"
 }
 
 release_asset_url() {

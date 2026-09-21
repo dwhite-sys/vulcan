@@ -126,6 +126,14 @@ for (const marker of ['ensure_uv()', 'ensure_python()', 'ensure_etna()', 'ensure
 assert.match(shell, /pacman -S --needed --noconfirm docker/);
 assert.doesNotMatch(shell, /systemctl enable --now docker\.service/);
 assert.match(shell, /Keep Etna native on macOS/);
+assert.match(
+  shell,
+  /install_host_etna\(\)[\s\S]*ensure_uv[\s\S]*UV_TOOL_DIR/,
+);
+assert.doesNotMatch(
+  shell,
+  /ensure_etna\(\) \{\s*local kit\s*ensure_uv/,
+);
 assert.match(shell, /colima start vulcan --runtime docker/);
 assert.match(shell, /VULCAN_RESULT=/);
 assert.match(
@@ -133,8 +141,14 @@ assert.match(
   /install_linux_desktop >\/dev\/null/,
   'Linux must persist its stable AppImage without forcing a process handoff',
 );
+assert.match(
+  shell,
+  /-f "\$installed" && ! -x "\$installed"/,
+);
 assert.match(shell, /say "Preparing Docker workspace image"/);
 assert.match(shell, /SERVICE_CHANGED/);
+assert.match(shell, /SERVICE_TOUCHED/);
+assert.match(shell, /progress_plan 9 1 2 2 0 2 2/);
 assert.match(shell, /standalone_linux_bootstrap\(\)/);
 assert.match(shell, /releases\/latest\/download\/%s/);
 assert.match(shell, /release_asset_digest\(\)/);

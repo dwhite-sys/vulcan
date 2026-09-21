@@ -607,6 +607,8 @@ install_host_etna() {
     return
   fi
 
+  ensure_uv
+
   env \
     -u UV_PYTHON_INSTALL_DIR \
     -u UV_TOOL_DIR \
@@ -618,8 +620,6 @@ install_host_etna() {
 
 ensure_etna() {
   local kit
-
-  ensure_uv
 
   # Remove the obsolete Vulcan-owned Etna installation.
   [[ ! -e "$BIN_HOME/etna" ]] || rm -f "$BIN_HOME/etna"
@@ -847,7 +847,12 @@ ensure_docker_linux() {
 
 ensure_vulcan_service_linux() {
   SERVICE_CHANGED=0
-  local tmp_unit changed=0
+  SERVICE_TOUCHED=0
+
+  local tmp_unit
+  local changed=0
+  local restart_needed=0
+  local touched=0
 
   tmp_unit="$(mktemp)"
 
@@ -872,11 +877,19 @@ RestartSec=2
 WantedBy=multi-user.target
 UNIT
 
-    if ! cmp -s "$tmp_unit" /etc/systemd/system/vulcan.service 2>/dev/null; then
+    if ! cmp -s \
+      "$tmp_unit" \
+      /etc/systemd/system/vulcan.service \
+      2>/dev/null
+    then
       run_privileged install -m 0644 \
-        "$tmp_unit" /etc/systemd/system/vulcan.service
+        "$tmp_unit" \
+        /etc/systemd/system/vulcan.service
+
       run_privileged systemctl daemon-reload
+
       changed=1
+      restart_needed=1
     fi
 
     rm -f "$tmp_unit"
@@ -886,11 +899,13 @@ UNIT
       changed=1
     fi
 
-    if [[ "$changed" -eq 1 ]]; then
+    if [[ "$restart_needed" -eq 1 ]]; then
       run_privileged systemctl restart vulcan.service >/dev/null
+      touched=1
     elif ! systemctl is-active --quiet vulcan.service 2>/dev/null; then
       run_privileged systemctl start vulcan.service >/dev/null
       changed=1
+      touched=1
     fi
   else
     local dir="$CONFIG_HOME/systemd/user"
@@ -920,7 +935,9 @@ UNIT
     if ! cmp -s "$tmp_unit" "$file" 2>/dev/null; then
       mv -f "$tmp_unit" "$file"
       systemctl --user daemon-reload
+
       changed=1
+      restart_needed=1
     else
       rm -f "$tmp_unit"
     fi
@@ -930,15 +947,18 @@ UNIT
       changed=1
     fi
 
-    if [[ "$changed" -eq 1 ]]; then
+    if [[ "$restart_needed" -eq 1 ]]; then
       systemctl --user restart vulcan.service >/dev/null
+      touched=1
     elif ! systemctl --user is-active --quiet vulcan.service 2>/dev/null; then
       systemctl --user start vulcan.service >/dev/null
       changed=1
+      touched=1
     fi
   fi
 
   SERVICE_CHANGED="$changed"
+  SERVICE_TOUCHED="$touched"
 }
 
 restart_vulcan_service_linux() {
@@ -994,6 +1014,11 @@ install_linux_desktop() {
       mv -f "$tmp" "$installed"
       DESKTOP_CHANGED=1
     fi
+  fi
+
+  if [[ -f "$installed" && ! -x "$installed" ]]; then
+    chmod 0755 "$installed"
+    DESKTOP_CHANGED=1
   fi
 
   [[ -x "$installed" ]] \
@@ -1085,7 +1110,12 @@ workspace_runtime_ready() {
 
 linux_converge() {
   local relogin=0
-  progress_plan 15 1 2 2 6 2 2
+
+  if [[ -n "$GUEST" ]]; then
+    progress_plan 9 1 2 2 0 2 2
+  else
+    progress_plan 15 1 2 2 6 2 2
+  fi
 
   # Persist/update the stable AppImage and desktop metadata for future launches,
   # but keep the Electron process the user actually opened as this first session.
@@ -1140,7 +1170,7 @@ linux_converge() {
     if server_healthy; then
       progress_task_finish services health skipped "Vulcan server already healthy"
     else
-      if [[ "$SERVICE_CHANGED" -eq 0 ]]; then
+      if [[ "$SERVICE_TOUCHED" -eq 0 ]]; then
         restart_vulcan_service_linux
       fi
 

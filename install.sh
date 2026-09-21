@@ -321,26 +321,48 @@ resolve_release_tag() {
 }
 
 release_asset_digest() {
-  local asset="$1" metadata compact asset_record digest_tail digest
+  local asset="$1" metadata compact asset_record digest_tail digest body body_tail
   metadata="$(release_metadata)"
 
   compact="$(printf '%s' "$metadata" | tr -d '\r\n\t ')"
 
+  # Prefer GitHub's per-asset digest when present.
   asset_record="${compact#*\"name\":\"$asset\"}"
-  [[ "$asset_record" != "$compact" ]] \
-    || fail "GitHub release metadata did not contain asset $asset"
 
-  asset_record="${asset_record%%\"browser_download_url\":*}"
+  if [[ "$asset_record" != "$compact" ]]; then
+    asset_record="${asset_record%%\"browser_download_url\":*}"
+    digest_tail="${asset_record#*\"digest\":\"sha256:}"
 
-  digest_tail="${asset_record#*\"digest\":\"sha256:}"
-  [[ "$digest_tail" != "$asset_record" ]] \
-    || fail "GitHub release metadata did not contain a SHA-256 digest for $asset"
+    if [[ "$digest_tail" != "$asset_record" ]]; then
+      digest="${digest_tail%%\"*}"
 
-  digest="${digest_tail%%\"*}"
-  [[ "$digest" =~ ^[0-9A-Fa-f]{64}$ ]] \
-    || fail "GitHub release metadata contained an invalid SHA-256 digest for $asset"
+      if [[ "$digest" =~ ^[0-9A-Fa-f]{64}$ ]]; then
+        printf '%s' "${digest,,}"
+        return
+      fi
+    fi
+  fi
 
-  printf '%s' "${digest,,}"
+  # Some GitHub API responses omit asset.digest. Every Vulcan release also
+  # publishes the hashes in its generated release body, so use that as the
+  # authoritative fallback.
+  body="${compact#*\"body\":\"###SHA-256}"
+
+  if [[ "$body" != "$compact" ]]; then
+    body="${body//\`/}"
+    body_tail="${body#*|$asset|}"
+
+    if [[ "$body_tail" != "$body" ]]; then
+      digest="${body_tail%%|*}"
+
+      if [[ "$digest" =~ ^[0-9A-Fa-f]{64}$ ]]; then
+        printf '%s' "${digest,,}"
+        return
+      fi
+    fi
+  fi
+
+  fail "GitHub release metadata did not contain a SHA-256 digest for $asset"
 }
 
 release_asset_url() {

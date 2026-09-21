@@ -949,29 +949,51 @@ PY
 }
 
 install_linux_desktop() {
+  DESKTOP_CHANGED=0
+
   [[ "$SERVER_ONLY" -eq 0 ]] || return 0
   [[ "$FROM_APP" -eq 1 ]] || return 0
+
   local app_home="$APP_DATA_HOME/app"
   local desktop_home="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
   local icon_home="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/512x512/apps"
   local autostart_home="$CONFIG_HOME/autostart"
+
   mkdir -p "$app_home" "$desktop_home" "$icon_home" "$autostart_home"
 
   local installed="$app_home/Vulcan.AppImage"
-  if [[ -n "$APP_PATH" && -f "$APP_PATH" ]]; then
-    if [[ "$(readlink -f "$APP_PATH")" != "$(readlink -f "$installed" 2>/dev/null || true)" ]]; then
+
+  if [[ -n "$APP_PATH" && -f "$APP_PATH" ]] \
+    && [[ "$(readlink -f "$APP_PATH")" != "$(readlink -f "$installed" 2>/dev/null || true)" ]]
+  then
+    if [[ ! -f "$installed" ]] || ! cmp -s "$APP_PATH" "$installed"; then
       local tmp="$installed.new"
       cp -f "$APP_PATH" "$tmp"
       chmod 0755 "$tmp"
       mv -f "$tmp" "$installed"
+      DESKTOP_CHANGED=1
     fi
   fi
-  [[ -x "$installed" ]] || fail "Could not establish installed AppImage at $installed"
+
+  [[ -x "$installed" ]] \
+    || fail "Could not establish installed AppImage at $installed"
+
+  local icon="$icon_home/vulcan.png"
 
   if [[ -n "$RESOURCES_DIR" && -f "$RESOURCES_DIR/vulcan-icon.png" ]]; then
-    cp -f "$RESOURCES_DIR/vulcan-icon.png" "$icon_home/vulcan.png"
+    if [[ ! -f "$icon" ]] \
+      || ! cmp -s "$RESOURCES_DIR/vulcan-icon.png" "$icon"
+    then
+      cp -f "$RESOURCES_DIR/vulcan-icon.png" "$icon"
+      DESKTOP_CHANGED=1
+    fi
   fi
-  cat > "$desktop_home/vulcan.desktop" <<DESKTOP
+
+  local desktop_file="$desktop_home/vulcan.desktop"
+  local desktop_tmp
+  desktop_tmp="$(mktemp)"
+
+  cat > "$desktop_tmp" <<DESKTOP
 [Desktop Entry]
 Name=Vulcan
 Comment=AI harness with local server and workspaces
@@ -984,7 +1006,19 @@ Categories=Development;Utility;
 StartupWMClass=Vulcan
 X-AppImage-Integrate=false
 DESKTOP
-  cat > "$autostart_home/vulcan.desktop" <<DESKTOP
+
+  if ! cmp -s "$desktop_tmp" "$desktop_file" 2>/dev/null; then
+    mv -f "$desktop_tmp" "$desktop_file"
+    DESKTOP_CHANGED=1
+  else
+    rm -f "$desktop_tmp"
+  fi
+
+  local autostart_file="$autostart_home/vulcan.desktop"
+  local autostart_tmp
+  autostart_tmp="$(mktemp)"
+
+  cat > "$autostart_tmp" <<DESKTOP
 [Desktop Entry]
 Name=Vulcan
 Comment=Start Vulcan in the system tray
@@ -997,8 +1031,28 @@ X-GNOME-Autostart-enabled=true
 X-KDE-autostart-after=panel
 X-AppImage-Integrate=false
 DESKTOP
-  chmod +x "$desktop_home/vulcan.desktop" "$autostart_home/vulcan.desktop"
-  have update-desktop-database && update-desktop-database "$desktop_home" >/dev/null 2>&1 || true
+
+  if ! cmp -s "$autostart_tmp" "$autostart_file" 2>/dev/null; then
+    mv -f "$autostart_tmp" "$autostart_file"
+    DESKTOP_CHANGED=1
+  else
+    rm -f "$autostart_tmp"
+  fi
+
+  if [[ ! -x "$desktop_file" ]]; then
+    chmod +x "$desktop_file"
+    DESKTOP_CHANGED=1
+  fi
+
+  if [[ ! -x "$autostart_file" ]]; then
+    chmod +x "$autostart_file"
+    DESKTOP_CHANGED=1
+  fi
+
+  if [[ "$DESKTOP_CHANGED" -eq 1 ]] && have update-desktop-database; then
+    update-desktop-database "$desktop_home" >/dev/null 2>&1 || true
+  fi
+
   printf '%s' "$installed"
 }
 
@@ -1017,7 +1071,12 @@ linux_converge() {
   progress_task_start checking integration "Checking installation"
   if [[ -z "$GUEST" && "$SERVER_ONLY" -eq 0 ]]; then
     install_linux_desktop >/dev/null
-    progress_task_finish checking integration done "Desktop integration ready"
+
+    if [[ "$DESKTOP_CHANGED" -eq 1 ]]; then
+      progress_task_finish checking integration done "Desktop integration repaired"
+    else
+      progress_task_finish checking integration skipped "Desktop integration already ready"
+    fi
   else
     progress_task_finish checking integration skipped "Desktop integration not required"
   fi

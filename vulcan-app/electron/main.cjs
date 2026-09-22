@@ -6,6 +6,7 @@ const { createSecurePasswordStore, registerSecurePasswordIpc } = require('./secu
 const { createSemanticToolCacheStore, registerSemanticToolCacheIpc } = require('./semanticToolCacheStore.cjs');
 const { ensurePackagedRuntime } = require('./installCoordinator.cjs');
 const { createSetupWindow } = require('./setupWindow.cjs');
+const { createUpdater } = require('./updateManager.cjs');
 
 const isDev = process.env.NODE_ENV === 'development';
 
@@ -16,6 +17,7 @@ let isQuitting = false;
 let shouldShowOnReady = !startHidden;
 let setupController = null;
 let startupRepairInProgress = false;
+let updater = null;
 
 const gotSingleInstanceLock = app.requestSingleInstanceLock();
 if (!gotSingleInstanceLock) {
@@ -45,16 +47,34 @@ function showMainWindow(chatId = null) {
   if (chatId) mainWindow.webContents.send('vulcan-open-chat', String(chatId));
 }
 
-function installTray() {
-  if (tray) return tray;
-  const trayIconPath = path.join(__dirname, '../build/icon-titlebar.png');
-  tray = new Tray(nativeImage.createFromPath(trayIconPath));
-  tray.setToolTip('Vulcan');
-  tray.setContextMenu(Menu.buildFromTemplate([
+function refreshTrayMenu() {
+  if (!tray) return;
+  const update = updater?.getState?.();
+  const template = [];
+  if (update?.available) {
+    template.push({
+      label: 'Update and Restart',
+      click: () => updater?.openPrompt?.(),
+    });
+    template.push({ type: 'separator' });
+  }
+  template.push(
     { label: 'Open Vulcan', click: () => showMainWindow() },
     { type: 'separator' },
     { label: 'Exit', click: () => { isQuitting = true; app.quit(); } },
-  ]));
+  );
+  tray.setContextMenu(Menu.buildFromTemplate(template));
+}
+
+function installTray() {
+  if (tray) {
+    refreshTrayMenu();
+    return tray;
+  }
+  const trayIconPath = path.join(__dirname, '../build/icon-titlebar.png');
+  tray = new Tray(nativeImage.createFromPath(trayIconPath));
+  tray.setToolTip('Vulcan');
+  refreshTrayMenu();
   tray.on('click', () => showMainWindow());
   return tray;
 }
@@ -460,6 +480,17 @@ app.on('before-quit', async (e) => {
 process.on('SIGTERM', async () => { await flushAndQuit(); app.exit(0); });
 process.on('SIGHUP', async () => { await flushAndQuit(); app.exit(0); });
 
+ipcMain.handle('vulcan-update-state-get', async () => (
+  updater?.getState?.() || { available: false, currentVersion: app.getVersion() }
+));
+ipcMain.handle('vulcan-update-check', async () => (
+  updater?.check?.() || { available: false, currentVersion: app.getVersion() }
+));
+ipcMain.handle('vulcan-update-install', async () => {
+  if (!updater) throw new Error('Vulcan updater is unavailable');
+  return updater.install();
+});
+
 ipcMain.handle('vulcan-native-notify', async (_event, payload) => notifyCompletion(payload));
 ipcMain.handle('vulcan-window-show', async (_event, payload) => {
   showMainWindow(payload?.chatId ?? null);
@@ -622,9 +653,19 @@ app.whenReady().then(async () => {
   const semanticToolCacheStore = createSemanticToolCacheStore({ userDataPath: app.getPath('userData') });
   registerSemanticToolCacheIpc({ ipcMain, store: semanticToolCacheStore });
 
+  updater = createUpdater({
+    getMainWindow: () => mainWindow,
+    onStateChanged: () => refreshTrayMenu(),
+  });
   installTray();
   const win = createWindow();
   if (!shouldShowOnReady) win.hide();
+
+  // Update discovery is passive: startup continues whether GitHub is reachable
+  // or not. The renderer asks for current state on mount, so it cannot miss an
+  // early result, and hidden autostart launches do not force the window open.
+  setTimeout(() => { void updater?.check?.(); }, 1200);
+  updater.startPeriodicChecks();
 
   // Electron is only one of Vulcan's three lifecycle surfaces. Do not put
   // reconnect/auth logic here: main merely reports OS resume to the renderer's

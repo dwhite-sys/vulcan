@@ -1,7 +1,7 @@
 {
   "name": "vulcan",
   "private": true,
-  "version": "1.0.0-rc.11",
+  "version": "1.0.0-rc.16",
   "type": "module",
   "main": "electron/main.cjs",
   "author": {
@@ -64,7 +64,9 @@
     "test:design-proxy": "node --experimental-strip-types scripts/design-proxy-regression.ts",
     "test:tool-repeat-guard": "node --experimental-strip-types scripts/tool-repeat-guard-regression.ts",
     "runtime:hash": "node scripts/generate-runtime-hash.mjs",
-    "test:packaging": "node scripts/packaging-regression.mjs"
+    "test:packaging": "node scripts/packaging-regression.mjs",
+    "test:version": "node scripts/version-regression.mjs",
+    "test:updates": "node scripts/update-regression.mjs"
   },
   "build": {
     "appId": "com.vulcan.app",

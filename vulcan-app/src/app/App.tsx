@@ -9,6 +9,7 @@ import type { SkillMeta } from './components/SkillToggleMenu';
 import { WorkspacePanel } from './components/WorkspacePanel';
 import { HarnessTrustDialog } from './components/HarnessTrustDialog';
 import { ServerPasswordDialog } from './components/ServerPasswordDialog';
+import { UpdatePrompt } from './components/UpdatePrompt';
 import { llmClient, testProviderConnection, type LLMConfig, type ProviderConfig, type LLMStreamEvent } from './services/llm';
 import { getVulcanTools, getDesignSurfaceTools, isVulcanTool, executeVulcanTool } from './services/vulcanTools';
 import { isVisionModel } from './services/modelVision';
@@ -2943,6 +2944,7 @@ ${editedEvent.attachmentNotices}`.trim()
       <Toaster position="top-right" theme="dark" offset={{ top: 64 }} />
       <HarnessTrustDialog />
       <ServerPasswordDialog />
+      <UpdatePrompt />
       <TopBar
         connected={connected}
         vulcanConnected={vulcanConnected}

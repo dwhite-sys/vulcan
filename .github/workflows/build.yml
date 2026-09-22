@@ -38,6 +38,16 @@ jobs:
           cache: npm
           cache-dependency-path: vulcan-app/package-lock.json
 
+      - name: Derive release version from tag
+        if: github.ref_type == 'tag'
+        run: node scripts/version-from-tag.mjs "${{ github.ref_name }}"
+
+      - name: Version preflight
+        run: node scripts/version-regression.mjs
+
+      - name: Update preflight
+        run: node scripts/update-regression.mjs
+
       - name: Packaging preflight
         run: node scripts/packaging-regression.mjs
 

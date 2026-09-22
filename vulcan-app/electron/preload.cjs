@@ -21,6 +21,26 @@ contextBridge.exposeInMainWorld('electronAPI', {
     write: (endpoint, value) => ipcRenderer.invoke('vulcan-semantic-tool-cache-write', endpoint, value),
     remove: (endpoint) => ipcRenderer.invoke('vulcan-semantic-tool-cache-remove', endpoint),
   },
+  updates: {
+    getState: () => ipcRenderer.invoke('vulcan-update-state-get'),
+    check: () => ipcRenderer.invoke('vulcan-update-check'),
+    install: () => ipcRenderer.invoke('vulcan-update-install'),
+    onState: (callback) => {
+      const listener = (_event, payload) => callback(payload);
+      ipcRenderer.on('vulcan-update-state', listener);
+      return () => ipcRenderer.removeListener('vulcan-update-state', listener);
+    },
+    onOpen: (callback) => {
+      const listener = (_event, payload) => callback(payload);
+      ipcRenderer.on('vulcan-update-open', listener);
+      return () => ipcRenderer.removeListener('vulcan-update-open', listener);
+    },
+    onProgress: (callback) => {
+      const listener = (_event, payload) => callback(payload);
+      ipcRenderer.on('vulcan-update-progress', listener);
+      return () => ipcRenderer.removeListener('vulcan-update-progress', listener);
+    },
+  },
   desktop: {
     notify: (payload) => ipcRenderer.invoke('vulcan-native-notify', payload),
     show: (payload) => ipcRenderer.invoke('vulcan-window-show', payload),

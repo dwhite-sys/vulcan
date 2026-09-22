@@ -54,7 +54,7 @@ For development/private testing, `VULCAN_APPIMAGE_URL` together with `VULCAN_APP
 - Windows: native Electron + native Etna + dedicated `Vulcan` WSL2 Ubuntu 24.04 distro. Docker Engine and the Vulcan server run inside WSL2 under systemd.
 - macOS: native Electron `.app` + native Etna + named Colima profile. Only the Vulcan server/runtime lives inside the Colima Linux VM; Colima/Lima automatically forwards guest port 8468 back to macOS localhost.
 
-Etna deliberately stays on the desktop host on all three platforms so client-POV kits such as Playwright can interact with the user's real desktop/browser. The repair scripts establish uv-managed Python, Etna plus required kits (`web`, `playwright`, `ntfy`), the packaged Vulcan server runtime, Docker availability, and the Vulcan service.
+Etna deliberately stays on the desktop host on all three platforms so client-POV kits such as Playwright can interact with the user's real desktop/browser. The repair scripts establish uv-managed Python, Etna plus recommended kits (`web`, `playwright`, `ntfy`), the packaged Vulcan server runtime, Docker availability, and the Vulcan service.
 
 ## Build
 

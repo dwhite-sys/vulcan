@@ -6,14 +6,14 @@ const EXPANDED = { width: 560, height: 390 };
 const SHOW_DELAY_MS = 400;
 const COMPLETE_HOLD_MS = 240;
 
-function createSetupWindow({ allowShow = true } = {}) {
+function createSetupWindow({ allowShow = true, mode = 'repair' } = {}) {
   let ready = false;
   let revealRequested = false;
   let visible = false;
   let closing = false;
   let destroyed = false;
   let showAllowed = Boolean(allowShow);
-  const pending = [];
+  const pending = [{ type: 'context', mode }];
 
   const win = new BrowserWindow({
     width: COLLAPSED.width,

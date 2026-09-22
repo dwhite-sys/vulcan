@@ -4,7 +4,7 @@ const fs = require('fs');
 const os = require('os');
 const { createSecurePasswordStore, registerSecurePasswordIpc } = require('./securePasswordStore.cjs');
 const { createSemanticToolCacheStore, registerSemanticToolCacheIpc } = require('./semanticToolCacheStore.cjs');
-const { ensurePackagedRuntime } = require('./installCoordinator.cjs');
+const { checkPackagedRuntime, ensurePackagedRuntime } = require('./installCoordinator.cjs');
 const { createSetupWindow } = require('./setupWindow.cjs');
 const { createUpdater } = require('./updateManager.cjs');
 
@@ -602,18 +602,24 @@ ipcMain.on('native-file-drag-start', (event, payload) => {
 });
 
 app.whenReady().then(async () => {
-  startupRepairInProgress = app.isPackaged && process.env.VULCAN_SKIP_REPAIR !== '1';
+  const preflight = await checkPackagedRuntime({ app, net });
+  startupRepairInProgress = Boolean(preflight?.needsRepair);
 
   if (startupRepairInProgress) {
-    setupController = createSetupWindow({ allowShow: shouldShowOnReady });
+    setupController = createSetupWindow({
+      allowShow: shouldShowOnReady,
+      mode: preflight?.mode || 'repair',
+    });
   }
 
-  const repair = await ensurePackagedRuntime({
-    app,
-    dialog,
-    shell,
-    onProgress: (payload) => setupController?.progress(payload),
-  });
+  const repair = startupRepairInProgress
+    ? await ensurePackagedRuntime({
+        app,
+        dialog,
+        shell,
+        onProgress: (payload) => setupController?.progress(payload),
+      })
+    : { ok: true, skipped: true };
 
   startupRepairInProgress = false;
 

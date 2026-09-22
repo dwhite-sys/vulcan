@@ -862,7 +862,7 @@ ensure_vulcan_service_linux() {
     # Dedicated VM/distro and native --server-only installs use a system service
     # so the backend survives logout and starts at boot without a desktop session.
     local unit tmp_unit
-    unit="[Unit]\nDescription=Vulcan Server\nAfter=network-online.target docker.service\nWants=network-online.target\n\n[Service]\nType=simple\nUser=$USER\nEnvironment=HOME=$HOME\nEnvironment=PATH=$BIN_HOME:/usr/local/bin:/usr/bin:/bin\nEnvironment=PYTHONUNBUFFERED=1\nExecStart=$RUNTIME/bin/vulcan serve\nRestart=on-failure\nRestartSec=2\n\n[Install]\nWantedBy=multi-user.target\n"
+    unit="[Unit]\nDescription=Vulcan Server\nAfter=network-online.target docker.service\nWants=network-online.target\n\n[Service]\nType=simple\nUser=$USER\nEnvironment=HOME=$HOME\nEnvironment=PATH=$BIN_HOME:/usr/local/bin:/usr/bin:/bin\nEnvironment=PYTHONUNBUFFERED=1\nEnvironment=VULCAN_BUILD_ID=$VERSION\nExecStart=$RUNTIME/bin/vulcan serve\nRestart=on-failure\nRestartSec=2\n\n[Install]\nWantedBy=multi-user.target\n"
     tmp_unit="$(mktemp)"
     printf '%b' "$unit" > "$tmp_unit"
     run_privileged install -m 0644 "$tmp_unit" /etc/systemd/system/vulcan.service
@@ -883,6 +883,7 @@ Type=simple
 Environment=HOME=$HOME
 Environment=PATH=$BIN_HOME:/usr/local/bin:/usr/bin:/bin
 Environment=PYTHONUNBUFFERED=1
+Environment=VULCAN_BUILD_ID=$VERSION
 ExecStart=$RUNTIME/bin/vulcan serve
 Restart=on-failure
 RestartSec=2

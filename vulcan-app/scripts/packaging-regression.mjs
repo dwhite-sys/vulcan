@@ -53,6 +53,7 @@ assert.match(main, /event\.preventDefault\(\);\s*\n\s*win\.hide\(\)/);
 assert.match(main, /vulcan-native-notify/);
 assert.match(main, /note\.on\('click', \(\) => showMainWindow\(chatId\)\)/);
 assert.match(main, /ensurePackagedRuntime/);
+assert.match(main, /checkPackagedRuntime/);
 
 const preload = read(path.join(appRoot, 'electron', 'preload.cjs'));
 assert.match(preload, /desktop:\s*\{/);
@@ -69,6 +70,10 @@ assert.match(coordinator, /install\.sh/);
 assert.match(coordinator, /onProgress/);
 assert.match(coordinator, /installerStageForLine/);
 assert.match(coordinator, /type: 'log'/);
+assert.match(coordinator, /127\.0\.0\.1:8468\/meta/);
+assert.match(coordinator, /127\.0\.0\.1:8467\/health/);
+assert.match(coordinator, /serverCurrent && etnaReady/);
+assert.match(coordinator, /mode = 'update'/);
 
 assert.match(main, /createSetupWindow/);
 assert.match(main, /allowShow: shouldShowOnReady/);
@@ -84,11 +89,15 @@ assert.match(setupWindow, /width: 560, height: 124/);
 assert.match(setupWindow, /width: 560, height: 390/);
 assert.match(setupWindow, /SHOW_DELAY_MS = 400/);
 assert.match(setupWindow, /setContentSize\(size\.width, size\.height\)/);
+assert.match(setupWindow, /type: 'context', mode/);
 assert.match(setupPreload, /vulcan-setup-details/);
 assert.match(setupPreload, /vulcan-setup-progress/);
 
 assert(setupHtml.includes('Click for details'));
 assert(setupHtml.includes('First launch setup'));
+assert(setupHtml.includes('Finishing update'));
+assert(setupHtml.includes('Repairing Vulcan'));
+assert(setupHtml.includes('Update complete'));
 assert(setupHtml.includes('Working…'));
 assert(setupHtml.includes('repeating-linear-gradient('));
 assert(setupHtml.includes('125deg'));
@@ -115,8 +124,8 @@ assert.match(
 );
 assert.match(
   main,
-  /const repair = await ensurePackagedRuntime[\s\S]*const win = createWindow\(\)/,
-  'the visible application window must be created only after runtime convergence',
+  /const preflight = await checkPackagedRuntime[\s\S]*const win = createWindow\(\)/,
+  'the visible application window must be created only after the silent preflight and any required convergence',
 );
 
 const shell = read(path.join(root, 'install.sh'));
@@ -154,6 +163,7 @@ assert(shell.includes('APP_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}/vulca
 assert(shell.includes('installed_source="$PAYLOAD_HOME/server"'));
 assert(shell.includes('"$BIN_HOME/uv" pip install --python "$RUNTIME/bin/python" "$installed_source"'));
 assert(!shell.includes('"$BIN_HOME/uv" pip install --python "$RUNTIME/bin/python" "$SERVER_SOURCE"'));
+assert.match(shell, /Environment=VULCAN_BUILD_ID=\$VERSION/);
 
 const workflow = read(path.join(root, '.github', 'workflows', 'build.yml'));
 assert.match(workflow, /ubuntu-latest/);

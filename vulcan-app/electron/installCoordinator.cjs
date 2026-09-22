@@ -1,5 +1,7 @@
 const { spawn } = require('child_process');
 const path = require('path');
+const fs = require('fs');
+const os = require('os');
 
 function parseResult(output) {
   const lines = String(output || '').split(/\r?\n/).reverse();
@@ -99,6 +101,65 @@ function installerStageForLine(line) {
   ) return stagePayload('services');
 
   return null;
+}
+
+async function probeJson(net, url, timeoutMs = 900) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await net.fetch(url, {
+      method: 'GET',
+      redirect: 'error',
+      signal: controller.signal,
+      headers: { accept: 'application/json' },
+    });
+    if (!response.ok) return null;
+    return await response.json();
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function checkPackagedRuntime({ app, net }) {
+  if (!app.isPackaged || process.env.VULCAN_SKIP_REPAIR === '1') {
+    return { ok: true, needsRepair: false, skipped: true };
+  }
+
+  if (process.platform === 'darwin' && !app.isInApplicationsFolder()) {
+    return { ok: true, needsRepair: true, mode: 'setup', reason: 'app-location' };
+  }
+
+  const [server, etna] = await Promise.all([
+    probeJson(net, 'http://127.0.0.1:8468/meta'),
+    probeJson(net, 'http://127.0.0.1:8467/health'),
+  ]);
+
+  const version = app.getVersion();
+  const serverReady = server?.ok === true;
+  const serverCurrent = serverReady && String(server?.buildId || '') === version;
+  const etnaReady = etna?.service === 'etna-mcp' && etna?.status === 'ok';
+
+  if (serverCurrent && etnaReady) {
+    return { ok: true, needsRepair: false, mode: null, reason: 'healthy' };
+  }
+
+  const vulcanHomeExists = fs.existsSync(path.join(os.homedir(), '.vulcan'));
+  let mode = 'repair';
+  if (serverReady && !serverCurrent) mode = 'update';
+  else if (!serverReady && !vulcanHomeExists) mode = 'setup';
+
+  return {
+    ok: true,
+    needsRepair: true,
+    mode,
+    reason: !serverReady
+      ? 'server-unavailable'
+      : !serverCurrent
+        ? 'server-version'
+        : 'etna-unhealthy',
+  };
 }
 
 function run(command, args, options = {}) {
@@ -285,4 +346,4 @@ async function ensurePackagedRuntime({ app, dialog, shell, onProgress }) {
   return { ok: true, ...result };
 }
 
-module.exports = { ensurePackagedRuntime, parseResult, parseProgressLine };
+module.exports = { checkPackagedRuntime, ensurePackagedRuntime, parseResult, parseProgressLine, probeJson };

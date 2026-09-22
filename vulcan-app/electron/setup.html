@@ -341,6 +341,7 @@ let totalIndividualTasks = 0;
 let latestDoneTask = 0;
 let activeKey = 'checking';
 let detailsOpen = false;
+let convergenceMode = 'setup';
 
 const root = document.getElementById('window');
 const title = document.getElementById('title');
@@ -362,6 +363,25 @@ function appendLog(text){
   if (!text) return;
   log.textContent += `[${stamp()}] ${text}\n`;
   log.scrollTop = log.scrollHeight;
+}
+
+function applyContext(payload){
+  convergenceMode = String(payload?.mode || 'repair');
+
+  if (convergenceMode === 'update'){
+    eyebrow.textContent = 'Finishing update';
+    hint.textContent = 'Applying updated runtime';
+    appendLog('A newer Vulcan desktop build is converging its local runtime.');
+  } else if (convergenceMode === 'repair'){
+    eyebrow.textContent = 'Repairing Vulcan';
+    hint.textContent = 'Self-repair';
+    appendLog('Vulcan found local runtime state that needs repair.');
+  } else {
+    convergenceMode = 'setup';
+    eyebrow.textContent = 'Setting up Vulcan';
+    hint.textContent = 'First launch setup';
+    appendLog('Beginning first-launch Vulcan setup.');
+  }
 }
 
 function renderSteps(){
@@ -487,7 +507,9 @@ function complete(){
   renderSteps();
 
   root.classList.add('complete');
-  eyebrow.textContent = 'Setup complete';
+  eyebrow.textContent = convergenceMode === 'update'
+    ? 'Update complete'
+    : convergenceMode === 'repair' ? 'Repair complete' : 'Setup complete';
   title.textContent = 'Vulcan is ready';
   sub.textContent = 'Opening Vulcan…';
   activity.textContent = 'Ready';
@@ -505,10 +527,14 @@ link.addEventListener('click', () => {
 state.set('checking', 'active');
 renderSteps();
 updateProgress();
-appendLog('Beginning Vulcan convergence.');
 
 window.vulcanSetup?.onProgress((payload) => {
   if (!payload || typeof payload !== 'object') return;
+
+  if (payload.type === 'context'){
+    applyContext(payload);
+    return;
+  }
 
   if (payload.type === 'plan'){
     applyPlan(payload);

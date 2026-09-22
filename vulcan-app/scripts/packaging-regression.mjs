@@ -72,11 +72,11 @@ assert.match(coordinator, /installerStageForLine/);
 assert.match(coordinator, /type: 'log'/);
 assert.match(coordinator, /127\.0\.0\.1:8468\/meta/);
 assert.match(coordinator, /127\.0\.0\.1:8467\/health/);
-assert.match(coordinator, /server-payload\\.sha256/);
-assert.match(coordinator, /server\\?\\.payloadHash/);
+assert.match(coordinator, /server-payload\.sha256/);
+assert.match(coordinator, /server\?\.payloadHash/);
 assert.match(coordinator, /payloadCurrent && etnaReady/);
 assert.match(coordinator, /installedLinuxHash === packagedHash/);
-assert.doesNotMatch(coordinator, /buildId[^\\n]*===/);
+assert.doesNotMatch(coordinator, /buildId[^\n]*===/);
 assert.match(coordinator, /mode = 'update'/);
 
 assert.match(main, /createSetupWindow/);
@@ -168,6 +168,10 @@ assert(shell.includes('installed_source="$PAYLOAD_HOME/server"'));
 assert(shell.includes('"$BIN_HOME/uv" pip install --python "$RUNTIME/bin/python" "$installed_source"'));
 assert(!shell.includes('"$BIN_HOME/uv" pip install --python "$RUNTIME/bin/python" "$SERVER_SOURCE"'));
 assert.match(shell, /Environment=VULCAN_BUILD_ID=\$VERSION/);
+assert.match(shell, /Environment=VULCAN_PAYLOAD_HASH=\$payload_hash/);
+
+const serverPy = read(path.join(root, 'vulcan', 'server.py'));
+assert.match(serverPy, /"payloadHash": os\.environ\.get\("VULCAN_PAYLOAD_HASH", ""\)/);
 
 const workflow = read(path.join(root, '.github', 'workflows', 'build.yml'));
 assert.match(workflow, /ubuntu-latest/);

@@ -72,7 +72,11 @@ assert.match(coordinator, /installerStageForLine/);
 assert.match(coordinator, /type: 'log'/);
 assert.match(coordinator, /127\.0\.0\.1:8468\/meta/);
 assert.match(coordinator, /127\.0\.0\.1:8467\/health/);
-assert.match(coordinator, /serverCurrent && etnaReady/);
+assert.match(coordinator, /server-payload\\.sha256/);
+assert.match(coordinator, /server\\?\\.payloadHash/);
+assert.match(coordinator, /payloadCurrent && etnaReady/);
+assert.match(coordinator, /installedLinuxHash === packagedHash/);
+assert.doesNotMatch(coordinator, /buildId[^\\n]*===/);
 assert.match(coordinator, /mode = 'update'/);
 
 assert.match(main, /createSetupWindow/);

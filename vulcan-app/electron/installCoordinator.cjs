@@ -122,6 +122,15 @@ async function probeJson(net, url, timeoutMs = 900) {
   }
 }
 
+function readSha256(filePath) {
+  try {
+    const value = fs.readFileSync(filePath, 'utf8').trim().toLowerCase();
+    return /^[0-9a-f]{64}$/.test(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
 async function checkPackagedRuntime({ app, net }) {
   if (!app.isPackaged || process.env.VULCAN_SKIP_REPAIR === '1') {
     return { ok: true, needsRepair: false, skipped: true };
@@ -136,18 +145,30 @@ async function checkPackagedRuntime({ app, net }) {
     probeJson(net, 'http://127.0.0.1:8467/health'),
   ]);
 
-  const version = app.getVersion();
   const serverReady = server?.ok === true;
-  const serverCurrent = serverReady && String(server?.buildId || '') === version;
   const etnaReady = etna?.service === 'etna-mcp' && etna?.status === 'ok';
 
-  if (serverCurrent && etnaReady) {
+  const packagedHash = readSha256(path.join(process.resourcesPath, 'server-payload.sha256'));
+  const reportedRaw = String(server?.payloadHash || '').toLowerCase();
+  const reportedHash = /^[0-9a-f]{64}$/.test(reportedRaw) ? reportedRaw : null;
+
+  // Transition fallback for Linux builds installed before /meta exposed
+  // payloadHash. The converger already persists this exact desired-state hash.
+  const installedLinuxHash = process.platform === 'linux'
+    ? readSha256(path.join(os.homedir(), '.vulcan', 'payload', 'server-payload.sha256'))
+    : null;
+
+  const payloadCurrent = serverReady
+    && Boolean(packagedHash)
+    && (reportedHash === packagedHash || installedLinuxHash === packagedHash);
+
+  if (payloadCurrent && etnaReady) {
     return { ok: true, needsRepair: false, mode: null, reason: 'healthy' };
   }
 
   const vulcanHomeExists = fs.existsSync(path.join(os.homedir(), '.vulcan'));
   let mode = 'repair';
-  if (serverReady && !serverCurrent) mode = 'update';
+  if (serverReady && !payloadCurrent) mode = 'update';
   else if (!serverReady && !vulcanHomeExists) mode = 'setup';
 
   return {
@@ -156,8 +177,8 @@ async function checkPackagedRuntime({ app, net }) {
     mode,
     reason: !serverReady
       ? 'server-unavailable'
-      : !serverCurrent
-        ? 'server-version'
+      : !payloadCurrent
+        ? 'server-payload'
         : 'etna-unhealthy',
   };
 }

@@ -857,12 +857,13 @@ ensure_docker_linux() {
 }
 
 ensure_vulcan_service_linux() {
-  local py="$RUNTIME/bin/python"
+  local py="$RUNTIME/bin/python" payload_hash
+  payload_hash="$(server_payload_hash)"
   if [[ -n "$GUEST" || "$SERVER_ONLY" -eq 1 ]]; then
     # Dedicated VM/distro and native --server-only installs use a system service
     # so the backend survives logout and starts at boot without a desktop session.
     local unit tmp_unit
-    unit="[Unit]\nDescription=Vulcan Server\nAfter=network-online.target docker.service\nWants=network-online.target\n\n[Service]\nType=simple\nUser=$USER\nEnvironment=HOME=$HOME\nEnvironment=PATH=$BIN_HOME:/usr/local/bin:/usr/bin:/bin\nEnvironment=PYTHONUNBUFFERED=1\nEnvironment=VULCAN_BUILD_ID=$VERSION\nExecStart=$RUNTIME/bin/vulcan serve\nRestart=on-failure\nRestartSec=2\n\n[Install]\nWantedBy=multi-user.target\n"
+    unit="[Unit]\nDescription=Vulcan Server\nAfter=network-online.target docker.service\nWants=network-online.target\n\n[Service]\nType=simple\nUser=$USER\nEnvironment=HOME=$HOME\nEnvironment=PATH=$BIN_HOME:/usr/local/bin:/usr/bin:/bin\nEnvironment=PYTHONUNBUFFERED=1\nEnvironment=VULCAN_BUILD_ID=$VERSION\nEnvironment=VULCAN_PAYLOAD_HASH=$payload_hash\nExecStart=$RUNTIME/bin/vulcan serve\nRestart=on-failure\nRestartSec=2\n\n[Install]\nWantedBy=multi-user.target\n"
     tmp_unit="$(mktemp)"
     printf '%b' "$unit" > "$tmp_unit"
     run_privileged install -m 0644 "$tmp_unit" /etc/systemd/system/vulcan.service
@@ -884,6 +885,7 @@ Environment=HOME=$HOME
 Environment=PATH=$BIN_HOME:/usr/local/bin:/usr/bin:/bin
 Environment=PYTHONUNBUFFERED=1
 Environment=VULCAN_BUILD_ID=$VERSION
+Environment=VULCAN_PAYLOAD_HASH=$payload_hash
 ExecStart=$RUNTIME/bin/vulcan serve
 Restart=on-failure
 RestartSec=2

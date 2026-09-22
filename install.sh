@@ -570,51 +570,46 @@ etna_kit_ready() {
   grep -Eq "\"$kit\"[[:space:]]*:" "$config"
 }
 
-find_etna_python() {
-  local candidate="" resolved=""
+etna_runtime_python() {
+  printf '%s\n' "$HOME/.etna_server/venv/bin/python"
+}
 
-  for candidate in python3 python; do
-    resolved="$(PATH="$HOST_PATH" command -v "$candidate" 2>/dev/null || true)"
-    if [[ -n "$resolved" ]] && "$resolved" -c 'import etna' >/dev/null 2>&1; then
-      printf '%s\n' "$resolved"
-      return 0
-    fi
-  done
+bootstrap_etna() {
+  say "Bootstrapping Etna with Etna's own installer"
+  ensure_downloader
 
-  return 1
+  if have curl; then
+    curl -LsSf https://raw.githubusercontent.com/dwhite-sys/Etna/main/install.sh | sh
+  elif have wget; then
+    wget -qO- https://raw.githubusercontent.com/dwhite-sys/Etna/main/install.sh | sh
+  else
+    fail "curl or wget is required to bootstrap Etna"
+  fi
 }
 
 ensure_etna() {
-  local py="" managed_py="" kit
+  local py kit
+  py="$(etna_runtime_python)"
 
-  # Vulcan only needs enough Etna present for Etna's own repair machinery to run.
-  # Prefer an existing host Python that can already import Etna. If none can,
-  # seed the package into Vulcan's managed Python, then follow the exact same path.
-  py="$(find_etna_python || true)"
-
-  if [[ -z "$py" ]]; then
-    ensure_python
-    managed_py="$("$BIN_HOME/uv" python find --managed-python 3.12)"
-
-    if "$managed_py" -c 'import etna' >/dev/null 2>&1; then
-      py="$managed_py"
-      progress_task_finish etna cli skipped "Etna Python package already available"
-    else
-      progress_task_start etna cli "Checking Etna Python package"
-      say "Installing Etna Python package"
-      "$BIN_HOME/uv" pip install --python "$managed_py" 'etna-mcp' >/dev/null \
-        || fail "Could not install Etna"
-      "$managed_py" -c 'import etna' >/dev/null 2>&1 \
-        || fail "Etna package installed but could not be imported"
-      py="$managed_py"
-      progress_task_finish etna cli done "Etna Python package ready"
+  # Vulcan does not install, repair, or lay out Etna itself. If Etna's managed
+  # runtime is not viable enough to invoke, hand bootstrap to Etna's own installer.
+  progress_task_start etna cli "Checking Etna runtime"
+  if [[ ! -x "$py" ]] || ! "$py" -c 'import etna' >/dev/null 2>&1; then
+    if ! bootstrap_etna; then
+      fail "Etna's installer failed"
     fi
+
+    [[ -x "$py" ]] \
+      || fail "Etna's installer did not create its managed runtime"
+    "$py" -c 'import etna' >/dev/null 2>&1 \
+      || fail "Etna's managed runtime cannot import Etna"
+    progress_task_finish etna cli done "Etna bootstrap complete"
   else
-    progress_task_finish etna cli skipped "Existing Etna Python package ready"
+    progress_task_finish etna cli skipped "Etna runtime already viable"
   fi
 
-  # Etna is regenerative: start is the cheap self-repair path. Let it finish,
-  # then verify the real health endpoint. Only escalate to init if still unhealthy.
+  # From here both pre-existing and freshly bootstrapped Etna take the same path.
+  # Etna owns repair: start first, check health, then escalate to init only if needed.
   progress_task_start etna runtime "Starting Etna"
   "$py" -m etna start >/dev/null 2>&1 || true
 
@@ -622,7 +617,7 @@ ensure_etna() {
     progress_task_finish etna runtime skipped "Etna already healthy"
   else
     say "Etna is not healthy after start; asking Etna to self-repair"
-    "$py" -m etna init >/dev/null 2>&1 \
+    "$py" -m etna init \
       || fail "Etna self-repair failed"
     etna_endpoint_healthy \
       || fail "Etna init completed but Etna is not healthy on port 8467"
@@ -636,7 +631,7 @@ ensure_etna() {
       progress_task_finish etna "kit-$kit" skipped "Etna kit already ready: $kit"
     else
       say "Installing missing Etna kit: $kit"
-      "$py" -m etna install "$kit" >/dev/null \
+      "$py" -m etna install "$kit" \
         || fail "Could not install Etna kit: $kit"
       progress_task_finish etna "kit-$kit" done "Etna kit ready: $kit"
     fi

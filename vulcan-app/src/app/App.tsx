@@ -2596,6 +2596,15 @@ Narrate at the level of intent. Say what you're doing and why; don't narrate eac
       setChats((previous) => previous.map((chat) => chat.id === chatId ? { ...chat, title, updatedAt } : chat));
       setActiveChat((previous) => previous?.id === chatId ? { ...previous, title, updatedAt } : previous);
     });
+    const removeGenerationComplete = vulcan.generalWS.onPush('push/generation-complete', (payload: any) => {
+      const chatId = String(payload.chat_id ?? '');
+      if (chatId === activeChatIdRef.current) {
+        // OpenAI-compatible providers explicitly tell us when the final model
+        // completion ends. Unlock the composer on that signal instead of waiting
+        // for server-side persistence/title/checkpoint cleanup.
+        setProcessing(false);
+      }
+    });
     const removeStatus = vulcan.generalWS.onPush('push/run-status', (payload: any) => {
       const chatId = String(payload.chat_id ?? '');
       if (chatId === activeChatIdRef.current) {
@@ -2665,7 +2674,7 @@ Narrate at the level of intent. Say what you're doing and why; don't narrate eac
       }).catch(() => {});
     });
     return () => {
-      removeEvents(); removeEvent(); removeChatUpdate(); removeStatus(); removeQuestion(); removePanelDelete(); removeTerminal(); removeRunning(); removeIdle(); removeReconnect();
+      removeEvents(); removeEvent(); removeChatUpdate(); removeGenerationComplete(); removeStatus(); removeQuestion(); removePanelDelete(); removeTerminal(); removeRunning(); removeIdle(); removeReconnect();
     };
   }, []);
 

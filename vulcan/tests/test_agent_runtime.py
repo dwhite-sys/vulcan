@@ -1860,6 +1860,8 @@ class BackgroundAgentTests(unittest.IsolatedAsyncioTestCase):
                 timeout=0.5,
             )
         self.assertEqual(result['content'], 'finished')
+        self.assertTrue(result['providerTerminal'])
+        self.assertIsNone(result['finishReason'])
 
     async def test_provider_finish_reason_ends_run_without_done_or_http_eof(self):
         release = asyncio.Event()
@@ -1890,6 +1892,38 @@ class BackgroundAgentTests(unittest.IsolatedAsyncioTestCase):
                 timeout=0.5,
             )
         self.assertEqual(result['content'], 'finished')
+        self.assertTrue(result['providerTerminal'])
+        self.assertEqual(result['finishReason'], 'stop')
+
+    async def test_provider_terminal_unlocks_before_final_checkpoint_cleanup(self):
+        manager = agent.RunManager()
+        session = FakeSession()
+        checkpoint_release = asyncio.Event()
+
+        async def provider(run, messages, tools, turn_id):
+            run.stream_event({"type": "text_delta", "delta": "done"}, turn_id)
+            return {"thinking": "", "content": "done", "toolCalls": [],
+                    "providerTerminal": True, "finishReason": "stop"}
+
+        async def blocked_checkpoint(self, *, publish_full=False):
+            await checkpoint_release.wait()
+
+        with mock.patch.object(agent, '_provider_response', provider), \
+             mock.patch.object(agent.AgentRun, 'checkpoint', blocked_checkpoint):
+            run = manager.start(chat('generation-unlock'), options(autoGenerateTitle=False), session)
+            for _ in range(50):
+                if any(item['type'] == 'push/generation-complete' for item in session.messages):
+                    break
+                await asyncio.sleep(0.01)
+
+            completed = [item for item in session.messages if item['type'] == 'push/generation-complete']
+            self.assertEqual(len(completed), 1)
+            self.assertEqual(completed[0]['payload']['finish_reason'], 'stop')
+            self.assertTrue(run.generation_complete)
+            self.assertFalse(run.task.done())
+
+            checkpoint_release.set()
+            await asyncio.wait_for(run.task, timeout=2)
 
     async def test_dashboard_http_proxy_streams_and_never_forwards_session_credentials(self):
         server = load_server_module()

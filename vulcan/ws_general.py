@@ -142,7 +142,7 @@ class GeneralWSSession:
         if msg_type in {"push/client-http-request", "push/client-http-cancel"}:
             return 0
         if msg_type in {
-            "push/connected", "push/run-status", "push/run-question", "push/design-action",
+            "push/connected", "push/run-status", "push/generation-complete", "push/run-question", "push/design-action",
         }:
             return 1
         if msg_type == "push/run-events":
@@ -634,7 +634,7 @@ class GeneralWSSession:
         run = agent_runtime.MANAGER.runs.get(chat_id)
         chat = run.chat if run else await asyncio.to_thread(chat_store.load_chat, chat_id)
         await self.respond(req_id, "runs/subscribe", {
-            "chat_id": chat_id, "chat": chat, "status": run.status if run else "idle",
+            "chat_id": chat_id, "chat": chat, "status": ("complete" if run and run.generation_complete else run.status) if run else "idle",
             "run_id": run.run_id if run else None, "question": run.question_batch if run else None,
         })
 
@@ -645,7 +645,7 @@ class GeneralWSSession:
     async def _runs_status(self, req_id: str, p: dict):
         run = agent_runtime.MANAGER.runs.get(p["chat_id"])
         await self.respond(req_id, "runs/status", {
-            "status": run.status if run else "idle", "run_id": run.run_id if run else None,
+            "status": ("complete" if run and run.generation_complete else run.status) if run else "idle", "run_id": run.run_id if run else None,
             "question": run.question_batch if run else None,
         })
 

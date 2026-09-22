@@ -624,6 +624,7 @@ class AgentRun:
     terminal_resume_task: asyncio.Task | None = None
     checkpoint_task: asyncio.Task | None = None
     checkpoint_requested: bool = False
+    generation_complete: bool = False
 
     @property
     def events(self) -> list[dict[str, Any]]:
@@ -815,6 +816,16 @@ class RunManager:
         return self._launch(run, session)
 
     async def start_async(self, chat: dict[str, Any], options: dict[str, Any], session: Any | None = None) -> AgentRun:
+        # The renderer is released as soon as the provider explicitly ends the
+        # final completion. If a user submits the next turn while the previous
+        # run is only finishing persistence/title cleanup, accept that send and
+        # wait for the old task rather than rejecting it as "already active".
+        existing = self.runs.get(chat["id"])
+        if existing and existing.task and not existing.task.done() and existing.generation_complete:
+            try:
+                await asyncio.shield(existing.task)
+            except Exception:
+                pass
         run = self._prepare_start(chat, options)
         # Provider dispatch must not wait for a potentially multi-megabyte
         # SQLite/FTS rewrite. Persist an immutable snapshot in the background;
@@ -1084,6 +1095,8 @@ async def _provider_response(run: AgentRun, messages: list[dict[str, Any]], tool
         headers["Authorization"] = f"Bearer {api_key}"
     parser = ProviderStreamParser(lambda event: run.stream_event(event, turn_id))
     endpoint = base_url.rstrip("/") + "/chat/completions"
+    provider_terminal = False
+    finish_reason: str | None = None
 
     def process_line(line: str) -> bool:
         """Process one SSE line and report whether the provider has terminated.
@@ -1095,6 +1108,7 @@ async def _provider_response(run: AgentRun, messages: list[dict[str, Any]], tool
         already finished. A non-null finish_reason is terminal too and lets us stop
         one event earlier when providers omit/delay `[DONE]`.
         """
+        nonlocal finish_reason
         if not line.startswith("data:"):
             return False
         data = line[5:].strip()
@@ -1106,7 +1120,11 @@ async def _provider_response(run: AgentRun, messages: list[dict[str, Any]], tool
             parsed = json.loads(data)
             choice = (parsed.get("choices") or [{}])[0]
             parser.process_delta(choice.get("delta"))
-            return choice.get("finish_reason") is not None
+            reason = choice.get("finish_reason")
+            if choice.get("finish_reason") is not None:
+                finish_reason = str(reason)
+                return True
+            return False
         except (json.JSONDecodeError, IndexError, TypeError):
             return False
 
@@ -1126,11 +1144,14 @@ async def _provider_response(run: AgentRun, messages: list[dict[str, Any]], tool
                     line, pending = pending.split("\n", 1)
                     if process_line(line.rstrip("\r")):
                         terminal = True
+                        provider_terminal = True
                         break
                 if terminal:
                     break
             if not terminal and pending:
                 terminal = process_line(pending.rstrip("\r"))
+                if terminal:
+                    provider_terminal = True
         finally:
             # Explicitly close an early-terminated client relay. relay_http_stream
             # then cancels the browser-side fetch instead of leaving it alive until
@@ -1152,13 +1173,17 @@ async def _provider_response(run: AgentRun, messages: list[dict[str, Any]], tool
                         raise ValueError(f"LLM error {response.status_code}: {content}")
                     async for line in response.aiter_lines():
                         if process_line(line):
+                            provider_terminal = True
                             break
                 break
             except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout):
                 if attempt:
                     raise
                 await asyncio.sleep(0.1)
-    return parser.finish()
+    result = parser.finish()
+    result["providerTerminal"] = provider_terminal
+    result["finishReason"] = finish_reason
+    return result
 
 
 def _toolset(run: AgentRun) -> list[dict[str, Any]]:
@@ -1295,6 +1320,16 @@ async def execute_run(run: AgentRun):
         response = await _provider_response(run, messages, tools, turn_id)
         run.seal_semantic()
         calls = response.get("toolCalls", [])
+        if response.get("providerTerminal") and not calls:
+            # The OpenAI-compatible provider has explicitly ended the final model
+            # completion.  Surface that fact immediately; persistence/title/final
+            # checkpoint work must not keep the human composer locked.
+            run.generation_complete = True
+            run.manager.publish(run.chat["id"], "push/generation-complete", {
+                "chat_id": run.chat["id"],
+                "run_id": run.run_id,
+                "finish_reason": response.get("finishReason"),
+            })
         for index, call in enumerate(calls):
             event_id = run.streamed_tool_ids.get(index)
             if not event_id:

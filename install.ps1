@@ -123,98 +123,130 @@ if (-not $FromApp -and -not $ResourcesDir -and -not $ElevatedWslBootstrap) {
     exit 0
 }
 
+function Test-EtnaHealth {
+    try {
+        $health = Invoke-RestMethod `
+            -UseBasicParsing `
+            -Uri "http://127.0.0.1:8467/health" `
+            -TimeoutSec 2
+
+        return (
+            $health.service -eq "etna-mcp" -and
+            $health.status -eq "ok"
+        )
+    }
+    catch {
+        return $false
+    }
+}
+
+function Find-EtnaPython {
+    # Etna is a Python package. Resolve the interpreter that can import it;
+    # do not depend on a generated console-script wrapper.
+    $pyLauncher = Get-Command "py.exe" -ErrorAction SilentlyContinue
+
+    if ($pyLauncher) {
+        $candidate = & $pyLauncher.Source -3 -c "import etna, sys; print(sys.executable)" 2>$null
+        if ($LASTEXITCODE -eq 0 -and $candidate) {
+            return ([string]$candidate).Trim()
+        }
+    }
+
+    foreach ($name in @("python.exe", "python3.exe")) {
+        $command = Get-Command $name -ErrorAction SilentlyContinue
+        if (-not $command) { continue }
+
+        $candidate = & $command.Source -c "import etna, sys; print(sys.executable)" 2>$null
+        if ($LASTEXITCODE -eq 0 -and $candidate) {
+            return ([string]$candidate).Trim()
+        }
+    }
+
+    return $null
+}
+
 function Ensure-HostEtna {
-    # If Etna is already healthy, leave it completely alone.
-    if (Test-TcpPort "127.0.0.1" 8467 500) {
-        Write-Step "Etna already healthy; skipping Etna setup"
-        return
-    }
-
     # Etna is intentionally native Windows. Its Playwright kit drives the user's
-    # visible host Chrome, while Vulcan's server remains isolated inside WSL2.
-    $uv = Join-Path $BinRoot "uv.exe"
+    # visible host Chrome. Vulcan only ensures enough of the Python package exists
+    # to invoke Etna's own regenerative repair machinery.
+    $etnaPython = Find-EtnaPython
 
-    if (-not (Test-Path $uv)) {
-        Write-Step "Repairing uv runtime"
+    if (-not $etnaPython) {
+        $uv = Join-Path $BinRoot "uv.exe"
 
-        $env:UV_UNMANAGED_INSTALL = $BinRoot
-        $env:UV_NO_MODIFY_PATH = "1"
+        if (-not (Test-Path $uv)) {
+            Write-Step "Repairing uv runtime"
 
-        try {
-            $installer = Invoke-RestMethod `
-                -UseBasicParsing `
-                -Uri "https://astral.sh/uv/install.ps1"
+            $env:UV_UNMANAGED_INSTALL = $BinRoot
+            $env:UV_NO_MODIFY_PATH = "1"
 
-            Invoke-Expression $installer
+            try {
+                $installer = Invoke-RestMethod `
+                    -UseBasicParsing `
+                    -Uri "https://astral.sh/uv/install.ps1"
+
+                Invoke-Expression $installer
+            }
+            catch {
+                Fail "Could not install uv: $($_.Exception.Message)"
+            }
         }
-        catch {
-            Fail "Could not install uv: $($_.Exception.Message)"
+
+        if (-not (Test-Path $uv)) {
+            Fail "uv installer did not create $uv"
         }
-    }
 
-    if (-not (Test-Path $uv)) {
-        Fail "uv installer did not create $uv"
-    }
-
-    & $uv python find --managed-python 3.12 *> $null
-
-    if ($LASTEXITCODE -ne 0) {
-        Write-Step "Installing Vulcan-managed Python 3.12"
-
-        & $uv python install 3.12 *> $null
+        & $uv python find --managed-python 3.12 *> $null
 
         if ($LASTEXITCODE -ne 0) {
-            Fail "Could not install Vulcan-managed Python 3.12"
+            Write-Step "Installing Vulcan-managed Python 3.12"
+            & $uv python install 3.12 *> $null
+
+            if ($LASTEXITCODE -ne 0) {
+                Fail "Could not install Vulcan-managed Python 3.12"
+            }
+        }
+
+        $managedPython = ((& $uv python find --managed-python 3.12) | Select-Object -Last 1).Trim()
+        if (-not $managedPython) {
+            Fail "Could not locate Vulcan-managed Python 3.12"
+        }
+
+        & $managedPython -c "import etna" *> $null
+        if ($LASTEXITCODE -eq 0) {
+            $etnaPython = $managedPython
+        }
+        else {
+            Write-Step "Installing Etna Python package"
+            & $uv pip install --python $managedPython "etna-mcp" *> $null
+
+            if ($LASTEXITCODE -ne 0) {
+                Fail "Could not install Etna"
+            }
+
+            & $managedPython -c "import etna" *> $null
+            if ($LASTEXITCODE -ne 0) {
+                Fail "Etna package installed but could not be imported"
+            }
+
+            $etnaPython = $managedPython
         }
     }
 
-    $etna = Join-Path $BinRoot "etna.exe"
-    $etnaHealthy = $false
+    # First give Etna its cheap start/self-repair path. Once that command exits,
+    # trust the real health endpoint. Only escalate to `init` if Etna is unhealthy.
+    & $etnaPython -m etna start *> $null
 
-    if (Test-Path $etna) {
-        & $etna --help *> $null
-        $etnaHealthy = ($LASTEXITCODE -eq 0)
-    }
-
-    if (-not $etnaHealthy) {
-        Write-Step "Repairing native Etna"
-
-        & $uv tool install `
-            --force `
-            --python 3.12 `
-            "etna-mcp" *> $null
-
-        if (
-            $LASTEXITCODE -ne 0 -or
-            -not (Test-Path $etna)
-        ) {
-            Fail "Could not install Etna"
-        }
-    }
-
-    # Etna now owns its managed runtime and Task Scheduler lifecycle.
-    & $etna init *> $null
-
-    if ($LASTEXITCODE -ne 0) {
-        # Covers b38, which has no `init`, and repairs stale pre-b40 installs.
-        Write-Step "Refreshing native Etna"
-
-        & $uv tool install `
-            --force `
-            --python 3.12 `
-            "etna-mcp" *> $null
-
-        if (
-            $LASTEXITCODE -ne 0 -or
-            -not (Test-Path $etna)
-        ) {
-            Fail "Could not refresh Etna"
-        }
-
-        & $etna init *> $null
+    if (-not (Test-EtnaHealth)) {
+        Write-Step "Etna is not healthy after start; asking Etna to self-repair"
+        & $etnaPython -m etna init *> $null
 
         if ($LASTEXITCODE -ne 0) {
             Fail "Etna self-repair failed"
+        }
+
+        if (-not (Test-EtnaHealth)) {
+            Fail "Etna init completed but Etna is not healthy on port 8467"
         }
     }
 
@@ -242,8 +274,7 @@ function Ensure-HostEtna {
 
         if (-not $installed) {
             Write-Step "Installing missing Etna kit: $kit"
-
-            & $etna install $kit *> $null
+            & $etnaPython -m etna install $kit *> $null
 
             if ($LASTEXITCODE -ne 0) {
                 Fail "Could not install Etna kit '$kit'"
@@ -251,8 +282,8 @@ function Ensure-HostEtna {
         }
     }
 
-    if (-not (Test-TcpPort "127.0.0.1" 8467 500)) {
-        Fail "Etna init completed but Etna is not healthy on port 8467"
+    if (-not (Test-EtnaHealth)) {
+        Fail "Etna is not healthy on port 8467"
     }
 }
 

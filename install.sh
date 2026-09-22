@@ -570,109 +570,82 @@ etna_kit_ready() {
   grep -Eq "\"$kit\"[[:space:]]*:" "$config"
 }
 
+find_etna_python() {
+  local candidate="" resolved=""
+
+  for candidate in python3 python; do
+    resolved="$(PATH="$HOST_PATH" command -v "$candidate" 2>/dev/null || true)"
+    if [[ -n "$resolved" ]] && "$resolved" -c 'import etna' >/dev/null 2>&1; then
+      printf '%s\n' "$resolved"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
 ensure_etna() {
-  local etna="" kit
+  local py="" managed_py="" kit
 
-  # If Etna is already healthy, leave it completely alone.
-  if etna_endpoint_healthy; then
-    progress_task_finish etna cli skipped "Etna already healthy"
-    progress_task_finish etna runtime skipped "Etna already healthy"
-    for kit in web playwright ntfy; do
-      progress_task_finish etna "kit-$kit" skipped "Etna already healthy"
-    done
-    progress_task_finish etna endpoint skipped "Etna already healthy"
-    return
-  fi
+  # Vulcan only needs enough Etna present for Etna's own repair machinery to run.
+  # Prefer an existing host Python that can already import Etna. If none can,
+  # seed the package into Vulcan's managed Python, then follow the exact same path.
+  py="$(find_etna_python || true)"
 
-  ensure_python
-  etna="$BIN_HOME/etna"
+  if [[ -z "$py" ]]; then
+    ensure_python
+    managed_py="$("$BIN_HOME/uv" python find --managed-python 3.12)"
 
-  progress_task_start etna cli "Checking Etna CLI"
-  if [[ ! -x "$etna" ]] || ! "$etna" --help >/dev/null 2>&1; then
-    say "Repairing Etna"
-    "$BIN_HOME/uv" tool install \
-      --force \
-      --python 3.12 \
-      'etna-mcp' >/dev/null
-    progress_task_finish etna cli done "Etna CLI ready"
+    if "$managed_py" -c 'import etna' >/dev/null 2>&1; then
+      py="$managed_py"
+      progress_task_finish etna cli skipped "Etna Python package already available"
+    else
+      progress_task_start etna cli "Checking Etna Python package"
+      say "Installing Etna Python package"
+      "$BIN_HOME/uv" pip install --python "$managed_py" 'etna-mcp' >/dev/null \
+        || fail "Could not install Etna"
+      "$managed_py" -c 'import etna' >/dev/null 2>&1 \
+        || fail "Etna package installed but could not be imported"
+      py="$managed_py"
+      progress_task_finish etna cli done "Etna Python package ready"
+    fi
   else
-    progress_task_finish etna cli skipped "Etna CLI already ready"
+    progress_task_finish etna cli skipped "Existing Etna Python package ready"
   fi
 
-  [[ -x "$etna" ]] || fail "Etna installation did not produce $etna"
+  # Etna is regenerative: start is the cheap self-repair path. Let it finish,
+  # then verify the real health endpoint. Only escalate to init if still unhealthy.
+  progress_task_start etna runtime "Starting Etna"
+  "$py" -m etna start >/dev/null 2>&1 || true
 
-  # Old Vulcan builds modified Etna's systemd unit with a drop-in. Etna now
-  # owns its own service lifecycle, so remove that migration artifact before
-  # asking Etna to converge itself.
-  if [[ "$OS" == "Linux" && -z "$GUEST" ]] && have systemctl; then
-    local legacy_dropin="$CONFIG_HOME/systemd/user/etna.service.d/10-vulcan-runtime.conf"
-    rm -f "$legacy_dropin"
-    rmdir "$(dirname "$legacy_dropin")" >/dev/null 2>&1 || true
-    systemctl --user daemon-reload >/dev/null 2>&1 || true
-  fi
-
-  progress_task_start etna runtime "Converging Etna runtime"
-
-  if ! "$etna" init >/dev/null; then
-    # b38 has no `etna init`, and b39 contained a Linux venv-service path bug.
-    # Refresh to the lifecycle-owning Etna release and retry once.
-    say "Refreshing Etna"
-    "$BIN_HOME/uv" tool install \
-      --force \
-      --python 3.12 \
-      'etna-mcp' >/dev/null \
-      || fail "Could not refresh Etna"
-
-    [[ -x "$etna" ]] || fail "Etna refresh did not produce $etna"
-
-    "$etna" init >/dev/null \
+  if etna_endpoint_healthy; then
+    progress_task_finish etna runtime skipped "Etna already healthy"
+  else
+    say "Etna is not healthy after start; asking Etna to self-repair"
+    "$py" -m etna init >/dev/null 2>&1 \
       || fail "Etna self-repair failed"
+    etna_endpoint_healthy \
+      || fail "Etna init completed but Etna is not healthy on port 8467"
+    progress_task_finish etna runtime done "Etna self-repair complete"
   fi
-
-  progress_task_finish etna runtime done "Etna runtime ready"
-
-  local py
-  py="$("$BIN_HOME/uv" python find --managed-python 3.12)"
 
   for kit in web playwright ntfy; do
     progress_task_start etna "kit-$kit" "Checking Etna kit: $kit"
 
-    if ! "$py" - "$kit" <<'PYKIT' >/dev/null 2>&1
-import json, pathlib, sys
-kit = sys.argv[1]
-p = pathlib.Path.home() / ".etna_server" / "config.json"
-if not p.exists():
-    raise SystemExit(1)
-data = json.loads(p.read_text())
-if kit not in data.get("kits", {}):
-    raise SystemExit(1)
-kitfile = pathlib.Path.home() / ".etna_server" / "kits" / f"{kit}.py"
-raise SystemExit(0 if kitfile.exists() else 1)
-PYKIT
-    then
+    if etna_kit_ready "$kit"; then
+      progress_task_finish etna "kit-$kit" skipped "Etna kit already ready: $kit"
+    else
       say "Installing missing Etna kit: $kit"
-      "$etna" install "$kit" >/dev/null \
+      "$py" -m etna install "$kit" >/dev/null \
         || fail "Could not install Etna kit: $kit"
       progress_task_finish etna "kit-$kit" done "Etna kit ready: $kit"
-    else
-      progress_task_finish etna "kit-$kit" skipped "Etna kit already ready: $kit"
     fi
   done
 
-  # `etna init` owns startup and verifies health. Vulcan must not create a
-  # second independently-managed Etna process if the endpoint is absent.
   progress_task_start etna endpoint "Checking Etna endpoint"
-
-  if "$py" - <<'PYHEALTH' >/dev/null 2>&1
-import urllib.request
-with urllib.request.urlopen("http://127.0.0.1:8467/health", timeout=1) as r:
-    raise SystemExit(0 if r.status == 200 else 1)
-PYHEALTH
-  then
-    progress_task_finish etna endpoint skipped "Etna endpoint already running"
-  else
-    fail "Etna init completed but Etna is not healthy on port 8467"
-  fi
+  etna_endpoint_healthy \
+    || fail "Etna is not healthy on port 8467"
+  progress_task_finish etna endpoint skipped "Etna endpoint already running"
 }
 
 server_payload_hash() {

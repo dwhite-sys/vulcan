@@ -16,8 +16,7 @@ Electron owns application installation/integration, tray behavior, login startup
 
 
 ## One-command Linux install
-
-Once a tagged GitHub release exists, Linux users can install the same AppImage used by the desktop download path with:
+Linux users can install the same AppImage used by the desktop download path with:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/dwhite-sys/vulcan/main/install.sh | bash

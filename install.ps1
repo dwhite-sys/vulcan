@@ -125,117 +125,155 @@ if (-not $FromApp -and -not $ResourcesDir -and -not $ElevatedWslBootstrap) {
 
 function Test-EtnaHealth {
     try {
-        $health = Invoke-RestMethod `
-            -UseBasicParsing `
-            -Uri "http://127.0.0.1:8467/health" `
-            -TimeoutSec 2
-
-        return (
-            $health.service -eq "etna-mcp" -and
-            $health.status -eq "ok"
-        )
+        $r = Invoke-WebRequest -UseBasicParsing -TimeoutSec 2 -Uri "http://127.0.0.1:8467/health"
+        if ($r.StatusCode -ne 200) { return $false }
+        $body = [string]$r.Content
+        return $body -match '"service"\s*:\s*"etna-mcp"' -and $body -match '"status"\s*:\s*"ok"'
     }
-    catch {
-        return $false
-    }
+    catch { return $false }
 }
 
-function Get-EtnaRuntimePython {
-    return Join-Path $env:APPDATA "Etna\venv\Scripts\python.exe"
+function Get-HostEtnaCommand {
+    $cmd = Get-Command etna -All -ErrorAction SilentlyContinue |
+        Where-Object { $_.Source -and -not $_.Source.StartsWith($BinRoot, [StringComparison]::OrdinalIgnoreCase) } |
+        Select-Object -First 1
+    if ($cmd) { return $cmd.Source }
+    return $null
 }
 
-function Install-EtnaWithOfficialBootstrap {
-    Write-Step "Bootstrapping Etna with Etna's own installer"
+function Invoke-EtnaModule([string]$Verb) {
+    foreach ($python in @("python", "py")) {
+        $cmd = Get-Command $python -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not $cmd) { continue }
+        try {
+            if ($python -eq "py") { & $cmd.Source -3 -m etna --help *> $null }
+            else { & $cmd.Source -m etna --help *> $null }
+            if ($LASTEXITCODE -ne 0) { continue }
+            if ($python -eq "py") { & $cmd.Source -3 -m etna $Verb }
+            else { & $cmd.Source -m etna $Verb }
+            return $LASTEXITCODE
+        } catch { }
+    }
 
+    $etna = Get-HostEtnaCommand
+    if (-not $etna) { return 127 }
+    & $etna $Verb
+    return $LASTEXITCODE
+}
+
+function Install-EtnaIfAbsent {
+    # Acquisition only. Never use this ladder to repair an existing Etna home.
+    foreach ($python in @("python", "py")) {
+        $cmd = Get-Command $python -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not $cmd) { continue }
+        try {
+            if ($python -eq "py") { & $cmd.Source -3 -m pip --version *> $null }
+            else { & $cmd.Source -m pip --version *> $null }
+            if ($LASTEXITCODE -ne 0) { continue }
+            Write-Step "Installing Etna with pip"
+            if ($python -eq "py") { & $cmd.Source -3 -m pip install --user etna-mcp }
+            else { & $cmd.Source -m pip install --user etna-mcp }
+            if ($LASTEXITCODE -eq 0) { return $true }
+        } catch { }
+        break
+    }
+
+    $pipx = Get-Command pipx -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($pipx) {
+        Write-Step "Installing Etna with pipx"
+        try {
+            & $pipx.Source install etna-mcp
+            if ($LASTEXITCODE -eq 0) { return $true }
+        } catch { }
+    }
+
+    $uv = Get-Command uv -All -ErrorAction SilentlyContinue |
+        Where-Object { $_.Source -and -not $_.Source.StartsWith($BinRoot, [StringComparison]::OrdinalIgnoreCase) } |
+        Select-Object -First 1
+    if (-not $uv) {
+        Write-Step "Bootstrapping user uv for Etna"
+        $savedPythonDir = $env:UV_PYTHON_INSTALL_DIR
+        $savedToolDir = $env:UV_TOOL_DIR
+        $savedToolBinDir = $env:UV_TOOL_BIN_DIR
+        try {
+            Remove-Item Env:UV_PYTHON_INSTALL_DIR -ErrorAction SilentlyContinue
+            Remove-Item Env:UV_TOOL_DIR -ErrorAction SilentlyContinue
+            Remove-Item Env:UV_TOOL_BIN_DIR -ErrorAction SilentlyContinue
+            $installer = Invoke-RestMethod -UseBasicParsing -Uri "https://astral.sh/uv/install.ps1"
+            Invoke-Expression $installer
+        } catch {
+            Write-Warning "Etna uv bootstrap failed: $($_.Exception.Message)"
+            return $false
+        } finally {
+            $env:UV_PYTHON_INSTALL_DIR = $savedPythonDir
+            $env:UV_TOOL_DIR = $savedToolDir
+            $env:UV_TOOL_BIN_DIR = $savedToolBinDir
+        }
+        $candidate = Join-Path $HOME ".local\bin\uv.exe"
+        if (Test-Path $candidate) { $uv = Get-Item $candidate }
+    }
+
+    if (-not $uv) { return $false }
+    Write-Step "Installing Etna with uv"
+    $savedPythonDir = $env:UV_PYTHON_INSTALL_DIR
+    $savedToolDir = $env:UV_TOOL_DIR
+    $savedToolBinDir = $env:UV_TOOL_BIN_DIR
     try {
-        $installer = Invoke-RestMethod `
-            -UseBasicParsing `
-            -Uri "https://raw.githubusercontent.com/dwhite-sys/Etna/main/install.ps1"
-
-        & ([ScriptBlock]::Create([string]$installer))
-    }
-    catch {
-        Fail "Etna's installer failed: $($_.Exception.Message)"
+        Remove-Item Env:UV_PYTHON_INSTALL_DIR -ErrorAction SilentlyContinue
+        Remove-Item Env:UV_TOOL_DIR -ErrorAction SilentlyContinue
+        Remove-Item Env:UV_TOOL_BIN_DIR -ErrorAction SilentlyContinue
+        & $uv.Source tool install etna-mcp
+        return $LASTEXITCODE -eq 0
+    } catch { return $false }
+    finally {
+        $env:UV_PYTHON_INSTALL_DIR = $savedPythonDir
+        $env:UV_TOOL_DIR = $savedToolDir
+        $env:UV_TOOL_BIN_DIR = $savedToolBinDir
     }
 }
 
 function Ensure-HostEtna {
-    # Etna is intentionally native Windows. Its Playwright kit drives the user's
-    # visible host Chrome. Vulcan only ensures there is enough viable Etna to let
-    # Etna's own regenerative repair machinery take over.
-    $etnaPython = Get-EtnaRuntimePython
-    $runtimeReady = $false
+    # Etna is native Windows so Playwright can drive the user's visible host Chrome.
+    # Vulcan only asks it to converge itself; Vulcan neither owns Etna's venv/runtime nor installs Etna kits.
+    $etnaRoot = Join-Path $HOME ".etna_server"
+    $existing = (Test-Path $etnaRoot -PathType Container) -and
+        (Test-Path (Join-Path $etnaRoot "config.json") -PathType Leaf) -and
+        (Test-Path (Join-Path $etnaRoot "kits") -PathType Container)
 
-    if (Test-Path -LiteralPath $etnaPython -PathType Leaf) {
-        & $etnaPython -c "import etna" *> $null
-        $runtimeReady = $LASTEXITCODE -eq 0
-    }
-
-    if (-not $runtimeReady) {
-        Install-EtnaWithOfficialBootstrap
-
-        if (-not (Test-Path -LiteralPath $etnaPython -PathType Leaf)) {
-            Fail "Etna's installer did not create its managed runtime"
-        }
-
-        & $etnaPython -c "import etna" *> $null
-        if ($LASTEXITCODE -ne 0) {
-            Fail "Etna's managed runtime cannot import Etna"
+    if (-not $existing) {
+        if (-not (Install-EtnaIfAbsent)) {
+            Write-Warning "Etna failed: package installation failed"
+            Write-Step "Etna failed"
+            return
         }
     }
 
-    # From here both pre-existing and freshly bootstrapped Etna take the same path.
-    # Etna owns repair: start first, check health, then escalate to init only if needed.
-    & $etnaPython -m etna start *> $null
+    if (Test-EtnaHealth) {
+        Write-Step "Etna ready"
+        return
+    }
 
-    if (-not (Test-EtnaHealth)) {
-        Write-Step "Etna is not healthy after start; asking Etna to self-repair"
-        & $etnaPython -m etna init
-
-        if ($LASTEXITCODE -ne 0) {
-            Fail "Etna self-repair failed"
-        }
-
-        if (-not (Test-EtnaHealth)) {
-            Fail "Etna init completed but Etna is not healthy on port 8467"
+    if ($existing) {
+        try { $null = Invoke-EtnaModule "start" } catch { }
+        if (Test-EtnaHealth) {
+            Write-Step "Etna ready"
+            return
         }
     }
 
-    $etnaRoot = Join-Path $env:APPDATA "Etna"
-    $configPath = Join-Path $etnaRoot "config.json"
+    $initCode = 127
+    try { $initCode = Invoke-EtnaModule "init" }
+    catch { Write-Warning "Etna init failed: $($_.Exception.Message)" }
 
-    foreach ($kit in @("web", "playwright", "ntfy")) {
-        $installed = $false
-
-        try {
-            if (Test-Path $configPath) {
-                $cfg = Get-Content -Raw $configPath | ConvertFrom-Json
-                $hasConfig = @($cfg.kits.PSObject.Properties.Name) -contains $kit
-                $hasFile = Test-Path (
-                    Join-Path (
-                        Join-Path $etnaRoot "kits"
-                    ) "$kit.py"
-                )
-                $installed = $hasConfig -and $hasFile
-            }
-        }
-        catch {
-            $installed = $false
-        }
-
-        if (-not $installed) {
-            Write-Step "Installing missing Etna kit: $kit"
-            & $etnaPython -m etna install $kit
-
-            if ($LASTEXITCODE -ne 0) {
-                Fail "Could not install Etna kit '$kit'"
-            }
-        }
+    if ($initCode -eq 0 -and (Test-EtnaHealth)) {
+        Write-Step "Etna ready"
+        return
     }
 
-    if (-not (Test-EtnaHealth)) {
-        Fail "Etna is not healthy on port 8467"
-    }
+    if ($initCode -eq 0) { Write-Warning "Etna failed: init completed but the health check did not pass" }
+    else { Write-Warning "Etna failed: init exited with code $initCode" }
+    Write-Step "Etna failed"
+    return
 }
 
 if ($ElevatedWslBootstrap) {

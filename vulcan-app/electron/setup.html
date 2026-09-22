@@ -402,7 +402,7 @@ function recomputeGroup(group){
     .filter(([key]) => key.startsWith(`${group}:`))
     .map(([, value]) => value);
   const completed = entries.filter(
-    (value) => value === 'done' || value === 'skipped'
+    (value) => value === 'done' || value === 'skipped' || value === 'failed'
   ).length;
 
   if (expected > 0 && completed >= expected) state.set(group, 'done');
@@ -435,12 +435,12 @@ function applyTask(payload){
   const taskState = String(payload?.state || '');
 
   if (!state.has(group) || !id) return;
-  if (!['running', 'done', 'skipped'].includes(taskState)) return;
+  if (!['running', 'done', 'skipped', 'failed'].includes(taskState)) return;
 
   taskStates.set(`${group}:${id}`, taskState);
   recomputeGroup(group);
 
-  if (taskState === 'running'){
+  if (taskState === 'running' || taskState === 'failed'){
     activeKey = group;
     if (payload.title) title.textContent = payload.title;
     if (payload.detail || payload.label){

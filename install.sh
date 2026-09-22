@@ -198,6 +198,8 @@ progress_task_finish() {
     cli_clear_progress
     if [[ "$state" == skipped ]]; then
       printf '  %s·%s  %s\n' "$CLI_LIGHT_GREY" "$CLI_RESET" "$label" >&2
+    elif [[ "$state" == failed ]]; then
+      printf '  %s×%s  %s\n' "$CLI_GREY" "$CLI_RESET" "$label" >&2
     else
       printf '  %s✔%s  %s\n' "$CLI_LIGHT_GREEN" "$CLI_RESET" "$label" >&2
     fi
@@ -560,87 +562,150 @@ etna_endpoint_healthy() {
     && "$body" == *'"status":"ok"'* ]]
 }
 
-etna_kit_ready() {
-  local kit="$1"
-  local config="$HOME/.etna_server/config.json"
-
-  [[ -f "$config" ]] || return 1
-  [[ -f "$HOME/.etna_server/kits/$kit.py" ]] || return 1
-
-  grep -Eq "\"$kit\"[[:space:]]*:" "$config"
+etna_installation_present() {
+  # The initialized Etna home is authoritative. Vulcan deliberately does not
+  # inspect Etna's Python/venv internals or try to own an existing install.
+  [[ -d "$HOME/.etna_server" \
+    && -f "$HOME/.etna_server/config.json" \
+    && -d "$HOME/.etna_server/kits" ]]
 }
 
-etna_runtime_python() {
-  printf '%s\n' "$HOME/.etna_server/venv/bin/python"
+find_host_etna() {
+  PATH="$HOST_PATH:$HOME/.local/bin:$HOME/.cargo/bin" command -v etna 2>/dev/null || true
 }
 
-bootstrap_etna() {
-  say "Bootstrapping Etna with Etna's own installer"
-  ensure_downloader
-
-  if have curl; then
-    curl -LsSf https://raw.githubusercontent.com/dwhite-sys/Etna/main/install.sh | sh
-  elif have wget; then
-    wget -qO- https://raw.githubusercontent.com/dwhite-sys/Etna/main/install.sh | sh
-  else
-    fail "curl or wget is required to bootstrap Etna"
+etna_init() {
+  # Prefer the module entry point: Etna owns convergence of its own runtime.
+  # A pipx/uv tool install may intentionally isolate the module, in which case
+  # its public CLI is the equivalent entry point.
+  if have python3 && python3 -m etna --help >/dev/null 2>&1; then
+    python3 -m etna init
+    return $?
   fi
+  if have python && python -m etna --help >/dev/null 2>&1; then
+    python -m etna init
+    return $?
+  fi
+  local etna
+  etna="$(find_host_etna)"
+  [[ -n "$etna" ]] || return 127
+  "$etna" init
+}
+
+etna_start() {
+  local etna
+  etna="$(find_host_etna)"
+  if [[ -n "$etna" ]]; then
+    "$etna" start
+    return $?
+  fi
+  if have python3 && python3 -m etna --help >/dev/null 2>&1; then
+    python3 -m etna start
+    return $?
+  fi
+  if have python && python -m etna --help >/dev/null 2>&1; then
+    python -m etna start
+    return $?
+  fi
+  return 127
+}
+
+install_etna_if_absent() {
+  # Acquisition only. This ladder must never be used to "repair" an existing
+  # ~/.etna_server. Try the host's normal package mechanisms from least to most
+  # self-contained; uv is a normal user/global tool install, not a Vulcan venv.
+  if have python3 && python3 -m pip --version >/dev/null 2>&1; then
+    say "Installing Etna with pip"
+    if python3 -m pip install --user etna-mcp; then return 0; fi
+  elif have python && python -m pip --version >/dev/null 2>&1; then
+    say "Installing Etna with pip"
+    if python -m pip install --user etna-mcp; then return 0; fi
+  elif have pip3; then
+    say "Installing Etna with pip"
+    if pip3 install --user etna-mcp; then return 0; fi
+  elif have pip; then
+    say "Installing Etna with pip"
+    if pip install --user etna-mcp; then return 0; fi
+  fi
+
+  if have pipx; then
+    say "Installing Etna with pipx"
+    if pipx install etna-mcp; then return 0; fi
+  fi
+
+  local uv=""
+  uv="$(PATH="$HOST_PATH:$HOME/.local/bin:$HOME/.cargo/bin" command -v uv 2>/dev/null || true)"
+  if [[ -z "$uv" ]]; then
+    say "Bootstrapping user uv for Etna"
+    if ! have curl && ! have wget; then return 1; fi
+    if have curl; then
+      curl -LsSf --retry 3 https://astral.sh/uv/install.sh \
+        | env -u UV_PYTHON_INSTALL_DIR -u UV_TOOL_DIR -u UV_TOOL_BIN_DIR sh >/dev/null \
+        || return 1
+    else
+      wget -qO- https://astral.sh/uv/install.sh \
+        | env -u UV_PYTHON_INSTALL_DIR -u UV_TOOL_DIR -u UV_TOOL_BIN_DIR sh >/dev/null \
+        || return 1
+    fi
+    uv="$(PATH="$HOST_PATH:$HOME/.local/bin:$HOME/.cargo/bin" command -v uv 2>/dev/null || true)"
+  fi
+  [[ -n "$uv" ]] || return 1
+
+  say "Installing Etna with uv"
+  env -u UV_PYTHON_INSTALL_DIR -u UV_TOOL_DIR -u UV_TOOL_BIN_DIR \
+    "$uv" tool install etna-mcp
 }
 
 ensure_etna() {
-  local py kit
-  py="$(etna_runtime_python)"
+  local existed=0
 
-  # Vulcan does not install, repair, or lay out Etna itself. If Etna's managed
-  # runtime is not viable enough to invoke, hand bootstrap to Etna's own installer.
-  progress_task_start etna cli "Checking Etna runtime"
-  if [[ ! -x "$py" ]] || ! "$py" -c 'import etna' >/dev/null 2>&1; then
-    if ! bootstrap_etna; then
-      fail "Etna's installer failed"
-    fi
-
-    [[ -x "$py" ]] \
-      || fail "Etna's installer did not create its managed runtime"
-    "$py" -c 'import etna' >/dev/null 2>&1 \
-      || fail "Etna's managed runtime cannot import Etna"
-    progress_task_finish etna cli done "Etna bootstrap complete"
+  progress_task_start etna cli "Checking Etna installation"
+  if etna_installation_present; then
+    existed=1
+    progress_task_finish etna cli skipped "Existing Etna installation found"
   else
-    progress_task_finish etna cli skipped "Etna runtime already viable"
+    if install_etna_if_absent; then
+      progress_task_finish etna cli done "Etna installed"
+    else
+      warn "Etna failed: package installation failed"
+      progress_task_finish etna cli failed "Etna failed"
+      progress_task_finish etna runtime skipped "Etna unavailable; continuing Vulcan installation"
+      return 0
+    fi
   fi
 
-  # From here both pre-existing and freshly bootstrapped Etna take the same path.
-  # Etna owns repair: start first, check health, then escalate to init only if needed.
-  progress_task_start etna runtime "Starting Etna"
-  "$py" -m etna start >/dev/null 2>&1 || true
+  progress_task_start etna runtime "Checking Etna runtime"
 
   if etna_endpoint_healthy; then
     progress_task_finish etna runtime skipped "Etna already healthy"
-  else
-    say "Etna is not healthy after start; asking Etna to self-repair"
-    "$py" -m etna init \
-      || fail "Etna self-repair failed"
-    etna_endpoint_healthy \
-      || fail "Etna init completed but Etna is not healthy on port 8467"
-    progress_task_finish etna runtime done "Etna self-repair complete"
+    return 0
   fi
 
-  for kit in web playwright ntfy; do
-    progress_task_start etna "kit-$kit" "Checking Etna kit: $kit"
-
-    if etna_kit_ready "$kit"; then
-      progress_task_finish etna "kit-$kit" skipped "Etna kit already ready: $kit"
-    else
-      say "Installing missing Etna kit: $kit"
-      "$py" -m etna install "$kit" \
-        || fail "Could not install Etna kit: $kit"
-      progress_task_finish etna "kit-$kit" done "Etna kit ready: $kit"
+  # Existing Etna gets the least-invasive escalation possible. Package managers
+  # are never entered on this path.
+  if [[ "$existed" -eq 1 ]]; then
+    etna_start >/dev/null 2>&1 || true
+    if etna_endpoint_healthy; then
+      progress_task_finish etna runtime done "Etna started"
+      return 0
     fi
-  done
+  fi
 
-  progress_task_start etna endpoint "Checking Etna endpoint"
-  etna_endpoint_healthy \
-    || fail "Etna is not healthy on port 8467"
-  progress_task_finish etna endpoint skipped "Etna endpoint already running"
+  # `init` is Etna's own convergence/self-repair primitive. Preserve its output
+  # in the installer log, but failure is explicitly non-fatal to Vulcan.
+  if etna_init; then
+    if etna_endpoint_healthy; then
+      progress_task_finish etna runtime done "Etna ready"
+      return 0
+    fi
+    warn "Etna failed: init completed but the health check did not pass"
+  else
+    local code=$?
+    warn "Etna failed: init exited with code $code"
+  fi
+
+  progress_task_finish etna runtime failed "Etna failed"
+  return 0
 }
 
 server_payload_hash() {
@@ -899,7 +964,7 @@ DESKTOP
 
 linux_converge() {
   local relogin=0
-  progress_plan 15 1 2 2 6 2 2
+  progress_plan 11 1 2 2 2 2 2
 
   # Persist/update the stable AppImage and desktop metadata for future launches,
   # but keep the Electron process the user actually opened as this first session.
@@ -915,10 +980,9 @@ linux_converge() {
   # the server machine, so the same Etna + kit runtime is retained.
   if [[ -z "$GUEST" ]]; then ensure_etna; fi
   if [[ -z "$GUEST" && "$SERVER_ONLY" -eq 1 ]] && have loginctl; then
-    # Etna is a systemd user service. Linger keeps that user manager available
-    # after SSH logout while Vulcan itself is supervised by a system service.
+    # Keep the user's session available for host-side services after SSH logout.
+    # Etna owns its own startup/service lifecycle; Vulcan does not manage it.
     run_privileged loginctl enable-linger "$USER" >/dev/null 2>&1 || true
-    systemctl --user enable --now etna.service >/dev/null 2>&1 || true
   fi
   ensure_docker_linux
   relogin="$DOCKER_RELOGIN"

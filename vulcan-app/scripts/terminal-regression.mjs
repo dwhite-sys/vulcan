@@ -74,6 +74,14 @@ assert.deepEqual(terminalTools.wait.parameters.required, ['seconds'],
   'Waiting must require an explicit timeout');
 assert.ok(terminalTools.wait.parameters.properties.slot,
   'Waiting should accept an optional terminal slot');
+assert.ok(terminalTools.wait.parameters.properties.webhook_url,
+  'Waiting should accept an optional webhook callback URL');
+assert.match(terminal, /def trigger_webhook\(/,
+  'Webhook waits must have an inbound wake trigger');
+assert.ok(server.includes('@app.api_route("/webhook/{hook_path:path}"'),
+  'The Vulcan server must expose the callback route used by wait(webhook_url=...)');
+assert.match(runtime, /wake_reason.*webhook/s,
+  'Server-owned wait execution must surface webhook wake reasons');
 assert.ok(terminalTools.send_input.parameters.properties.key,
   'Interactive input must support named keys');
 assert.ok(terminalTools.send_input.parameters.properties.modifiers,

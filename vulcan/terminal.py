@@ -39,6 +39,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
+from urllib.parse import urlsplit
 from typing import Optional, AsyncIterator, Literal
 
 from vulcan import docker
@@ -1439,31 +1440,89 @@ class WaitProcess:
     pid:          str
     chat_id:      str
     seconds:      float
+    webhook_key:  str | None = None
     finished:     bool  = False
     detached:     bool  = False
     detach_reason: str  = ""
+    wake_reason:  str | None = None
+    webhook_method: str | None = None
+    webhook_path: str | None = None
     started_at:   float = field(default_factory=time.time)
 
 
 _waits: dict[str, WaitProcess] = {}
+_wait_webhooks: dict[str, set[str]] = {}
+_wait_webhooks_lock = threading.Lock()
 
 
-def start_wait(chat_id: str, seconds: float) -> str:
+def normalize_webhook_url(webhook_url: str) -> str:
+    """Return the Vulcan webhook path used to wake a wait process."""
+    value = str(webhook_url or "").strip()
+    if not value:
+        raise ValueError("webhook_url must be a non-empty URL or /webhook/... path.")
+    parsed = urlsplit(value)
+    if parsed.scheme and parsed.scheme not in ("http", "https"):
+        raise ValueError("webhook_url must use http or https.")
+    path = parsed.path or value
+    if not path.startswith("/webhook/") or path == "/webhook/":
+        raise ValueError("webhook_url must point to /webhook/<name> on this Vulcan server.")
+    return path.rstrip("/")
+
+
+def _unregister_wait_webhook(wp: WaitProcess) -> None:
+    if not wp.webhook_key:
+        return
+    with _wait_webhooks_lock:
+        pids = _wait_webhooks.get(wp.webhook_key)
+        if not pids:
+            return
+        pids.discard(wp.pid)
+        if not pids:
+            _wait_webhooks.pop(wp.webhook_key, None)
+
+
+def start_wait(chat_id: str, seconds: float, webhook_url: str | None = None) -> str:
     pid = _new_pid()
-    wp  = WaitProcess(pid=pid, chat_id=chat_id, seconds=seconds)
+    webhook_key = normalize_webhook_url(webhook_url) if webhook_url is not None else None
+    wp  = WaitProcess(pid=pid, chat_id=chat_id, seconds=seconds, webhook_key=webhook_key)
     _waits[pid] = wp
     _processes[pid] = {'kind': 'wait', 'chat_id': chat_id, 'wp': wp}
+    if webhook_key:
+        with _wait_webhooks_lock:
+            _wait_webhooks.setdefault(webhook_key, set()).add(pid)
 
     def _wait():
-        start = time.time()
-        while time.time() - start < seconds:
-            if wp.detached:
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if wp.detached or wp.finished:
                 break
-            time.sleep(0.1)
-        wp.finished = True
+            time.sleep(0.05)
+        if not wp.finished and not wp.detached:
+            wp.wake_reason = "timeout"
+            wp.finished = True
+        _unregister_wait_webhook(wp)
 
     threading.Thread(target=_wait, daemon=True).start()
     return pid
+
+
+def trigger_webhook(path: str, method: str = "POST") -> int:
+    """Wake all active waits registered for the exact /webhook/... path."""
+    key = str(path or "").rstrip("/")
+    with _wait_webhooks_lock:
+        pids = list(_wait_webhooks.get(key, set()))
+    triggered = 0
+    for pid in pids:
+        wp = _waits.get(pid)
+        if not wp or wp.finished or wp.detached:
+            continue
+        wp.webhook_method = str(method or "POST").upper()
+        wp.webhook_path = key
+        wp.wake_reason = "webhook"
+        wp.finished = True
+        _unregister_wait_webhook(wp)
+        triggered += 1
+    return triggered
 
 
 def get_wait(pid: str) -> Optional[WaitProcess]:
@@ -1477,6 +1536,7 @@ def detach_wait(pid: str, reason: str = "") -> bool:
     wp.detached      = True
     wp.detach_reason = reason
     wp.finished      = True
+    _unregister_wait_webhook(wp)
     return True
 
 

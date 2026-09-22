@@ -489,7 +489,7 @@
     },
     {
       "name": "wait",
-      "description": "Pause for the specified duration. When a terminal slot is provided, return as soon as its foreground command finishes or the timeout expires. Useful for installations, builds, downloads, and other operations that may take a few minutes.",
+      "description": "Pause until the timeout expires, an optional terminal slot finishes, or an optional Vulcan webhook is called. Useful for installations, builds, downloads, and external callbacks.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -500,6 +500,10 @@
           "slot": {
             "type": "number",
             "description": "Optional agent terminal slot. Return early when its foreground command finishes."
+          },
+          "webhook_url": {
+            "type": "string",
+            "description": "Optional callback URL on this Vulcan server under /webhook/<name>. Return early when that webhook path is called."
           }
         },
         "required": [

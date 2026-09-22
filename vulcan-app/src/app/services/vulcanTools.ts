@@ -451,12 +451,13 @@ const WORKSPACE_TOOLS: Tool[] = [
   },
   {
     name: 'wait',
-    description: "Pause for the specified duration. When a terminal slot is provided, return as soon as its foreground command finishes or the timeout expires. Useful for installations, builds, downloads, and other operations that may take a few minutes.",
+    description: "Pause until the timeout expires, an optional terminal slot finishes, or an optional Vulcan webhook is called. Useful for installations, builds, downloads, and external callbacks.",
     parameters: {
       type: 'object',
       properties: {
         seconds: { type: 'number', description: 'Maximum number of seconds to wait.' },
         slot: { type: 'number', description: 'Optional agent terminal slot. Return early when its foreground command finishes.' },
+        webhook_url: { type: 'string', description: 'Optional callback URL on this Vulcan server under /webhook/<name>. Return early when that webhook path is called.' },
       },
       required: ['seconds'],
     },
@@ -1352,23 +1353,38 @@ export async function executeVulcanTool(
       return JSON.stringify({ error: 'wait requires seconds as a positive number.' });
     }
     if (args.seconds > 3600) return JSON.stringify({ error: 'Timeout cannot exceed 3600 seconds.' });
+    if (args.webhook_url !== undefined && (typeof args.webhook_url !== 'string' || !args.webhook_url.trim())) {
+      return JSON.stringify({ error: 'webhook_url must be a non-empty URL or /webhook/... path.' });
+    }
+    const webhookUrl = typeof args.webhook_url === 'string' ? args.webhook_url.trim() : undefined;
     if (Object.prototype.hasOwnProperty.call(args, 'slot')) {
       if (!Number.isInteger(args.slot) || !ctx.openAgentSlots.includes(args.slot)) {
         return JSON.stringify({ error: `Terminal ${args.slot} is not open.` });
       }
+      const webhookPid = webhookUrl ? await vulcan.startWait(ctx.chatId, args.seconds, webhookUrl) : null;
       const started = Date.now();
       let running = true;
       while (running && Date.now() - started < args.seconds * 1000) {
+        if (webhookPid) {
+          const webhook = await vulcan.getCommandResult(webhookPid);
+          if (webhook.finished && webhook.wake_reason === 'webhook') {
+            return JSON.stringify({ ok: true, wake_reason: 'webhook', webhook_method: webhook.webhook_method, webhook_path: webhook.webhook_path, elapsed_seconds: (Date.now() - started) / 1000 });
+          }
+        }
         const slots = await vulcan.listSlots(ctx.chatId);
         const state = slots.find((item) => item.kind === 'agent' && item.slot === args.slot && !item.finished);
-        if (!state) return JSON.stringify({ error: `Terminal ${args.slot} closed while waiting.` });
+        if (!state) {
+          if (webhookPid) await vulcan.detachProcess(webhookPid, 'terminal closed');
+          return JSON.stringify({ error: `Terminal ${args.slot} closed while waiting.` });
+        }
         running = Boolean(state.has_running);
         if (running) await new Promise((resolve) => setTimeout(resolve, Math.min(50, Math.max(0, args.seconds * 1000 - (Date.now() - started)))));
       }
+      if (webhookPid) await vulcan.detachProcess(webhookPid, 'terminal wait condition finished');
       const output = await vulcan.readSlotOutput(ctx.chatId, 'agent', args.slot, 50);
-      return JSON.stringify({ slot: args.slot, output: output.trim(), running, elapsed_seconds: (Date.now() - started) / 1000, ...(running ? { timed_out: true } : {}) });
+      return JSON.stringify({ slot: args.slot, output: output.trim(), running, wake_reason: running ? 'timeout' : 'slot', elapsed_seconds: (Date.now() - started) / 1000, ...(running ? { timed_out: true } : {}) });
     }
-    const pid = await vulcan.startWait(ctx.chatId, args.seconds);
+    const pid = await vulcan.startWait(ctx.chatId, args.seconds, webhookUrl);
     ctx.onTerminalStream?.(pid, `wait(${args.seconds}s)`);
     const result = await vulcan.waitForResult(pid, (args.seconds + 5) * 1000);
     ctx.onTerminalDone?.();
@@ -1376,7 +1392,12 @@ export async function executeVulcanTool(
       const reason = result.detach_reason?.trim();
       return JSON.stringify({ detached: true, note: reason ? `Detached by user. Reason: ${reason}` : 'Detached by user.' });
     }
-    return JSON.stringify({ ok: true, waited: args.seconds });
+    return JSON.stringify({
+      ok: true,
+      waited: args.seconds,
+      ...(webhookUrl ? { wake_reason: result.wake_reason ?? 'timeout' } : {}),
+      ...(result.wake_reason === 'webhook' ? { webhook_method: result.webhook_method, webhook_path: result.webhook_path } : {}),
+    });
   }
 
   if (toolName === 'list_terminals') {

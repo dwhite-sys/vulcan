@@ -804,6 +804,9 @@ class GeneralWSSession:
                 "pid": pid, "output": f"Waited {wp.seconds}s.",
                 "finished": wp.finished, "exit_code": 0,
                 "detached": wp.detached, "detach_reason": wp.detach_reason,
+                "wake_reason": wp.wake_reason,
+                "webhook_method": wp.webhook_method,
+                "webhook_path": wp.webhook_path,
             })
         else:
             await self.error(req_id, f"Unknown pid: {pid}")
@@ -818,8 +821,11 @@ class GeneralWSSession:
         await self.respond(req_id, "terminal/kill", {"ok": term.kill_process(p["pid"])})
 
     async def _terminal_wait(self, req_id: str, p: dict):
-        pid = term.start_wait(p["chat_id"], float(p.get("seconds", 5)))
-        await self.respond(req_id, "terminal/wait", {"pid": pid})
+        try:
+            pid = term.start_wait(p["chat_id"], float(p.get("seconds", 5)), p.get("webhook_url"))
+            await self.respond(req_id, "terminal/wait", {"pid": pid})
+        except ValueError as error:
+            await self.error(req_id, str(error))
 
     # ── Workspace files ───────────────────────────────────────────────────────
 

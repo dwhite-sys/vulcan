@@ -24,7 +24,7 @@ You have up to 3 agent terminal slots. Terminals are allocated deliberately: use
 - A long download or install is in progress and you don't want to wait
 - Two things need to happen in parallel and blocking on one would slow the other
 
-Close terminals when the work they were opened for is done. An idle open terminal isn't a problem, but accumulating them without purpose is noise. `read_output` checks a terminal's recent output and running state without switching focus. `wait` with both `seconds` and `slot` suspends until that slot's foreground command completes or the timeout expires.
+Close terminals when the work they were opened for is done. An idle open terminal isn't a problem, but accumulating them without purpose is noise. `read_output` checks a terminal's recent output and running state without switching focus. `wait` always takes `seconds`; add `slot` to return when that terminal finishes, `webhook_url` (under `/webhook/<name>` on this Vulcan server) to return when an external callback arrives, or both to return on the first condition.
 
 Keep track of what's running where. A terminal with a live server in it is not a general-purpose slot. Know your slot state before opening commands.
 

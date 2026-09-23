@@ -187,6 +187,42 @@ class InteractiveTerminalTests(unittest.TestCase):
         self.wait_for(lambda: "input-revived" in "".join(self.ts.output))
         self.assertFalse(self.ts.finished)
 
+    def test_unexpected_agent_shell_exit_is_transparently_revived(self):
+        # Reproduce the production failure: the logical slot remains selected, but
+        # the backing docker-exec/PTY process disappears between terminal calls.
+        original = self.ts
+        original.proc.kill()
+        self.wait_for(lambda: original.finished)
+        self.assertEqual(original.close_reason, "process-exit")
+
+        listed = terminal.list_slots(self.chat_id)
+        agent_slot = next(item for item in listed if item["kind"] == "agent" and item["slot"] == self.slot)
+        self.assertTrue(agent_slot["logical_open"])
+        self.assertEqual(agent_slot["close_reason"], "process-exit")
+
+        pid = terminal.use_terminal_in_slot(self.chat_id, "agent", self.slot, "printf recovered-after-exit", 5)
+        self.ts = terminal._slots[(self.chat_id, "agent", self.slot)]
+        process = terminal.get_command(pid)
+        self.wait_for(lambda: process.finished)
+        self.assertEqual(process.exit_code, 0)
+        self.assertIn("recovered-after-exit", "".join(process.output))
+        self.assertIsNot(self.ts, original)
+        self.assertFalse(self.ts.finished)
+
+    def test_explicit_close_retires_process_exit_parked_agent_slot(self):
+        original = self.ts
+        original.proc.kill()
+        self.wait_for(lambda: original.finished)
+        self.assertEqual(original.close_reason, "process-exit")
+
+        terminal.close_slot(self.chat_id, "agent", self.slot, reason="explicit")
+        listed = terminal.list_slots(self.chat_id)
+        agent_slot = next(item for item in listed if item["kind"] == "agent" and item["slot"] == self.slot)
+        self.assertFalse(agent_slot["logical_open"])
+        self.assertEqual(agent_slot["close_reason"], "explicit")
+        with self.assertRaisesRegex(RuntimeError, "is not open"):
+            terminal.use_terminal_in_slot(self.chat_id, "agent", self.slot, "echo nope", 5)
+
     def test_agent_lifecycle_view_stays_idle_and_scrollback_remains_readable(self):
         previous = self.command("printf opaque-lifecycle")
         self.assertIn("opaque-lifecycle", "".join(previous.output))

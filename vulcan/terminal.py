@@ -408,7 +408,8 @@ def list_slots(chat_id: str) -> list[dict]:
             if cid != chat_id:
                 continue
             seen.add((kind, slot))
-            logical_open = (not ts.finished) or ts.close_reason in _LIFECYCLE_REOPEN_REASONS
+            recoverable_reasons = _AGENT_RECOVERABLE_REASONS if kind == "agent" else _LIFECYCLE_REOPEN_REASONS
+            logical_open = (not ts.finished) or ts.close_reason in recoverable_reasons
             result.append({
                 "kind": kind,
                 "slot": slot,
@@ -760,6 +761,11 @@ def _start_slot_proc(chat_id: str, kind: SlotKind, slot: int, cols: int = 80, ro
                 except OSError:
                     break
         finally:
+            # Record an unplanned shell death before publishing `finished`. This
+            # closes the tiny window where another tool can observe a dead slot
+            # without knowing that it is eligible for transparent agent recovery.
+            if not ts.close_reason:
+                ts.close_reason = "process-exit"
             ts.finished = True
             command = ts.active_command
             if command is not None and not command.finished:
@@ -770,13 +776,34 @@ def _start_slot_proc(chat_id: str, kind: SlotKind, slot: int, cols: int = 80, ro
             ts.has_running = False
             _close_slot_fd(ts)
             _persist_slot_output(ts)
-            if not ts.close_reason:
-                _update_slot_meta(
-                    ts.chat_id, ts.kind, ts.slot, open=False, parked=False,
-                    close_reason="process-exit", cols=ts.cols, rows=ts.rows,
-                    last_activity=ts.last_activity,
+            if ts.close_reason == "process-exit":
+                try:
+                    returncode = ts.proc.poll()
+                except Exception:
+                    returncode = None
+                tail = _strip_lifecycle_notices("".join(ts.output))[-1000:]
+                logger.warning(
+                    "Terminal PTY exited unexpectedly chat=%s kind=%s slot=%s returncode=%r tail=%r",
+                    ts.chat_id, ts.kind, ts.slot, returncode, tail,
                 )
-                clear_slot_focus_if_matches(ts.chat_id, ts.kind, ts.slot)
+                # Agent terminals are logical resources selected by the model. A transient
+                # docker-exec/PTY death must not invalidate that selection; park the slot so
+                # the next terminal operation can revive it transparently. User terminals
+                # keep the traditional shell-exit semantics (typing `exit` closes them).
+                recoverable = ts.kind == "agent"
+                # A demand-triggered revival may already have replaced this TerminalSlot
+                # while the collector was waking up from PTY EOF. Never let the retired
+                # collector overwrite the new shell's fresh metadata.
+                with _slots_lock:
+                    still_current = _slots.get(_slot_key(ts.chat_id, ts.kind, ts.slot)) is ts
+                if still_current:
+                    _update_slot_meta(
+                        ts.chat_id, ts.kind, ts.slot, open=recoverable, parked=recoverable,
+                        close_reason="process-exit", cols=ts.cols, rows=ts.rows,
+                        last_activity=ts.last_activity,
+                    )
+                    if not recoverable:
+                        clear_slot_focus_if_matches(ts.chat_id, ts.kind, ts.slot)
 
     threading.Thread(target=_collect, daemon=True).start()
     _start_inactivity_watcher(ts)
@@ -851,7 +878,8 @@ def close_slot(chat_id: str, kind: SlotKind, slot: int, reason: str = 'explicit'
                 clear_slot_focus_if_matches(chat_id, kind, slot)
             return
         if ts.finished:
-            if reason == 'explicit' and ts.close_reason in _LIFECYCLE_REOPEN_REASONS:
+            recoverable_reasons = _AGENT_RECOVERABLE_REASONS if kind == 'agent' else _LIFECYCLE_REOPEN_REASONS
+            if reason == 'explicit' and ts.close_reason in recoverable_reasons:
                 ts.close_reason = 'explicit'
                 with _scrollback_lock:
                     _scrollbacks.pop(key, None)
@@ -909,6 +937,7 @@ def resize_slot(chat_id: str, kind: SlotKind, slot: int, cols: int, rows: int):
 
 
 _LIFECYCLE_REOPEN_REASONS = {"inactivity", "container-stopped"}
+_AGENT_RECOVERABLE_REASONS = _LIFECYCLE_REOPEN_REASONS | {"process-exit"}
 
 
 def _revive_slot_if_lifecycled(chat_id: str, kind: SlotKind, slot: int) -> TerminalSlot | None:
@@ -917,10 +946,35 @@ def _revive_slot_if_lifecycled(chat_id: str, kind: SlotKind, slot: int) -> Termi
     ts = _slots.get(key)
     entry = _persisted_slot_entry(chat_id, kind, slot)
     reason = ""
+    recoverable_reasons = _AGENT_RECOVERABLE_REASONS if kind == "agent" else _LIFECYCLE_REOPEN_REASONS
+
+    # Popen can report the docker-exec process dead a few milliseconds before
+    # the collector consumes PTY EOF and flips `finished`. Treat that as the
+    # same process-exit lifecycle event immediately, otherwise list_terminals
+    # can report an idle slot and use_terminal can reject it on the next call.
+    if ts is not None and not ts.finished:
+        try:
+            process_exited = ts.proc.poll() is not None
+        except Exception:
+            process_exited = False
+        if process_exited:
+            ts.close_reason = ts.close_reason or "process-exit"
+            ts.finished = True
+            _close_slot_fd(ts)
+            _persist_slot_output(ts)
+            recoverable = kind == "agent"
+            _update_slot_meta(
+                chat_id, kind, slot, open=recoverable, parked=recoverable,
+                close_reason="process-exit", cols=ts.cols, rows=ts.rows,
+                last_activity=ts.last_activity,
+            )
+            if not recoverable:
+                clear_slot_focus_if_matches(chat_id, kind, slot)
+            entry = _persisted_slot_entry(chat_id, kind, slot)
     if ts is not None:
         if not ts.finished:
             return ts
-        if ts.close_reason not in _LIFECYCLE_REOPEN_REASONS:
+        if ts.close_reason not in recoverable_reasons:
             return ts
         reason = ts.close_reason
     elif entry.get("open"):
@@ -937,7 +991,12 @@ def _revive_slot_if_lifecycled(chat_id: str, kind: SlotKind, slot: int) -> Termi
         pass
     revived = _slots.get(key)
     if revived is not None and not revived.finished:
-        if reason in _LIFECYCLE_REOPEN_REASONS:
+        if reason == "process-exit":
+            revived.resume_notice = (
+                f"Terminal {slot} recovered after its backing shell exited unexpectedly. "
+                "Its persisted scrollback, working directory, and exported environment were restored."
+            )
+        elif reason in _LIFECYCLE_REOPEN_REASONS:
             revived.resume_notice = (
                 f"Terminal {slot} resumed after inactivity. Its persisted scrollback, "
                 "working directory, and exported environment were restored."

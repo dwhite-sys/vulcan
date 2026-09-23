@@ -71,13 +71,15 @@ assert.match(coordinator, /onProgress/);
 assert.match(coordinator, /installerStageForLine/);
 assert.match(coordinator, /type: 'log'/);
 assert.match(coordinator, /127\.0\.0\.1:8468\/meta/);
-assert.match(coordinator, /127\.0\.0\.1:8467\/health/);
+assert.doesNotMatch(coordinator, /127\.0\.0\.1:8467\/health/);
 assert.match(coordinator, /server-payload\.sha256/);
 assert.match(coordinator, /server\?\.payloadHash/);
-assert.match(coordinator, /payloadCurrent && etnaReady/);
 assert.match(coordinator, /installedLinuxHash === packagedHash/);
+assert.match(coordinator, /reportedHash === packagedHash/);
+assert.match(coordinator, /reason: 'payload-current'/);
+assert.doesNotMatch(coordinator, /etnaReady/);
 assert.doesNotMatch(coordinator, /buildId[^\n]*===/);
-assert.match(coordinator, /mode = 'update'/);
+assert.match(coordinator, /if \(serverReady\) mode = 'update'/);
 
 assert.match(main, /createSetupWindow/);
 assert.match(main, /allowShow: shouldShowOnReady/);

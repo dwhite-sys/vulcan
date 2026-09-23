@@ -140,46 +140,39 @@ async function checkPackagedRuntime({ app, net }) {
     return { ok: true, needsRepair: true, mode: 'setup', reason: 'app-location' };
   }
 
-  const [server, etna] = await Promise.all([
-    probeJson(net, 'http://127.0.0.1:8468/meta'),
-    probeJson(net, 'http://127.0.0.1:8467/health'),
-  ]);
-
-  const serverReady = server?.ok === true;
-  const etnaReady = etna?.service === 'etna-mcp' && etna?.status === 'ok';
-
   const packagedHash = readSha256(path.join(process.resourcesPath, 'server-payload.sha256'));
-  const reportedRaw = String(server?.payloadHash || '').toLowerCase();
-  const reportedHash = /^[0-9a-f]{64}$/.test(reportedRaw) ? reportedRaw : null;
 
-  // Transition fallback for Linux builds installed before /meta exposed
-  // payloadHash. The converger already persists this exact desired-state hash.
+  // Desired-state rule: matching backend payload means there is nothing to
+  // install or repair. Do not gate this on Vulcan service liveness, Etna health,
+  // or the desktop release version.
   const installedLinuxHash = process.platform === 'linux'
     ? readSha256(path.join(os.homedir(), '.vulcan', 'payload', 'server-payload.sha256'))
     : null;
 
-  const payloadCurrent = serverReady
-    && Boolean(packagedHash)
-    && (reportedHash === packagedHash || installedLinuxHash === packagedHash);
+  if (packagedHash && installedLinuxHash === packagedHash) {
+    return { ok: true, needsRepair: false, mode: null, reason: 'payload-current' };
+  }
 
-  if (payloadCurrent && etnaReady) {
-    return { ok: true, needsRepair: false, mode: null, reason: 'healthy' };
+  // WSL/Colima do not expose the guest hash as a host file, so use /meta there.
+  const server = await probeJson(net, 'http://127.0.0.1:8468/meta');
+  const serverReady = server?.ok === true;
+  const reportedRaw = String(server?.payloadHash || '').toLowerCase();
+  const reportedHash = /^[0-9a-f]{64}$/.test(reportedRaw) ? reportedRaw : null;
+
+  if (packagedHash && reportedHash === packagedHash) {
+    return { ok: true, needsRepair: false, mode: null, reason: 'payload-current' };
   }
 
   const vulcanHomeExists = fs.existsSync(path.join(os.homedir(), '.vulcan'));
   let mode = 'repair';
-  if (serverReady && !payloadCurrent) mode = 'update';
-  else if (!serverReady && !vulcanHomeExists) mode = 'setup';
+  if (serverReady) mode = 'update';
+  else if (!vulcanHomeExists) mode = 'setup';
 
   return {
     ok: true,
     needsRepair: true,
     mode,
-    reason: !serverReady
-      ? 'server-unavailable'
-      : !payloadCurrent
-        ? 'server-payload'
-        : 'etna-unhealthy',
+    reason: serverReady ? 'server-payload' : 'server-unavailable',
   };
 }
 

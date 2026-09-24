@@ -105,6 +105,7 @@ class TerminalSlot:
     cols: int                       = 80
     rows: int                       = 24
     resume_notice: str              = ''        # one-shot agent-visible revival notice
+    generation: str                 = field(default_factory=lambda: uuid.uuid4().hex)
 
     @property
     def is_busy(self) -> bool:
@@ -123,11 +124,29 @@ _slots_lock = threading.Lock()
 # independently probing/restarting the same environment.
 _resume_locks: dict[tuple[str, str], threading.Lock] = {}
 _resume_locks_guard = threading.Lock()
+# Physical PTY creation/revival/retirement is serialized per logical slot.
+_slot_lifecycle_locks: dict[tuple[str, str, int], threading.RLock] = {}
+_slot_lifecycle_locks_guard = threading.Lock()
 
 # Per-chat scrollback storage: (chat_id, kind, slot) → serialized string
 _scrollbacks: dict[tuple, str] = {}
 _scrollback_lock = threading.RLock()
 
+
+
+
+def _slot_lifecycle_lock(chat_id: str, kind: SlotKind, slot: int) -> threading.RLock:
+    key = (chat_id, kind, int(slot))
+    with _slot_lifecycle_locks_guard:
+        lock = _slot_lifecycle_locks.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _slot_lifecycle_locks[key] = lock
+        return lock
+
+
+def _recoverable_reasons(kind: SlotKind) -> set[str]:
+    return _AGENT_RECOVERABLE_REASONS if kind == "agent" else _LIFECYCLE_REOPEN_REASONS
 
 def _close_slot_fd(ts: TerminalSlot):
     """Close a PTY exactly once; fd reuse makes double-closing dangerous."""
@@ -484,7 +503,7 @@ def agent_slot_state(chat_id: str, kind: SlotKind, slot: int) -> dict | None:
         return live
     with _slots_lock:
         ts = _slots.get(_slot_key(chat_id, kind, slot))
-        if ts is not None and ts.finished and ts.close_reason in _LIFECYCLE_REOPEN_REASONS:
+        if ts is not None and ts.finished and ts.close_reason in _recoverable_reasons(kind):
             return {"slot": slot, "running": False, "pid": None}
     if _persisted_slot_entry(chat_id, kind, slot).get("open"):
         return {"slot": slot, "running": False, "pid": None}
@@ -500,7 +519,7 @@ def _next_slot(chat_id: str, kind: SlotKind) -> int | None:
     used = {
         slot for (cid, k, slot), ts in _slots.items()
         if cid == chat_id and k == kind
-        and (not ts.finished or ts.close_reason in _LIFECYCLE_REOPEN_REASONS)
+        and (not ts.finished or ts.close_reason in _recoverable_reasons(kind))
     }
     for key, entry in _load_slot_meta(chat_id).items():
         if not isinstance(entry, dict) or not entry.get("open"):
@@ -795,12 +814,13 @@ def _start_slot_proc(chat_id: str, kind: SlotKind, slot: int, cols: int = 80, ro
                 # while the collector was waking up from PTY EOF. Never let the retired
                 # collector overwrite the new shell's fresh metadata.
                 with _slots_lock:
-                    still_current = _slots.get(_slot_key(ts.chat_id, ts.kind, ts.slot)) is ts
+                    current = _slots.get(_slot_key(ts.chat_id, ts.kind, ts.slot))
+                    still_current = current is ts and current.generation == ts.generation
                 if still_current:
                     _update_slot_meta(
                         ts.chat_id, ts.kind, ts.slot, open=recoverable, parked=recoverable,
                         close_reason="process-exit", cols=ts.cols, rows=ts.rows,
-                        last_activity=ts.last_activity,
+                        last_activity=ts.last_activity, generation=ts.generation,
                     )
                     if not recoverable:
                         clear_slot_focus_if_matches(ts.chat_id, ts.kind, ts.slot)
@@ -824,42 +844,60 @@ def _start_inactivity_watcher(ts: TerminalSlot):
     threading.Thread(target=_watch, daemon=True).start()
 
 
-def open_slot(chat_id: str, kind: SlotKind, preferred_slot: int | None = None, *, cols: int = 80, rows: int = 24) -> int:
-    """
-    Open a new terminal slot of the given kind for this chat.
-    Returns the slot number (1-3).
-    Raises ValueError if the maximum number of slots is already open.
-    """
+def _start_logical_slot_locked(chat_id: str, kind: SlotKind, slot: int, *, cols: int, rows: int) -> TerminalSlot:
+    """Create one physical PTY incarnation for a logical slot. Caller owns its lifecycle lock."""
     _ensure_chat_dirs(chat_id)
-    if not docker.container_running(chat_id) and not docker.start_container(chat_id):
+    if not docker.ensure_container_running(chat_id):
         raise RuntimeError(f"Could not start the workspace container for chat {chat_id}")
     if not docker.prepare_workspace_identity(chat_id):
         raise RuntimeError("Could not prepare host-owned workspace permissions")
+    ts = _start_slot_proc(chat_id, kind, slot, cols=max(1, int(cols)), rows=max(1, int(rows)))
+    key = _slot_key(chat_id, kind, slot)
     with _slots_lock:
-        if preferred_slot is not None:
-            slot = int(preferred_slot)
-            if slot < 1 or slot > SLOT_MAX:
-                raise ValueError(f"Terminal slot must be between 1 and {SLOT_MAX}")
-            existing = _slots.get(_slot_key(chat_id, kind, slot))
-            if existing is not None and not existing.finished:
-                raise ValueError(f"Terminal {slot} is already open")
-        else:
+        _slots[key] = ts
+    _update_slot_meta(
+        chat_id, kind, slot, open=True, parked=False, close_reason="",
+        cols=ts.cols, rows=ts.rows, last_activity=ts.last_activity, generation=ts.generation,
+    )
+    return ts
+
+
+def open_slot(chat_id: str, kind: SlotKind, preferred_slot: int | None = None, *, cols: int = 80, rows: int = 24) -> int:
+    """Open a new logical terminal slot attached to this chat's workspace container."""
+    _ensure_chat_dirs(chat_id)
+    if preferred_slot is not None:
+        slot = int(preferred_slot)
+        if slot < 1 or slot > SLOT_MAX:
+            raise ValueError(f"Terminal slot must be between 1 and {SLOT_MAX}")
+    else:
+        with _slots_lock:
             slot = _next_slot(chat_id, kind)
         if slot is None:
             raise ValueError(
                 f"Maximum of {SLOT_MAX} {kind} terminals already open. "
                 f"Close an existing terminal with close_terminal(slot) before opening a new one."
             )
-        ts = _start_slot_proc(chat_id, kind, slot, cols=max(1, int(cols)), rows=max(1, int(rows)))
-        _slots[_slot_key(chat_id, kind, slot)] = ts
-        _update_slot_meta(
-            chat_id, kind, slot, open=True, parked=False, close_reason="",
-            cols=ts.cols, rows=ts.rows, last_activity=ts.last_activity,
+
+    with _slot_lifecycle_lock(chat_id, kind, slot):
+        key = _slot_key(chat_id, kind, slot)
+        with _slots_lock:
+            existing = _slots.get(key)
+        entry = _persisted_slot_entry(chat_id, kind, slot)
+        logical_open = bool(entry.get("open")) or (
+            existing is not None and (not existing.finished or existing.close_reason in _recoverable_reasons(kind))
         )
+        if logical_open:
+            # Preserve the historical explicit-resume behavior for a parked preferred
+            # slot, but still reject attempts to duplicate a live physical shell.
+            if preferred_slot is not None and (existing is None or existing.finished):
+                revived = ensure_live_slot(chat_id, kind, slot, cols=cols, rows=rows)
+                if revived is not None and not revived.finished:
+                    return slot
+            raise ValueError(f"Terminal {slot} is already open")
+        _start_logical_slot_locked(chat_id, kind, slot, cols=cols, rows=rows)
     return slot
 
-
-def close_slot(chat_id: str, kind: SlotKind, slot: int, reason: str = 'explicit'):
+def _close_slot_locked(chat_id: str, kind: SlotKind, slot: int, reason: str = 'explicit'):
     """Close a terminal slot, killing the PTY immediately.
 
     An explicit close also retires a previously lifecycle-parked logical slot so
@@ -913,6 +951,12 @@ def close_slot(chat_id: str, kind: SlotKind, slot: int, reason: str = 'explicit'
             clear_slot_focus_if_matches(chat_id, kind, slot)
 
 
+def close_slot(chat_id: str, kind: SlotKind, slot: int, reason: str = 'explicit'):
+    """Serialize retirement with creation/revival for the same logical slot."""
+    with _slot_lifecycle_lock(chat_id, kind, slot):
+        return _close_slot_locked(chat_id, kind, slot, reason=reason)
+
+
 def close_chat_slots(chat_id: str, reason: str = 'explicit'):
     """Close every live terminal slot belonging to a chat/container."""
     with _slots_lock:
@@ -940,24 +984,36 @@ _LIFECYCLE_REOPEN_REASONS = {"inactivity", "container-stopped"}
 _AGENT_RECOVERABLE_REASONS = _LIFECYCLE_REOPEN_REASONS | {"process-exit"}
 
 
-def _revive_slot_if_lifecycled(chat_id: str, kind: SlotKind, slot: int) -> TerminalSlot | None:
-    """Revive a persisted logical slot and restore its prompt-level session state."""
-    key = _slot_key(chat_id, kind, slot)
-    ts = _slots.get(key)
-    entry = _persisted_slot_entry(chat_id, kind, slot)
-    reason = ""
-    recoverable_reasons = _AGENT_RECOVERABLE_REASONS if kind == "agent" else _LIFECYCLE_REOPEN_REASONS
+def ensure_live_slot(
+    chat_id: str, kind: SlotKind, slot: int, *,
+    cols: int | None = None, rows: int | None = None, create: bool = False,
+) -> TerminalSlot | None:
+    """Return a live PTY for one logical slot, reviving it exactly once if needed.
 
-    # Popen can report the docker-exec process dead a few milliseconds before
-    # the collector consumes PTY EOF and flips `finished`. Treat that as the
-    # same process-exit lifecycle event immediately, otherwise list_terminals
-    # can report an idle slot and use_terminal can reject it on the next call.
-    if ts is not None and not ts.finished:
-        try:
-            process_exited = ts.proc.poll() is not None
-        except Exception:
-            process_exited = False
-        if process_exited:
+    The logical identity is (chat_id, kind, slot). `chat_id` is also the workspace
+    container identity; revival always re-enters that same container and /workspace.
+    Physical PTYs have generation IDs so stale collectors cannot retire replacements.
+    """
+    slot = int(slot)
+    if slot < 1 or slot > SLOT_MAX:
+        return None
+    key = _slot_key(chat_id, kind, slot)
+    with _slot_lifecycle_lock(chat_id, kind, slot):
+        with _slots_lock:
+            ts = _slots.get(key)
+        entry = _persisted_slot_entry(chat_id, kind, slot)
+        reason = ""
+
+        if ts is not None and not ts.finished:
+            try:
+                process_exited = ts.proc.poll() is not None
+            except Exception:
+                process_exited = False
+            if not process_exited:
+                if cols is not None and rows is not None:
+                    resize_slot(chat_id, kind, slot, cols, rows)
+                return ts
+            # Publish the physical death only if this generation is still authoritative.
             ts.close_reason = ts.close_reason or "process-exit"
             ts.finished = True
             _close_slot_fd(ts)
@@ -966,31 +1022,33 @@ def _revive_slot_if_lifecycled(chat_id: str, kind: SlotKind, slot: int) -> Termi
             _update_slot_meta(
                 chat_id, kind, slot, open=recoverable, parked=recoverable,
                 close_reason="process-exit", cols=ts.cols, rows=ts.rows,
-                last_activity=ts.last_activity,
+                last_activity=ts.last_activity, generation=ts.generation,
             )
             if not recoverable:
                 clear_slot_focus_if_matches(chat_id, kind, slot)
             entry = _persisted_slot_entry(chat_id, kind, slot)
-    if ts is not None:
-        if not ts.finished:
-            return ts
-        if ts.close_reason not in recoverable_reasons:
-            return ts
-        reason = ts.close_reason
-    elif entry.get("open"):
-        reason = str(entry.get("close_reason") or "persisted")
-    else:
-        return None
 
-    cols = int(entry.get("cols") or getattr(ts, "cols", 80) or 80)
-    rows = int(entry.get("rows") or getattr(ts, "rows", 24) or 24)
-    try:
-        open_slot(chat_id, kind, preferred_slot=slot, cols=cols, rows=rows)
-    except ValueError:
-        # Another concurrent action may have already recreated the slot.
-        pass
-    revived = _slots.get(key)
-    if revived is not None and not revived.finished:
+        if ts is not None:
+            if not ts.finished:
+                return ts
+            if ts.close_reason in _recoverable_reasons(kind):
+                reason = ts.close_reason
+            elif create and not entry.get("open"):
+                reason = "create"
+            else:
+                return None
+        elif entry.get("open"):
+            reason = str(entry.get("close_reason") or "persisted")
+        elif create:
+            reason = "create"
+        else:
+            return None
+
+        target_cols = int(cols or entry.get("cols") or getattr(ts, "cols", 80) or 80)
+        target_rows = int(rows or entry.get("rows") or getattr(ts, "rows", 24) or 24)
+        revived = _start_logical_slot_locked(
+            chat_id, kind, slot, cols=target_cols, rows=target_rows
+        )
         if reason == "process-exit":
             revived.resume_notice = (
                 f"Terminal {slot} recovered after its backing shell exited unexpectedly. "
@@ -1001,13 +1059,44 @@ def _revive_slot_if_lifecycled(chat_id: str, kind: SlotKind, slot: int) -> Termi
                 f"Terminal {slot} resumed after inactivity. Its persisted scrollback, "
                 "working directory, and exported environment were restored."
             )
-        else:
+        elif reason == "persisted":
             revived.resume_notice = (
                 f"Terminal {slot} resumed from its persisted session. Its prior scrollback, "
                 "working directory, and exported environment were restored."
             )
-        _update_slot_meta(chat_id, kind, slot, open=True, parked=False, close_reason="")
-    return revived
+        return revived
+
+
+def _revive_slot_if_lifecycled(chat_id: str, kind: SlotKind, slot: int) -> TerminalSlot | None:
+    """Compatibility wrapper; all lifecycle ownership lives in ensure_live_slot()."""
+    return ensure_live_slot(chat_id, kind, slot)
+
+
+def ensure_slot_resumed(chat_id: str, kind: SlotKind, slot: int) -> TerminalSlot | None:
+    """Public demand hook used by terminal tools that inspect or interact with a slot."""
+    return ensure_live_slot(chat_id, kind, slot)
+
+
+def consume_slot_resume_notice(chat_id: str, kind: SlotKind, slot: int) -> str:
+    """Return and clear the one-shot agent-visible revival notice."""
+    ts = _slots.get(_slot_key(chat_id, kind, slot))
+    if ts is None:
+        return ""
+    notice = ts.resume_notice
+    ts.resume_notice = ""
+    return notice
+
+def send_slot_input(chat_id: str, kind: SlotKind, slot: int, text: str) -> bool:
+    """Write raw input to a logical slot, reviving its backing PTY first."""
+    ts = ensure_live_slot(chat_id, kind, slot)
+    if not ts or ts.finished:
+        return False
+    try:
+        os.write(ts.master_fd, text.encode('utf-8', errors='replace'))
+        ts.last_activity = time.time()
+        return True
+    except OSError:
+        return False
 
 
 def _resume_lock(chat_id: str, kind: SlotKind) -> threading.Lock:
@@ -1034,7 +1123,7 @@ def resume_logical_slots(chat_id: str, kind: SlotKind = "agent") -> list[dict]:
         ]
         if not logical:
             return []
-        if not docker.container_running(chat_id) and not docker.start_container(chat_id):
+        if not docker.ensure_container_running(chat_id):
             raise RuntimeError(f"Could not start the workspace container for chat {chat_id}")
         states: list[dict] = []
         for item in logical:
@@ -1046,33 +1135,6 @@ def resume_logical_slots(chat_id: str, kind: SlotKind = "agent") -> list[dict]:
             state["resumed"] = bool(revived.resume_notice)
             states.append(state)
         return sorted(states, key=lambda value: int(value["slot"]))
-
-
-def ensure_slot_resumed(chat_id: str, kind: SlotKind, slot: int) -> TerminalSlot | None:
-    """Public demand hook used by terminal tools that inspect or interact with a slot."""
-    return _revive_slot_if_lifecycled(chat_id, kind, slot)
-
-
-def consume_slot_resume_notice(chat_id: str, kind: SlotKind, slot: int) -> str:
-    """Return and clear the one-shot agent-visible revival notice."""
-    ts = _slots.get(_slot_key(chat_id, kind, slot))
-    if ts is None:
-        return ""
-    notice = ts.resume_notice
-    ts.resume_notice = ""
-    return notice
-
-def send_slot_input(chat_id: str, kind: SlotKind, slot: int, text: str) -> bool:
-    """Write raw input to a slot's PTY, reviving lifecycle-closed slots first."""
-    ts = _revive_slot_if_lifecycled(chat_id, kind, slot)
-    if not ts or ts.finished:
-        return False
-    try:
-        os.write(ts.master_fd, text.encode('utf-8', errors='replace'))
-        ts.last_activity = time.time()
-        return True
-    except OSError:
-        return False
 
 
 def encode_terminal_key(key: str, modifiers: list[str] | None = None) -> str:
@@ -1407,7 +1469,7 @@ def use_terminal_in_slot(chat_id: str, kind: SlotKind, slot: int,
     """
     _ensure_chat_dirs(chat_id)
     key = _slot_key(chat_id, kind, slot)
-    ts = _revive_slot_if_lifecycled(chat_id, kind, slot)
+    ts = ensure_live_slot(chat_id, kind, slot)
     if ts is None or ts.finished:
         raise RuntimeError(f"Terminal {slot} is not open. Open or select a live terminal first.")
     if not docker.container_running(chat_id):

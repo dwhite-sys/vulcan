@@ -102,28 +102,24 @@ async def handle(ws: WebSocket, chat_id: str, kind: str, slot: int):
         cols = max(1, int(msg.get("cols", 80)))
         rows = max(1, int(msg.get("rows", 24)))
         key = term._slot_key(chat_id, kind, slot)
-        existing = term._slots.get(key)
-        if not existing or existing.finished:
-            try:
-                opened_slot = await asyncio.to_thread(
-                    term.open_slot, chat_id, kind, slot, cols=cols, rows=rows
-                )
-                if opened_slot != slot:
-                    # Shouldn't happen if caller passes correct slot, but handle it
-                    await send({"type": "error", "message": f"Expected slot {slot}, got {opened_slot}"})
-                    await ws.close()
-                    return
-                slot_opened_here = True
-            except (ValueError, RuntimeError) as e:
-                await send({"type": "error", "message": str(e)})
-                await ws.close()
-                return
-        else:
-            term.resize_slot(chat_id, kind, slot, cols, rows)
+        before = term.agent_slot_state(chat_id, kind, slot) if kind == "agent" else term.slot_state(chat_id, kind, slot)
+        try:
+            # Viewer attachment is demand for this logical slot, but PTY ownership stays
+            # in TerminalManager-style ensure_live_slot(). It always enters the same
+            # chat/container workspace and serializes with agent recovery/explicit close.
+            ts = await asyncio.to_thread(
+                term.ensure_live_slot, chat_id, kind, slot, cols=cols, rows=rows, create=True
+            )
+            if ts is None:
+                raise RuntimeError(f"Could not open terminal {slot}")
+            slot_opened_here = before is None
+        except (ValueError, RuntimeError) as e:
+            await send({"type": "error", "message": str(e)})
+            await ws.close()
+            return
 
         # The server is the sole transcript authority. Send one coherent snapshot:
         # durable history from prior PTY sessions + the current PTY session exactly once.
-        ts = term._slots.get(key)
         current_chunks = list(ts.output) if ts is not None else []
         sent_chunks = len(current_chunks)
         snapshot = (term.get_slot_scrollback(chat_id, kind, slot) or "") + "".join(current_chunks)
@@ -135,8 +131,17 @@ async def handle(ws: WebSocket, chat_id: str, kind: str, slot: int):
         # ── Stream PTY output ─────────────────────────────────────────────────
 
         async def stream_output():
-            nonlocal sent_chunks
+            nonlocal sent_chunks, ts
+            generation = ts.generation
             while True:
+                current = term._slots.get(key)
+                if current is not None and current.generation != generation and not current.finished:
+                    # Another lifecycle actor revived the logical slot. Rebind the viewer
+                    # to the new physical incarnation rather than streaming a retired PTY.
+                    ts = current
+                    generation = current.generation
+                    sent_chunks = 0
+                    await send({"type": "status", "connected": True, "resumed": True})
                 if ts is None:
                     break
                 new_chunks = ts.output[sent_chunks:]
@@ -144,9 +149,13 @@ async def handle(ws: WebSocket, chat_id: str, kind: str, slot: int):
                     await send({"type": "chunk", "data": chunk})
                 sent_chunks += len(new_chunks)
                 if ts.finished:
-                    # The underlying docker-exec PTY ended (for example because
-                    # vulcan-global restarted). Tell the renderer and close the
-                    # socket so it cannot remain attached to a dead slot.
+                    revived = await asyncio.to_thread(term.ensure_live_slot, chat_id, kind, slot)
+                    if revived is not None and not revived.finished:
+                        ts = revived
+                        generation = revived.generation
+                        sent_chunks = 0
+                        await send({"type": "status", "connected": True, "resumed": True})
+                        continue
                     await send({"type": "closed", "reason": ts.close_reason or "process_exit"})
                     try:
                         await ws.close()

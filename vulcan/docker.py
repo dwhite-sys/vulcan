@@ -310,6 +310,29 @@ def container_running(chat_id: str) -> bool:
     return docker_output(["inspect", "--format", "{{.State.Running}}", container_name(chat_id)]) == "true"
 
 
+def ensure_container_running(chat_id: str, verbose: bool = False) -> bool:
+    """Ensure the chat workspace container is running without reconciling/migrating it.
+
+    Terminal revival must preserve the container process namespace it is attached to.
+    Existing containers are therefore only started in place; migration/reconciliation
+    remains an explicit higher-level lifecycle operation. A missing container still uses
+    start_container() to create the chat workspace normally.
+    """
+    cfg.ensure_dirs()
+    cfg.chat_dir(chat_id)
+    if container_running(chat_id):
+        return True
+    try:
+        exists = container_exists(chat_id)
+    except Exception:
+        # Keep tests/limited hosts compatible; start_container remains the canonical
+        # creator when Docker presence cannot be probed directly.
+        exists = False
+    if exists:
+        return run_docker(["start", container_name(chat_id)], capture_output=not verbose).returncode == 0
+    return start_container(chat_id) if not verbose else start_container(chat_id, verbose=True)
+
+
 def container_network_mode(chat_id: str) -> str | None:
     if not container_exists(chat_id):
         return None

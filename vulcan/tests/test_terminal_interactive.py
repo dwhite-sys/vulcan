@@ -7,6 +7,7 @@ import asyncio
 import os
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -208,6 +209,82 @@ class InteractiveTerminalTests(unittest.TestCase):
         self.assertIn("recovered-after-exit", "".join(process.output))
         self.assertIsNot(self.ts, original)
         self.assertFalse(self.ts.finished)
+
+
+    def test_concurrent_recovery_is_single_flight_per_logical_slot(self):
+        original = self.ts
+        original.proc.kill()
+        self.wait_for(lambda: original.finished)
+        self.assertEqual(original.close_reason, "process-exit")
+
+        real_start = terminal._start_slot_proc
+        starts = []
+        starts_lock = threading.Lock()
+
+        def counted_start(*args, **kwargs):
+            with starts_lock:
+                starts.append((args, kwargs))
+            return real_start(*args, **kwargs)
+
+        barrier = threading.Barrier(3)
+        results = []
+        errors = []
+
+        def recover():
+            try:
+                barrier.wait()
+                results.append(terminal.ensure_live_slot(self.chat_id, "agent", self.slot))
+            except Exception as exc:
+                errors.append(exc)
+
+        with mock.patch.object(terminal, "_start_slot_proc", side_effect=counted_start):
+            threads = [threading.Thread(target=recover) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            barrier.wait()
+            for thread in threads:
+                thread.join(timeout=5)
+
+        self.assertFalse(errors)
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(len(results), 2)
+        self.assertIs(results[0], results[1])
+        self.assertNotEqual(results[0].generation, original.generation)
+        self.ts = results[0]
+
+    def test_explicit_close_racing_recovery_leaves_logical_slot_closed(self):
+        original = self.ts
+        original.proc.kill()
+        self.wait_for(lambda: original.finished)
+        self.assertEqual(original.close_reason, "process-exit")
+
+        barrier = threading.Barrier(3)
+        errors = []
+
+        def recover():
+            try:
+                barrier.wait()
+                terminal.ensure_live_slot(self.chat_id, "agent", self.slot)
+            except Exception as exc:
+                errors.append(exc)
+
+        def close():
+            try:
+                barrier.wait()
+                terminal.close_slot(self.chat_id, "agent", self.slot, reason="explicit")
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=recover), threading.Thread(target=close)]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        self.assertFalse(errors)
+        self.assertIsNone(terminal.ensure_live_slot(self.chat_id, "agent", self.slot))
+        self.assertIsNone(terminal.agent_slot_state(self.chat_id, "agent", self.slot))
 
     def test_explicit_close_retires_process_exit_parked_agent_slot(self):
         original = self.ts

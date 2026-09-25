@@ -108,7 +108,7 @@ def prepare_workspace_identity(chat_id: str) -> bool:
         'uid="$1"; gid="$2"; workdir="$3"; '
         'mkdir -p /tmp/vulcan-home; '
         'chown "$uid:$gid" /tmp/vulcan-home; '
-        'packages="sudo curl iputils-ping ca-certificates git openssh-client wget unzip zip tar gzip bzip2 xz-utils zstd jq ripgrep fd-find fzf less file procps psmisc iproute2 dnsutils netcat-openbsd lsof rsync build-essential pkg-config python3 python3-pip python3-venv sqlite3 tree nano"; '
+        'packages="sudo curl iputils-ping ca-certificates git openssh-client wget unzip zip tar gzip bzip2 xz-utils zstd jq ripgrep fd-find fzf less file procps psmisc iproute2 dnsutils netcat-openbsd lsof rsync build-essential pkg-config python3 python3-pip python3-venv sqlite3 tree nano tmux"; '
         'missing=""; for pkg in $packages; do dpkg -s "$pkg" >/dev/null 2>&1 || missing="$missing $pkg"; done; '
         'if [ -n "$missing" ]; then apt-get update && apt-get install -y $missing && rm -rf /var/lib/apt/lists/*; fi; '
         'if command -v fdfind >/dev/null 2>&1 && [ ! -e /usr/local/bin/fd ]; then ln -s /usr/bin/fdfind /usr/local/bin/fd; fi; '
@@ -159,6 +159,7 @@ RUN apt-get update && apt-get install -y \\
     less \\
     file \\
     tree \\
+    tmux \\
     tar \\
     gzip \\
     bzip2 \\
@@ -265,35 +266,16 @@ def container_has_listening_service(chat_id: str) -> bool:
 
 
 def reconcile_orphan_terminal_processes() -> dict[str, int]:
-    """Kill interactive terminal shells that survived a Vulcan server restart.
+    """Preserve container-owned terminal sessions across Vulcan server restarts.
 
-    The in-memory terminal registry cannot reattach to pre-existing docker-exec PTYs,
-    so leaving them alive only creates duplicate logical slots on reconnect.
+    Terminal shells now live in tmux inside the per-chat container.  The server's
+    docker-exec process is only an attachment, so killing interactive bash
+    processes here would destroy the durable terminal that the next server
+    instance is supposed to reattach to.  Legacy direct-PTY shells are left
+    alone during this transition; explicit terminal/container lifecycle actions
+    remain responsible for retiring them.
     """
-    cleaned: dict[str, int] = {}
-    for chat_id in list_running_containers():
-        if chat_id == "global":
-            continue
-        name = container_name(chat_id)
-        script = r'''count=0
-for pid in $(ps -eo pid=,tty=,args= | awk '$2 ~ /^pts\// && $0 ~ /\/bin\/bash/ {print $1}'); do
-  [ "$pid" = "$$" ] && continue
-  kill -TERM "$pid" 2>/dev/null && count=$((count+1)) || true
-done
-sleep 0.05
-for pid in $(ps -eo pid=,tty=,args= | awk '$2 ~ /^pts\// && $0 ~ /\/bin\/bash/ {print $1}'); do
-  [ "$pid" = "$$" ] && continue
-  kill -KILL "$pid" 2>/dev/null || true
-done
-printf '%s' "$count"'''
-        result = run_docker(["exec", "--user", "0:0", name, "/bin/sh", "-c", script],
-                            capture_output=True, text=True)
-        if result.returncode == 0:
-            try:
-                cleaned[chat_id] = int((result.stdout or "0").strip() or "0")
-            except ValueError:
-                cleaned[chat_id] = 0
-    return cleaned
+    return {}
 
 
 def _gpu_available() -> bool:

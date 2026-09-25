@@ -39,6 +39,8 @@ class InteractiveTerminalTests(unittest.TestCase):
         self.patches.enter_context(mock.patch.object(terminal.docker, "prepare_workspace_identity", return_value=True))
         self.patches.enter_context(mock.patch.object(terminal.docker, "prepare_terminal_identity", return_value=True))
         self.patches.enter_context(mock.patch.object(terminal.docker, "terminal_exec_flags", return_value=[]))
+        self.patches.enter_context(mock.patch.object(terminal, "_ensure_tmux_session"))
+        self.patches.enter_context(mock.patch.object(terminal, "_kill_slot_tmux_session"))
         original_popen = subprocess.Popen
 
         def start_real_local_shell(_docker_arguments, **kwargs):
@@ -476,3 +478,63 @@ class TerminalPersistenceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+class TmuxTerminalPersistenceTests(unittest.TestCase):
+    def completed(self, code=0, stdout="", stderr=""):
+        return subprocess.CompletedProcess([], code, stdout, stderr)
+
+    def test_creates_durable_tmux_shell_once_then_configures_transport(self):
+        calls = []
+        results = iter([
+            self.completed(1),  # has-session: absent
+            self.completed(0),  # new-session
+            self.completed(0),  # status off
+            self.completed(0),  # prefix None
+        ])
+
+        def run(args, **kwargs):
+            calls.append((args, kwargs))
+            return next(results)
+
+        with mock.patch.object(terminal.docker, "terminal_exec_flags", return_value=["--user", "1000:1000"]), \
+             mock.patch.object(terminal.docker, "container_name", return_value="vulcan-chat-test"), \
+             mock.patch.object(terminal.docker, "run_docker", side_effect=run):
+            terminal._ensure_tmux_session(
+                "chat", "agent", 2,
+                workdir="/workspace",
+                revive_env=["FOO=bar"],
+                shell_command="umask 000; exec /bin/bash -i",
+            )
+
+        self.assertEqual(len(calls), 4)
+        self.assertIn("has-session", calls[0][0])
+        create = calls[1][0]
+        self.assertIn("new-session", create)
+        self.assertIn("vulcan-agent-2", create)
+        self.assertIn("FOO=bar", create)
+        self.assertIn("umask 000; exec /bin/bash -i", create)
+        self.assertEqual(calls[2][0][-2:], ["status", "off"])
+        self.assertEqual(calls[3][0][-2:], ["prefix", "None"])
+
+    def test_existing_tmux_shell_is_only_reattached_not_recreated(self):
+        with mock.patch.object(terminal.docker, "terminal_exec_flags", return_value=[]), \
+             mock.patch.object(terminal.docker, "container_name", return_value="vulcan-chat-test"), \
+             mock.patch.object(terminal.docker, "run_docker", return_value=self.completed(0)) as run:
+            terminal._ensure_tmux_session(
+                "chat", "agent", 1,
+                workdir="/workspace",
+                revive_env=[],
+                shell_command="exec /bin/bash -i",
+            )
+        run.assert_called_once()
+        self.assertIn("has-session", run.call_args.args[0])
+
+    def test_explicit_terminal_retirement_kills_tmux_session(self):
+        with mock.patch.object(terminal.docker, "container_running", return_value=True), \
+             mock.patch.object(terminal.docker, "terminal_exec_flags", return_value=[]), \
+             mock.patch.object(terminal.docker, "container_name", return_value="vulcan-chat-test"), \
+             mock.patch.object(terminal.docker, "run_docker", return_value=self.completed(0)) as run:
+            terminal._kill_slot_tmux_session("chat", "agent", 3)
+        args = run.call_args.args[0]
+        self.assertIn("kill-session", args)
+        self.assertEqual(args[-1], "vulcan-agent-3")

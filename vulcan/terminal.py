@@ -30,6 +30,7 @@ import json
 import logging
 import re
 import os
+import shlex
 import pty
 import shutil
 import struct
@@ -712,6 +713,62 @@ def _persist_slot_output(ts: TerminalSlot):
         ts.persisted = True
 
 
+def _tmux_session_name(kind: SlotKind, slot: int) -> str:
+    """Stable shell-session identity inside one chat container."""
+    return f"vulcan-{kind}-{int(slot)}"
+
+
+def _ensure_tmux_session(
+    chat_id: str, kind: SlotKind, slot: int, *, workdir: str,
+    revive_env: list[str], shell_command: str,
+) -> None:
+    """Create the durable in-container shell once; later PTYs only attach to it."""
+    name = _tmux_session_name(kind, slot)
+    base = ["exec", *docker.terminal_exec_flags(chat_id, kind, slot)]
+    container = docker.container_name(chat_id)
+    present = docker.run_docker(
+        [*base, container, "tmux", "has-session", "-t", name],
+        capture_output=True, text=True,
+    )
+    if present.returncode != 0:
+        created = docker.run_docker(
+            [*base, *sum((["-e", value] for value in revive_env), []),
+             "-e", f"VULCAN_SESSION={chat_id}:{kind}:{slot}",
+             "-e", "TERM=xterm-256color", "-e", "COLORTERM=truecolor",
+             "-w", workdir, container,
+             "tmux", "new-session", "-d", "-s", name, "-c", workdir, shell_command],
+            capture_output=True, text=True,
+        )
+        if created.returncode != 0:
+            detail = (getattr(created, "stderr", "") or getattr(created, "stdout", "") or "").strip()
+            raise RuntimeError(f"Could not create persistent terminal {slot}: {detail or 'tmux failed'}")
+        # tmux is transport here, not a user-facing multiplexer. Disable its UI
+        # and key prefix so every keystroke belongs to the shell/application.
+        docker.run_docker(
+            [*base, container, "tmux", "set-option", "-t", name, "status", "off"],
+            capture_output=True, text=True,
+        )
+        docker.run_docker(
+            [*base, container, "tmux", "set-option", "-g", "prefix", "None"],
+            capture_output=True, text=True,
+        )
+
+
+def _kill_slot_tmux_session(chat_id: str, kind: SlotKind, slot: int) -> None:
+    """Retire the container-owned shell for an explicit/lifecycle close."""
+    if not docker.container_running(chat_id):
+        return
+    try:
+        docker.run_docker(
+            ["exec", *docker.terminal_exec_flags(chat_id, kind, slot),
+             docker.container_name(chat_id), "tmux", "kill-session",
+             "-t", _tmux_session_name(kind, slot)],
+            capture_output=True, text=True,
+        )
+    except Exception:
+        logger.debug("Could not retire tmux terminal session %s:%s:%s", chat_id, kind, slot, exc_info=True)
+
+
 def _start_slot_proc(chat_id: str, kind: SlotKind, slot: int, cols: int = 80, rows: int = 24) -> TerminalSlot:
     """Spawn a new PTY bash session for a slot."""
     master_fd, slave_fd = pty.openpty()
@@ -743,6 +800,10 @@ def _start_slot_proc(chat_id: str, kind: SlotKind, slot: int, cols: int = 80, ro
     shell_prefix = 'umask 000'
     rc_path = _install_slot_shell_integration(chat_id, kind, slot)
     interactive_shell = ['/bin/bash', '--rcfile', rc_path, '-i'] if rc_path else ['/bin/bash', '-i']
+    shell_command = f'{shell_prefix}; exec ' + ' '.join(shlex.quote(part) for part in interactive_shell)
+    _ensure_tmux_session(
+        chat_id, kind, slot, workdir=workdir, revive_env=revive_env, shell_command=shell_command
+    )
     proc = subprocess.Popen(
         session_prefix + [
             'docker', 'exec', '-it', *docker.terminal_exec_flags(chat_id, kind, slot),
@@ -752,7 +813,7 @@ def _start_slot_proc(chat_id: str, kind: SlotKind, slot: int, cols: int = 80, ro
             '-e', 'COLORTERM=truecolor',
             '-e', session_var,
             docker.container_name(chat_id),
-            '/bin/bash', '-c', f'{shell_prefix}; exec "$@"', 'vulcan-shell', *interactive_shell,
+            'tmux', 'attach-session', '-t', _tmux_session_name(kind, slot),
         ],
         stdin=slave_fd,
         stdout=slave_fd,
@@ -909,6 +970,7 @@ def _close_slot_locked(chat_id: str, kind: SlotKind, slot: int, reason: str = 'e
         if not ts:
             entry = _persisted_slot_entry(chat_id, kind, slot)
             if reason == 'explicit' and entry.get("open"):
+                _kill_slot_tmux_session(chat_id, kind, slot)
                 with _scrollback_lock:
                     _scrollbacks.pop(key, None)
                 _clear_slot_revival_state(chat_id, kind, slot)
@@ -918,6 +980,7 @@ def _close_slot_locked(chat_id: str, kind: SlotKind, slot: int, reason: str = 'e
         if ts.finished:
             recoverable_reasons = _AGENT_RECOVERABLE_REASONS if kind == 'agent' else _LIFECYCLE_REOPEN_REASONS
             if reason == 'explicit' and ts.close_reason in recoverable_reasons:
+                _kill_slot_tmux_session(chat_id, kind, slot)
                 ts.close_reason = 'explicit'
                 with _scrollback_lock:
                     _scrollbacks.pop(key, None)
@@ -927,6 +990,10 @@ def _close_slot_locked(chat_id: str, kind: SlotKind, slot: int, reason: str = 'e
             return
         ts.close_reason = reason
         ts.finished = True
+        # The persistent shell lives in tmux inside the chat container.  Intentional
+        # lifecycle closes retire that shell; an unplanned docker-exec attachment
+        # death never reaches this path and therefore leaves the session intact.
+        _kill_slot_tmux_session(chat_id, kind, slot)
         try:
             ts.proc.kill()
         except Exception:

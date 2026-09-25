@@ -652,6 +652,7 @@ def _strip_activity_markers(ts: TerminalSlot, chunk: str) -> str:
                     except ValueError:
                         command.exit_code = 1
                     command.finished = True
+                    command.completion_event.set()
                     ts.active_command = None
                     ts.capture_active = False
                     ts.has_running = False
@@ -671,6 +672,7 @@ def _strip_activity_markers(ts: TerminalSlot, chunk: str) -> str:
                     # marker executes; do not leave the slot permanently busy.
                     command.exit_code = 130
                     command.finished = True
+                    command.completion_event.set()
                     ts.active_command = None
                     ts.capture_active = False
                     ts.has_running = False
@@ -1433,6 +1435,7 @@ class CommandProcess:
     detach_reason: str      = ""
     started_at: float       = field(default_factory=time.time)
     slot_key: tuple | None  = None
+    completion_event: threading.Event = field(default_factory=threading.Event, repr=False)
 
 
 _processes: dict[str, dict] = {}   # pid → {'kind': ..., ...}
@@ -1571,6 +1574,7 @@ def use_terminal_in_slot(chat_id: str, kind: SlotKind, slot: int,
         ts.capture_active = False
         cp.finished = True
         cp.exit_code = 1
+        cp.completion_event.set()
         raise RuntimeError(f"Terminal {slot} is no longer connected") from error
 
     def _watch_timeout():

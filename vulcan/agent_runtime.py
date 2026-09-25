@@ -1256,7 +1256,6 @@ async def _resume_agent_terminals(run: AgentRun) -> list[dict[str, Any]]:
             term.live_slot_states, run.chat["id"], "agent", sorted(set(run.terminal_slots))
         )
         if live is not None:
-            await _reconcile_agent_terminal_focus(run)
             return live
 
     task = run.terminal_resume_task
@@ -1270,20 +1269,15 @@ async def _resume_agent_terminals(run: AgentRun) -> list[dict[str, Any]]:
                     await run.workspace_warm_task
                 except Exception:
                     pass
-            states = await asyncio.to_thread(
-                term.resume_logical_slots,
-                run.chat["id"],
-                "agent",
-            )
-
-            # Physical or transparently-revivable terminal state is authoritative.
-            # Never synthesize an "idle" terminal from stale AgentRun bookkeeping.
-            run.terminal_slots = sorted({
-                int(item["slot"]) for item in states
-            })
-
-            await _reconcile_agent_terminal_focus(run)
-            return states
+            previous_slots = sorted(set(run.terminal_slots))
+            states = await asyncio.to_thread(term.resume_logical_slots, run.chat["id"], "agent")
+            if states:
+                run.terminal_slots = sorted({int(item["slot"]) for item in states})
+                return states
+            # Preserve already-known logical identity if metadata was not yet
+            # materialized (notably immediately after open_terminal). Real tool
+            # interaction will still validate/revive the selected slot.
+            return [{"slot": int(slot), "running": False, "pid": None} for slot in previous_slots]
         task = asyncio.create_task(recover(), name=f"vulcan-terminal-resume:{run.chat['id']}")
         run.terminal_resume_task = task
     return await task

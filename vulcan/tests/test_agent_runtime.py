@@ -1376,16 +1376,16 @@ class BackgroundAgentTests(unittest.IsolatedAsyncioTestCase):
             1,
         )
 
-    async def test_terminal_recovery_drops_stale_nonexistent_slot(self):
+    async def test_terminal_recovery_preserves_just_opened_slot_when_metadata_is_transiently_empty(self):
         run = agent.AgentRun(
-            chat=chat("terminal-stale-slot"),
+            chat=chat("terminal-post-open-slot"),
             options=options(settings={
                 "toolMode": "search",
                 "cliWorkspaceEnabled": True,
                 "panelsEnabled": True,
             }),
             manager=agent.RunManager(),
-            run_id="terminal-stale-slot:run",
+            run_id="terminal-post-open-slot:run",
         )
         run.terminal_slots = [1]
         run.terminal_focus = 1
@@ -1400,23 +1400,15 @@ class BackgroundAgentTests(unittest.IsolatedAsyncioTestCase):
             return_value=[],
         ), mock.patch.object(
             agent.term,
-            "get_slot_focus",
-            return_value=1,
-        ), mock.patch.object(
-            agent.term,
             "clear_slot_focus_if_matches",
             return_value=True,
         ) as clear:
             states = await agent._resume_agent_terminals(run)
 
-        self.assertEqual(states, [])
-        self.assertEqual(run.terminal_slots, [])
-        self.assertIsNone(run.terminal_focus)
-        clear.assert_called_once_with(
-            "terminal-stale-slot",
-            "agent",
-            1,
-        )
+        self.assertEqual(states, [{"slot": 1, "running": False, "pid": None}])
+        self.assertEqual(run.terminal_slots, [1])
+        self.assertEqual(run.terminal_focus, 1)
+        clear.assert_not_called()
 
     async def test_periodic_checkpoint_scheduler_commits_existing_workspaces(self):
         server = load_server_module()

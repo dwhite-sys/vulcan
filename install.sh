@@ -979,6 +979,14 @@ linux_converge() {
     progress_task_finish checking integration skipped "Desktop integration not required"
   fi
   ensure_vulcan_runtime
+
+  # Own the public Linux CLI entrypoint as part of integration. A stale user-level
+  # wrapper can otherwise survive while the managed runtime itself is healthy.
+  if [[ -z "$GUEST" ]]; then
+    mkdir -p "$HOME/.local/bin"
+    ln -sfn "$RUNTIME/bin/vulcan" "$HOME/.local/bin/vulcan"
+  fi
+
   # Etna is deliberately host-side. On native headless Linux, the host is also
   # the server machine, so the same Etna + kit runtime is retained.
   if [[ -z "$GUEST" ]]; then ensure_etna; fi

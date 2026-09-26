@@ -71,15 +71,26 @@ assert.match(coordinator, /onProgress/);
 assert.match(coordinator, /installerStageForLine/);
 assert.match(coordinator, /type: 'log'/);
 assert.match(coordinator, /127\.0\.0\.1:8468\/meta/);
-assert.doesNotMatch(coordinator, /127\.0\.0\.1:8467\/health/);
+assert.match(coordinator, /127\.0\.0\.1:8467\/health/);
 assert.match(coordinator, /server-payload\.sha256/);
 assert.match(coordinator, /server\?\.payloadHash/);
 assert.match(coordinator, /installedLinuxHash === packagedHash/);
 assert.match(coordinator, /reportedHash === packagedHash/);
-assert.match(coordinator, /reason: 'payload-current'/);
-assert.doesNotMatch(coordinator, /etnaReady/);
+assert.match(coordinator, /probePlatformInstallation/);
+assert.match(coordinator, /probeCommand/);
+for (const component of ['hash', 'runtime', 'service', 'etna', 'docker', 'workspace', 'integration']) {
+  assert.match(coordinator, new RegExp(`${component}:`), `preflight must probe ${component}`);
+}
+assert.match(coordinator, /reason: 'healthy'/);
+assert.match(coordinator, /reason: `unhealthy-\$\{failed\[0\]\}`/);
+assert.match(coordinator, /etnaReady/);
 assert.doesNotMatch(coordinator, /buildId[^\n]*===/);
-assert.match(coordinator, /if \(serverReady\) mode = 'update'/);
+assert.match(coordinator, /if \(serverReady && !hashCurrent\) mode = 'update'/);
+assert.doesNotMatch(
+  coordinator,
+  /if \(packagedHash && installedLinuxHash === packagedHash\)[\s\S]{0,160}needsRepair: false/,
+  'a matching Linux payload hash must never bypass operational health probes',
+);
 
 assert.match(main, /createSetupWindow/);
 assert.match(main, /allowShow: shouldShowOnReady/);
@@ -171,6 +182,7 @@ assert(shell.includes('"$BIN_HOME/uv" pip install --python "$RUNTIME/bin/python"
 assert(!shell.includes('"$BIN_HOME/uv" pip install --python "$RUNTIME/bin/python" "$SERVER_SOURCE"'));
 assert.match(shell, /Environment=VULCAN_BUILD_ID=\$VERSION/);
 assert.match(shell, /Environment=VULCAN_PAYLOAD_HASH=\$payload_hash/);
+assert.match(shell, /ln -sfn "\$RUNTIME\/bin\/vulcan" "\$HOME\/\.local\/bin\/vulcan"/);
 
 const serverPy = read(path.join(root, 'vulcan', 'server.py'));
 assert.match(serverPy, /"payloadHash": os\.environ\.get\("VULCAN_PAYLOAD_HASH", ""\)/);

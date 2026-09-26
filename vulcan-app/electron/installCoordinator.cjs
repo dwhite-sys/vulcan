@@ -131,6 +131,134 @@ function readSha256(filePath) {
   }
 }
 
+function probeCommand(command, args = [], timeoutMs = 1500) {
+  return new Promise((resolve) => {
+    let settled = false;
+    let child;
+    const finish = (ok) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(Boolean(ok));
+    };
+
+    try {
+      child = spawn(command, args, {
+        windowsHide: true,
+        stdio: 'ignore',
+        env: process.env,
+      });
+    } catch {
+      resolve(false);
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      try { child.kill(); }
+      catch { /* best-effort timeout cleanup */ }
+      finish(false);
+    }, timeoutMs);
+
+    child.on('error', () => finish(false));
+    child.on('close', (code) => finish(code === 0));
+  });
+}
+
+function executableExists(filePath) {
+  try {
+    fs.accessSync(filePath, fs.constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function textFileContains(filePath, expected) {
+  try {
+    return fs.readFileSync(filePath, 'utf8').includes(expected);
+  } catch {
+    return false;
+  }
+}
+
+async function probePlatformInstallation(app) {
+  const home = os.homedir();
+  const workspaceProbe = "from vulcan import docker; raise SystemExit(0 if docker.image_current() else 1)";
+
+  if (process.platform === 'linux') {
+    const runtime = path.join(home, '.vulcan', 'runtime', 'bin', 'vulcan');
+    const python = path.join(home, '.vulcan', 'runtime', 'bin', 'python');
+    const publicCli = path.join(home, '.local', 'bin', 'vulcan');
+    const installedApp = path.join(home, '.local', 'share', 'vulcan', 'app', 'Vulcan.AppImage');
+    const desktopFile = path.join(home, '.local', 'share', 'applications', 'vulcan.desktop');
+    const autostartFile = path.join(home, '.config', 'autostart', 'vulcan.desktop');
+    const iconFile = path.join(home, '.local', 'share', 'icons', 'hicolor', '512x512', 'apps', 'vulcan.png');
+
+    const [runtimeHealthy, dockerHealthy, workspaceHealthy, cliHealthy] = await Promise.all([
+      executableExists(runtime) ? probeCommand(runtime, ['--help']) : Promise.resolve(false),
+      probeCommand('docker', ['info']),
+      executableExists(python)
+        ? probeCommand(python, ['-c', workspaceProbe])
+        : Promise.resolve(false),
+      executableExists(publicCli) ? probeCommand(publicCli, ['--help']) : Promise.resolve(false),
+    ]);
+
+    const integrationHealthy =
+      executableExists(installedApp)
+      && fs.existsSync(iconFile)
+      && textFileContains(desktopFile, installedApp)
+      && textFileContains(autostartFile, installedApp)
+      && cliHealthy;
+
+    return {
+      runtime: runtimeHealthy,
+      docker: dockerHealthy,
+      workspace: dockerHealthy && workspaceHealthy,
+      integration: integrationHealthy,
+    };
+  }
+
+  if (process.platform === 'win32') {
+    const wslBase = ['-d', 'Vulcan', '-u', 'vulcan', '--', 'bash', '-lc'];
+    const [integrationHealthy, runtimeHealthy, dockerHealthy, workspaceHealthy] = await Promise.all([
+      probeCommand('wsl.exe', ['-d', 'Vulcan', '-u', 'vulcan', '--', 'true']),
+      probeCommand('wsl.exe', [...wslBase, '$HOME/.vulcan/runtime/bin/vulcan --help >/dev/null 2>&1']),
+      probeCommand('wsl.exe', [...wslBase, 'docker info >/dev/null 2>&1']),
+      probeCommand('wsl.exe', [...wslBase, `$HOME/.vulcan/runtime/bin/python -c '${workspaceProbe}'`]),
+    ]);
+    return {
+      runtime: runtimeHealthy,
+      docker: dockerHealthy,
+      workspace: dockerHealthy && workspaceHealthy,
+      integration: integrationHealthy,
+    };
+  }
+
+  if (process.platform === 'darwin') {
+    const launchAgent = path.join(home, 'Library', 'LaunchAgents', 'com.vulcan.backend.plist');
+    const colimaBase = ['-p', 'vulcan', 'ssh', '--', 'sh', '-lc'];
+    const [runtimeHealthy, dockerHealthy, workspaceHealthy, colimaHealthy] = await Promise.all([
+      probeCommand('colima', [...colimaBase, '$HOME/.vulcan/runtime/bin/vulcan --help >/dev/null 2>&1']),
+      probeCommand('colima', [...colimaBase, 'docker info >/dev/null 2>&1']),
+      probeCommand('colima', [...colimaBase, `$HOME/.vulcan/runtime/bin/python -c '${workspaceProbe}'`]),
+      probeCommand('colima', ['status', '-p', 'vulcan']),
+    ]);
+    const integrationHealthy =
+      colimaHealthy
+      && textFileContains(launchAgent, 'colima')
+      && textFileContains(launchAgent, 'vulcan');
+
+    return {
+      runtime: runtimeHealthy,
+      docker: dockerHealthy,
+      workspace: dockerHealthy && workspaceHealthy,
+      integration: integrationHealthy,
+    };
+  }
+
+  return { runtime: false, docker: false, workspace: false, integration: false };
+}
+
 async function checkPackagedRuntime({ app, net }) {
   if (!app.isPackaged || process.env.VULCAN_SKIP_REPAIR === '1') {
     return { ok: true, needsRepair: false, skipped: true };
@@ -141,38 +269,63 @@ async function checkPackagedRuntime({ app, net }) {
   }
 
   const packagedHash = readSha256(path.join(process.resourcesPath, 'server-payload.sha256'));
-
-  // Desired-state rule: matching backend payload means there is nothing to
-  // install or repair. Do not gate this on Vulcan service liveness, Etna health,
-  // or the desktop release version.
   const installedLinuxHash = process.platform === 'linux'
     ? readSha256(path.join(os.homedir(), '.vulcan', 'payload', 'server-payload.sha256'))
     : null;
 
-  if (packagedHash && installedLinuxHash === packagedHash) {
-    return { ok: true, needsRepair: false, mode: null, reason: 'payload-current' };
-  }
+  // Run cheap, side-effect-free health probes in parallel. A matching hash is
+  // necessary but never sufficient: the installed system must actually work.
+  const [server, etna, platform] = await Promise.all([
+    probeJson(net, 'http://127.0.0.1:8468/meta'),
+    probeJson(net, 'http://127.0.0.1:8467/health'),
+    probePlatformInstallation(app),
+  ]);
 
-  // WSL/Colima do not expose the guest hash as a host file, so use /meta there.
-  const server = await probeJson(net, 'http://127.0.0.1:8468/meta');
   const serverReady = server?.ok === true;
   const reportedRaw = String(server?.payloadHash || '').toLowerCase();
   const reportedHash = /^[0-9a-f]{64}$/.test(reportedRaw) ? reportedRaw : null;
+  const hashCurrent = Boolean(
+    packagedHash
+    && (installedLinuxHash === packagedHash || reportedHash === packagedHash)
+  );
+  const etnaReady = etna?.service === 'etna-mcp' && etna?.status === 'ok';
 
-  if (packagedHash && reportedHash === packagedHash) {
-    return { ok: true, needsRepair: false, mode: null, reason: 'payload-current' };
+  const checks = {
+    hash: hashCurrent,
+    runtime: platform.runtime,
+    service: serverReady,
+    etna: etnaReady,
+    docker: platform.docker,
+    workspace: platform.workspace,
+    integration: platform.integration,
+  };
+
+  const failed = Object.entries(checks)
+    .filter(([, healthy]) => !healthy)
+    .map(([name]) => name);
+
+  if (failed.length === 0) {
+    return {
+      ok: true,
+      needsRepair: false,
+      mode: null,
+      reason: 'healthy',
+      checks,
+    };
   }
 
   const vulcanHomeExists = fs.existsSync(path.join(os.homedir(), '.vulcan'));
   let mode = 'repair';
-  if (serverReady) mode = 'update';
+  if (serverReady && !hashCurrent) mode = 'update';
   else if (!vulcanHomeExists) mode = 'setup';
 
   return {
     ok: true,
     needsRepair: true,
     mode,
-    reason: serverReady ? 'server-payload' : 'server-unavailable',
+    reason: `unhealthy-${failed[0]}`,
+    checks,
+    failed,
   };
 }
 

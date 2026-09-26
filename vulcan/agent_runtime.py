@@ -1504,18 +1504,33 @@ async def _publish_terminal_completion(run: AgentRun, slot: int, pid: str) -> No
 async def _wait_for_terminal_slot(
     run: AgentRun, slot: int, seconds: float, webhook_url: str | None = None
 ) -> dict[str, Any]:
-    """Wake when the shell becomes idle, a webhook arrives, or the timeout expires."""
+    """Wake when Bash returns to PS1, a webhook arrives, or timeout wins."""
     await asyncio.to_thread(term.ensure_slot_resumed, run.chat["id"], "agent", slot)
     notice = await asyncio.to_thread(term.consume_slot_resume_notice, run.chat["id"], "agent", slot)
     state = await asyncio.to_thread(term.agent_slot_state, run.chat["id"], "agent", slot)
     if state is None:
         return {"error": f"Terminal {slot} is not open."}
     pid = state.get("pid")
-    webhook_pid = term.start_wait(run.chat["id"], seconds, webhook_url) if webhook_url else None
     started = time.monotonic()
     deadline = started + seconds
-    while state["running"] and time.monotonic() < deadline:
-        if webhook_pid:
+    slot_woke = not state["running"]
+    webhook_pid = term.start_wait(run.chat["id"], seconds, webhook_url) if webhook_url else None
+
+    if state["running"] and webhook_pid is None:
+        # PS0 clears TerminalSlot.idle_event and PS1 sets it. This is the shell's
+        # own foreground-work boundary, so slot-only waits can sleep on the
+        # transition instead of polling command bookkeeping every 50 ms.
+        slot_woke = await asyncio.to_thread(
+            term.wait_for_slot_idle, run.chat["id"], "agent", slot, seconds
+        )
+    elif state["running"]:
+        # Webhook + slot is still a first-condition-wins race. The slot side is
+        # sourced from the PS1 idle event; webhook state is checked at the same
+        # short cadence as rc25 used for the combined race.
+        while time.monotonic() < deadline:
+            if await asyncio.to_thread(term.wait_for_slot_idle, run.chat["id"], "agent", slot, 0):
+                slot_woke = True
+                break
             webhook_wait = term.get_wait(webhook_pid)
             if webhook_wait and webhook_wait.finished and webhook_wait.wake_reason == "webhook":
                 return {"result": {
@@ -1525,26 +1540,28 @@ async def _wait_for_terminal_slot(
                     "webhook_path": webhook_wait.webhook_path,
                     "elapsed_seconds": round(time.monotonic() - started, 3),
                 }}
-        await asyncio.sleep(min(0.05, max(0, deadline - time.monotonic())))
-        state = await asyncio.to_thread(term.agent_slot_state, run.chat["id"], "agent", slot)
-        if state is None:
-            if webhook_pid:
-                term.detach_wait(webhook_pid, "terminal closed")
-            return {"error": f"Terminal {slot} closed while waiting."}
+            await asyncio.sleep(min(0.05, max(0, deadline - time.monotonic())))
+
     if webhook_pid:
         term.detach_wait(webhook_pid, "terminal wait condition finished")
+
+    state = await asyncio.to_thread(term.agent_slot_state, run.chat["id"], "agent", slot)
+    if state is None:
+        return {"error": f"Terminal {slot} closed while waiting."}
     process = term.get_command(pid) if pid else None
     output = "".join(process.output).strip() if process is not None else (
         await asyncio.to_thread(term.read_slot_output, run.chat["id"], "agent", slot, 50)
     ).strip()
+    timed_out = not slot_woke and time.monotonic() >= deadline
+    running = False if slot_woke else state["running"]
     result: dict[str, Any] = {
         "slot": slot,
         "output": output,
-        "running": state["running"],
+        "running": running,
         "elapsed_seconds": round(time.monotonic() - started, 3),
-        "wake_reason": "timeout" if state["running"] else "slot",
+        "wake_reason": "slot" if slot_woke else "timeout",
     }
-    if state["running"]:
+    if timed_out or running:
         result["timed_out"] = True
         if state.get("pid"):
             result["pid"] = state["pid"]

@@ -76,6 +76,19 @@ class InteractiveTerminalTests(unittest.TestCase):
         self.assertIn("/tmp:preserved:tty", "".join(second.output))
         self.assertFalse(self.ts.is_busy)
 
+    def test_prompt_idle_event_wakes_when_shell_returns_to_ps1(self):
+        pid = terminal.use_terminal_in_slot(
+            self.chat_id, "agent", self.slot, "sleep 0.15; printf done", None
+        )
+        process = terminal.get_command(pid)
+        started = time.monotonic()
+        self.assertTrue(terminal.wait_for_slot_idle(self.chat_id, "agent", self.slot, 2))
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 1.5)
+        self.assertTrue(self.ts.idle_event.is_set())
+        self.wait_for(lambda: process.finished)
+        self.assertFalse(self.ts.is_busy)
+
     def test_password_prompt_stays_open_and_direct_input_never_enters_output(self):
         command = "read -r -s -p 'Password: ' value; printf '\\naccepted:%s\\n' \"${#value}\""
         pid = terminal.use_terminal_in_slot(self.chat_id, "agent", self.slot, command, 5)
@@ -490,6 +503,7 @@ class TmuxTerminalPersistenceTests(unittest.TestCase):
             self.completed(0),  # new-session
             self.completed(0),  # status off
             self.completed(0),  # prefix None
+            self.completed(0),  # allow-passthrough on
         ])
 
         def run(args, **kwargs):
@@ -506,7 +520,7 @@ class TmuxTerminalPersistenceTests(unittest.TestCase):
                 shell_command="umask 000; exec /bin/bash -i",
             )
 
-        self.assertEqual(len(calls), 4)
+        self.assertEqual(len(calls), 5)
         self.assertIn("has-session", calls[0][0])
         create = calls[1][0]
         self.assertIn("new-session", create)
@@ -515,6 +529,7 @@ class TmuxTerminalPersistenceTests(unittest.TestCase):
         self.assertIn("umask 000; exec /bin/bash -i", create)
         self.assertEqual(calls[2][0][-2:], ["status", "off"])
         self.assertEqual(calls[3][0][-2:], ["prefix", "None"])
+        self.assertEqual(calls[4][0][-2:], ["allow-passthrough", "on"])
 
     def test_existing_tmux_shell_is_only_reattached_not_recreated(self):
         with mock.patch.object(terminal.docker, "terminal_exec_flags", return_value=[]), \
@@ -526,8 +541,11 @@ class TmuxTerminalPersistenceTests(unittest.TestCase):
                 revive_env=[],
                 shell_command="exec /bin/bash -i",
             )
-        run.assert_called_once()
-        self.assertIn("has-session", run.call_args.args[0])
+        self.assertEqual(run.call_count, 4)
+        calls = [call.args[0] for call in run.call_args_list]
+        self.assertIn("has-session", calls[0])
+        self.assertFalse(any("new-session" in call for call in calls))
+        self.assertEqual(calls[-1][-2:], ["allow-passthrough", "on"])
 
     def test_explicit_terminal_retirement_kills_tmux_session(self):
         with mock.patch.object(terminal.docker, "container_running", return_value=True), \

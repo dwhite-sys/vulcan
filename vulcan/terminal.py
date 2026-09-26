@@ -107,6 +107,7 @@ class TerminalSlot:
     rows: int                       = 24
     resume_notice: str              = ''        # one-shot agent-visible revival notice
     generation: str                 = field(default_factory=lambda: uuid.uuid4().hex)
+    idle_event: threading.Event      = field(default_factory=threading.Event, repr=False)
 
     @property
     def is_busy(self) -> bool:
@@ -493,6 +494,17 @@ def slot_state(chat_id: str, kind: SlotKind, slot: int) -> dict | None:
         }
 
 
+def wait_for_slot_idle(chat_id: str, kind: SlotKind, slot: int, timeout: float) -> bool:
+    """Block until Bash returns to PS1 for this slot, or the timeout expires."""
+    with _slots_lock:
+        ts = _slots.get(_slot_key(chat_id, kind, slot))
+    if ts is None or ts.finished:
+        return False
+    if not ts.is_busy:
+        return True
+    return ts.idle_event.wait(max(0.0, float(timeout)))
+
+
 def agent_slot_state(chat_id: str, kind: SlotKind, slot: int) -> dict | None:
     """Return the logical state exposed to agent tools across persisted revivals.
 
@@ -595,8 +607,10 @@ if [ -n "${{PROMPT_COMMAND-}}" ]; then
 else
   PROMPT_COMMAND="__vulcan_persist_terminal_state"
 fi
-PS0=$'\033]777;vulcan-terminal;busy\007'"${{PS0-}}"
-PS1=$'\033]777;vulcan-terminal;idle\007'"{prompt_identity}:\w\$ "
+# tmux is the durable shell transport. Wrap Vulcan's private OSC markers in
+# tmux DCS passthrough so the outer PTY collector receives the original OSC.
+PS0=$'\033Ptmux;\033\033]777;vulcan-terminal;busy\007\033\\'"${{PS0-}}"
+PS1=$'\033Ptmux;\033\033]777;vulcan-terminal;idle\007\033\\'"{prompt_identity}:\w\$ "
 export PS0 PS1
 """
     try:
@@ -661,10 +675,12 @@ def _strip_activity_markers(ts: TerminalSlot, chunk: str) -> str:
 
             if marker == _ACTIVITY_BUSY_MARKER:
                 ts.prompt_busy = True
+                ts.idle_event.clear()
                 if ts.active_command is not None:
                     ts.capture_active = True
             else:
                 ts.prompt_busy = False
+                ts.idle_event.set()
                 command = ts.active_command
                 if command is not None and ts.capture_active:
                     # Ctrl-C can return to the prompt before the completion
@@ -742,16 +758,25 @@ def _ensure_tmux_session(
         if created.returncode != 0:
             detail = (getattr(created, "stderr", "") or getattr(created, "stdout", "") or "").strip()
             raise RuntimeError(f"Could not create persistent terminal {slot}: {detail or 'tmux failed'}")
-        # tmux is transport here, not a user-facing multiplexer. Disable its UI
-        # and key prefix so every keystroke belongs to the shell/application.
-        docker.run_docker(
-            [*base, container, "tmux", "set-option", "-t", name, "status", "off"],
-            capture_output=True, text=True,
-        )
-        docker.run_docker(
-            [*base, container, "tmux", "set-option", "-g", "prefix", "None"],
-            capture_output=True, text=True,
-        )
+    # tmux is transport here, not a user-facing multiplexer. Apply these to
+    # both newly-created and already-existing sessions so an application update
+    # does not depend on recreating the durable shell.
+    docker.run_docker(
+        [*base, container, "tmux", "set-option", "-t", name, "status", "off"],
+        capture_output=True, text=True,
+    )
+    docker.run_docker(
+        [*base, container, "tmux", "set-option", "-g", "prefix", "None"],
+        capture_output=True, text=True,
+    )
+    # Vulcan's PS0/PS1 and command-completion OSC markers are private transport
+    # signals. tmux filters unknown escapes unless they are explicitly passed
+    # through, so allow our wrapped markers to reach the outer PTY collector.
+    docker.run_docker(
+        [*base, container, "tmux", "set-option", "-p", "-t", f"{name}:0.0",
+         "allow-passthrough", "on"],
+        capture_output=True, text=True,
+    )
 
 
 def _kill_slot_tmux_session(chat_id: str, kind: SlotKind, slot: int) -> None:
@@ -1557,9 +1582,13 @@ def use_terminal_in_slot(chat_id: str, kind: SlotKind, slot: int,
     ts.last_command_pid = pid
     ts.has_running = True
     ts.capture_active = not ts.shell_integration
+    # Clear the prompt-idle signal before handing work to the shell. PS0 will
+    # clear it again when bash actually begins execution; PS1 sets it when bash
+    # regains control. This closes the tiny dispatch-before-PS0 race.
+    ts.idle_event.clear()
     wrapped = (
         "{\n" + cmd.rstrip('\n') + "\n}; __vulcan_command_status=$?; "
-        + f"printf '\\033]777;vulcan-command;{pid};%s\\007' \"$__vulcan_command_status\"; "
+        + f"printf '\\033Ptmux;\\033\\033]777;vulcan-command;{pid};%s\\007\\033\\\\' \"$__vulcan_command_status\"; "
         + "unset __vulcan_command_status\n"
     )
     try:

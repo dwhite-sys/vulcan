@@ -13,7 +13,7 @@ from typing import Optional
 from vulcan import config as cfg
 
 IMAGE_NAME = "vulcan-workspace:latest"
-WORKSPACE_IMAGE_VERSION = "6"
+WORKSPACE_IMAGE_VERSION = "7"
 LEGACY_GLOBAL_CONTAINER = "vulcan-global"
 
 
@@ -111,6 +111,7 @@ def prepare_workspace_identity(chat_id: str) -> bool:
         'packages="sudo curl iputils-ping ca-certificates git openssh-client wget unzip zip tar gzip bzip2 xz-utils zstd jq ripgrep fd-find fzf less file procps psmisc iproute2 dnsutils netcat-openbsd lsof rsync build-essential pkg-config python3 python3-pip python3-venv sqlite3 tree nano tmux"; '
         'missing=""; for pkg in $packages; do dpkg -s "$pkg" >/dev/null 2>&1 || missing="$missing $pkg"; done; '
         'if [ -n "$missing" ]; then apt-get update && apt-get install -y $missing && rm -rf /var/lib/apt/lists/*; fi; '
+        'rm -f /usr/lib/python3*/EXTERNALLY-MANAGED; '
         'if command -v fdfind >/dev/null 2>&1 && [ ! -e /usr/local/bin/fd ]; then ln -s /usr/bin/fdfind /usr/local/bin/fd; fi; '
         'if ! getent group "$gid" >/dev/null 2>&1; then groupadd -g "$gid" vulcan-host-group; fi; '
         'account="$(getent passwd "$uid" | cut -d: -f1)"; '
@@ -132,7 +133,7 @@ def prepare_workspace_identity(chat_id: str) -> bool:
 DOCKERFILE = """\
 FROM ubuntu:24.04
 
-LABEL vulcan.workspace.version="6"
+LABEL vulcan.workspace.version="7"
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y \\
@@ -172,6 +173,7 @@ RUN apt-get update && apt-get install -y \\
     pkg-config \\
     sqlite3 \\
     nano \\
+    && rm -f /usr/lib/python3*/EXTERNALLY-MANAGED \\
     && rm -rf /var/lib/apt/lists/*
 
 RUN ln -sf /usr/bin/fdfind /usr/local/bin/fd

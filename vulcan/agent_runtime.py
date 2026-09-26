@@ -290,7 +290,7 @@ def build_prompt(chat: dict[str, Any], settings: dict[str, Any], kits: list[dict
         "You think before acting, work incrementally, and talk like a person. When someone says hello, you respond naturally; "
         "you don't inventory your capabilities unless asked.\n\n"
         f"Your workspace is an Ubuntu 24.04 Docker container. Working directory is {workdir} — persistent, git-backed, recoverable. "
-        "Python packages through `uv pip install` or `uv add`. Full internet access. Networking uses the host network, "
+        "Python packages through `pip install`, `uv pip install`, or `uv add`. Full internet access. Networking uses the host network, "
         f"including host-accessible private VPNs{terminal_guidance}\n\n"
         f"Vulcan skills (read directly with read_skill when relevant):\n{skill_context}\n\n"
         "Etna skills are dynamic. Use list_skills or search_skills to discover standalone and kit-paired Etna skills; "
@@ -1504,50 +1504,33 @@ async def _publish_terminal_completion(run: AgentRun, slot: int, pid: str) -> No
 async def _wait_for_terminal_slot(
     run: AgentRun, slot: int, seconds: float, webhook_url: str | None = None
 ) -> dict[str, Any]:
-    """Wake on the slot command's shell-completion marker, a webhook, or timeout."""
+    """Wake when the shell becomes idle, a webhook arrives, or the timeout expires."""
     await asyncio.to_thread(term.ensure_slot_resumed, run.chat["id"], "agent", slot)
     notice = await asyncio.to_thread(term.consume_slot_resume_notice, run.chat["id"], "agent", slot)
     state = await asyncio.to_thread(term.agent_slot_state, run.chat["id"], "agent", slot)
     if state is None:
         return {"error": f"Terminal {slot} is not open."}
-
     pid = state.get("pid")
-    process = term.get_command(pid) if pid else None
-    completion_event = getattr(process, "completion_event", None)
     webhook_pid = term.start_wait(run.chat["id"], seconds, webhook_url) if webhook_url else None
     started = time.monotonic()
     deadline = started + seconds
-
-    if state["running"] and completion_event is not None and webhook_pid is None:
-        # use_terminal wraps each command with an OSC 777 completion marker.
-        # The PTY parser sets this event only after it consumes the matching
-        # marker, so a slot-only wait can sleep until the command actually
-        # returns instead of polling agent_slot_state every 50 ms.
-        await asyncio.to_thread(completion_event.wait, seconds)
+    while state["running"] and time.monotonic() < deadline:
+        if webhook_pid:
+            webhook_wait = term.get_wait(webhook_pid)
+            if webhook_wait and webhook_wait.finished and webhook_wait.wake_reason == "webhook":
+                return {"result": {
+                    "ok": True,
+                    "wake_reason": "webhook",
+                    "webhook_method": webhook_wait.webhook_method,
+                    "webhook_path": webhook_wait.webhook_path,
+                    "elapsed_seconds": round(time.monotonic() - started, 3),
+                }}
+        await asyncio.sleep(min(0.05, max(0, deadline - time.monotonic())))
         state = await asyncio.to_thread(term.agent_slot_state, run.chat["id"], "agent", slot)
         if state is None:
-            return {"error": f"Terminal {slot} closed while waiting."}
-    else:
-        # Webhook + slot waits still have two independent wake sources. Keep
-        # their existing race loop; ordinary slot waits use the event above.
-        while state["running"] and time.monotonic() < deadline:
             if webhook_pid:
-                webhook_wait = term.get_wait(webhook_pid)
-                if webhook_wait and webhook_wait.finished and webhook_wait.wake_reason == "webhook":
-                    return {"result": {
-                        "ok": True,
-                        "wake_reason": "webhook",
-                        "webhook_method": webhook_wait.webhook_method,
-                        "webhook_path": webhook_wait.webhook_path,
-                        "elapsed_seconds": round(time.monotonic() - started, 3),
-                    }}
-            await asyncio.sleep(min(0.05, max(0, deadline - time.monotonic())))
-            state = await asyncio.to_thread(term.agent_slot_state, run.chat["id"], "agent", slot)
-            if state is None:
-                if webhook_pid:
-                    term.detach_wait(webhook_pid, "terminal closed")
-                return {"error": f"Terminal {slot} closed while waiting."}
-
+                term.detach_wait(webhook_pid, "terminal closed")
+            return {"error": f"Terminal {slot} closed while waiting."}
     if webhook_pid:
         term.detach_wait(webhook_pid, "terminal wait condition finished")
     process = term.get_command(pid) if pid else None
@@ -1570,6 +1553,7 @@ async def _wait_for_terminal_slot(
     if notice:
         result["notice"] = notice
     return {"result": result}
+
 
 def _safe_path_fragment(value: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_-]+", "-", value).strip("-")[:48] or "shot"

@@ -625,7 +625,9 @@ class GeneralWSSession:
         })
 
     async def _runs_cancel(self, req_id: str, p: dict):
-        stopped = agent_runtime.MANAGER.cancel(p["chat_id"])
+        # Stop is authoritative: acknowledge only after the cancelled run has
+        # checkpointed/finalized and released ownership of the chat.
+        stopped = await agent_runtime.MANAGER.cancel_and_wait(p["chat_id"])
         await self.respond(req_id, "runs/cancel", {"ok": stopped})
 
     async def _runs_subscribe(self, req_id: str, p: dict):

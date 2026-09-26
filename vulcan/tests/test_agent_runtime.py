@@ -2137,8 +2137,13 @@ class BackgroundAgentTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.01)
             with self.assertRaisesRegex(ValueError, "already active"):
                 manager.start(chat("cancel"), options())
-            self.assertTrue(manager.cancel("cancel"))
-            await asyncio.wait_for(run.task, timeout=2)
+            self.assertTrue(await manager.cancel_and_wait("cancel"))
+            self.assertTrue(run.task.done())
+            self.assertNotIn("cancel", manager.runs)
+            # Once Stop has been acknowledged, this chat must be immediately reusable.
+            replacement = manager.start(chat("cancel"), options())
+            manager.cancel("cancel")
+            await asyncio.wait_for(replacement.task, timeout=2)
         self.assertEqual(run.status, "interrupted")
         thought = next(event for event in chats.load_chat("cancel")["events"] if event["type"] == "reasoning")
         self.assertEqual(thought["content"], "In progress")

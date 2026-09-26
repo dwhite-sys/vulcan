@@ -876,10 +876,23 @@ class RunManager:
         })
 
     def cancel(self, chat_id: str) -> bool:
+        # Request cancellation without waiting for run finalization.
         run = self.runs.get(chat_id)
         if not run or not run.task or run.task.done():
             return False
         run.task.cancel()
+        return True
+
+    async def cancel_and_wait(self, chat_id: str) -> bool:
+        # Cancel a run and return only after the chat is free for another run.
+        run = self.runs.get(chat_id)
+        if not run or not run.task or run.task.done():
+            return False
+        run.task.cancel()
+        try:
+            await run.task
+        except asyncio.CancelledError:
+            pass
         return True
 
     def answer(self, chat_id: str, batch_id: str, answers: dict[str, Any]):
@@ -916,6 +929,10 @@ class RunManager:
             await run.flush_checkpoint()
             await run.checkpoint(publish_full=True)
             self.publish(run.chat["id"], "push/run-status", {"chat_id": run.chat["id"], "status": run.status, "run_id": run.run_id})
+            # Terminal runs must release ownership of the chat. In particular,
+            # once cancel_and_wait returns, a replacement run can start immediately.
+            if self.runs.get(run.chat["id"]) is run:
+                self.runs.pop(run.chat["id"], None)
 
 
 MANAGER = RunManager()

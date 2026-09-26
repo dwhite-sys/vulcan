@@ -395,14 +395,19 @@ export default function App() {
   const abortControllerRef = useRef<AbortController | null>(null);
 
   const handleStop = () => {
-    // Stop is optimistic in the UI; the server remains authoritative and will
-    // shortly publish the canonical interrupted checkpoint.
     abortControllerRef.current?.abort();
-    setProcessing(false);
-    if (activeChatIdRef.current) {
-      void vulcan.generalWS.send('runs/cancel', { chat_id: activeChatIdRef.current })
-        .catch((error) => console.warn('Could not stop server-owned run:', error));
+    const chatId = activeChatIdRef.current;
+    if (!chatId) {
+      setProcessing(false);
+      return;
     }
+    // Keep the composer locked until the server confirms that cancellation,
+    // checkpoint/finalization, and chat ownership release are complete.
+    void vulcan.generalWS.send('runs/cancel', { chat_id: chatId })
+      .then(() => {
+        if (activeChatIdRef.current === chatId) setProcessing(false);
+      })
+      .catch((error) => console.warn('Could not stop server-owned run:', error));
   };
 
   // Keep sidebar terminal activity indicators in sync for every chat, including

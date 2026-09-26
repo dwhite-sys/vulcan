@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode, type RefObject } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
-import { Bot, ChevronDown, ChevronRight, FileCode, LayoutDashboard, Monitor, RotateCcw } from 'lucide-react';
+import { Bot, ChevronDown, ChevronRight, CircleHelp, FileCode, LayoutDashboard, Monitor, RotateCcw } from 'lucide-react';
 import { MarkdownRenderer } from './MarkdownRenderer';
 import { ChatMessage, ThinkingStep, ToolStep } from './ChatMessage';
 import { RenderToUser, RenderPreview, type RenderType } from './RenderToUser';
@@ -104,6 +104,43 @@ function ActionGroup({ events, isProcessing, activeSearchEventId }: { events: (R
   );
 }
 
+function AskUserCard({ event }: { event: ToolEvent }) {
+  const question = String(event.arguments?.question ?? 'Question');
+  const options = Array.isArray(event.arguments?.options)
+    ? event.arguments.options.slice(0, 5).map((value: unknown) => String(value))
+    : [];
+  const payload = event.result?.result ?? event.result;
+  const result = payload && typeof payload === 'object' ? payload as Record<string, unknown> : null;
+  const status = result?.status;
+  const answer = result?.answer;
+  const hasAnswer = status === 'skipped' || (answer !== undefined && answer !== null && String(answer).length > 0);
+
+  return (
+    <div className="my-2 rounded-lg border border-ash-700/60 bg-ash-900/35 px-3 py-2.5">
+      <div className="grid grid-cols-[18px_minmax(0,1fr)] gap-2">
+        <CircleHelp className="mt-0.5 h-3.5 w-3.5 text-coral-400" />
+        <div className="min-w-0">
+          <div className="text-xs font-medium leading-5 text-ash-300">{question}</div>
+          {hasAnswer ? (
+            <div className={`text-xs leading-5 ${status === 'skipped' ? 'italic text-ash-600' : 'text-ash-400'}`}>
+              {status === 'skipped' ? 'Skipped' : String(answer)}
+            </div>
+          ) : options.length > 0 ? (
+            <div className="mt-1 space-y-1">
+              {options.map((option, optionIndex) => (
+                <div key={optionIndex} className="flex items-start gap-2 text-xs leading-5 text-ash-400">
+                  <span className="w-4 shrink-0 text-right text-ash-600">{optionIndex + 1}.</span>
+                  <span className="min-w-0 whitespace-normal break-words">{option}</span>
+                </div>
+              ))}
+            </div>
+          ) : null}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function PresentedFileCard({ event, chatId }: { event: Extract<ChatEvent, { type: 'presented_file' }>; chatId?: string }) {
   const pf = event.file;
   return (
@@ -188,6 +225,11 @@ function AssistantRun({ events, chatId, onRetry, isProcessing, quotes, contextOr
           type={(event.arguments?.type ?? 'svg') as RenderType}
         />
       );
+      continue;
+    }
+    if (event.type === 'tool' && event.tool === 'ask_user') {
+      flushActions();
+      renderNodes.push(<AskUserCard key={`ask-user-${event.id}`} event={event} />);
       continue;
     }
     if (event.type === 'reasoning' || event.type === 'tool') {

@@ -5,7 +5,8 @@ import { MarkdownRenderer } from './MarkdownRenderer';
 import { ChatMessage, ThinkingStep, ToolStep } from './ChatMessage';
 import { RenderToUser, RenderPreview, type RenderType } from './RenderToUser';
 import { QuoteSource } from './QuoteSource';
-import type { ChatEvent, Kit, Message, MessageQuote, ReasoningEvent, ToolEvent } from '../types/vulcan';
+import { QuestionToolPanel } from './QuestionToolPanel';
+import type { ChatEvent, Kit, Message, MessageQuote, ReasoningEvent, ToolEvent, UserQuestionAnswer, UserQuestionBatch } from '../types/vulcan';
 import { buildTranscriptBlocks, type TranscriptAssistantEvent } from '../services/transcript';
 import { isIsolatedMarkdownFence } from '../services/markdownDefense';
 import type { TranscriptSearchMatch } from '../services/transcriptSearch';
@@ -25,6 +26,8 @@ interface TranscriptRendererProps {
   scrollElementRef: RefObject<HTMLDivElement | null>;
   searchQuery?: string;
   activeSearchMatch?: TranscriptSearchMatch;
+  questionBatch?: UserQuestionBatch | null;
+  onResolveQuestionBatch?: (answers: Record<string, UserQuestionAnswer>) => void;
 }
 
 function toLegacyMessage(event: Extract<ChatEvent, { type: 'user_message' | 'system_message' }>): Message {
@@ -104,6 +107,11 @@ function ActionGroup({ events, isProcessing, activeSearchEventId }: { events: (R
   );
 }
 
+// Reserved for the future tool-visualization/history pass. Live `ask_user`
+/* interactions intentionally do NOT render through this card: the canonical
+ * interactive surface is QuestionToolPanel, routed from the active question
+ * batch below. Keep this component until historical tool calls get dedicated UI.
+ */
 function AskUserCard({ event }: { event: ToolEvent }) {
   const question = String(event.arguments?.question ?? 'Question');
   const options = Array.isArray(event.arguments?.options)
@@ -184,7 +192,7 @@ function DesignCard({ event }: { event: ToolEvent }) {
   );
 }
 
-function AssistantRun({ events, chatId, onRetry, isProcessing, quotes, contextOrder, activeSearchEventId }: {
+function AssistantRun({ events, chatId, onRetry, isProcessing, quotes, contextOrder, activeSearchEventId, questionBatch, onResolveQuestionBatch }: {
   events: TranscriptAssistantEvent[];
   chatId?: string;
   onRetry?: () => void;
@@ -192,8 +200,14 @@ function AssistantRun({ events, chatId, onRetry, isProcessing, quotes, contextOr
   quotes?: MessageQuote[];
   contextOrder?: string[];
   activeSearchEventId?: string;
+  questionBatch?: UserQuestionBatch | null;
+  onResolveQuestionBatch?: (answers: Record<string, UserQuestionAnswer>) => void;
 }) {
   const renderNodes: ReactNode[] = [];
+  const activeQuestionCallIds = new Set(questionBatch?.questions.map((question) => question.toolCallId) ?? []);
+  const firstActiveQuestionCallId = events.find(
+    (event) => event.type === 'tool' && event.tool === 'ask_user' && activeQuestionCallIds.has(event.callId),
+  )?.callId;
   const attachmentNodes = new Map<string, ReactNode>();
   let actionBuffer: (ReasoningEvent | ToolEvent)[] = [];
   const flushActions = () => {
@@ -227,9 +241,25 @@ function AssistantRun({ events, chatId, onRetry, isProcessing, quotes, contextOr
       );
       continue;
     }
-    if (event.type === 'tool' && event.tool === 'ask_user') {
+    if (
+      event.type === 'tool'
+      && event.tool === 'ask_user'
+      && questionBatch
+      && onResolveQuestionBatch
+      && activeQuestionCallIds.has(event.callId)
+    ) {
       flushActions();
-      renderNodes.push(<AskUserCard key={`ask-user-${event.id}`} event={event} />);
+      if (event.callId === firstActiveQuestionCallId) {
+        renderNodes.push(
+          <QuestionToolPanel
+            key={`ask-user-live-${questionBatch.id}`}
+            batch={questionBatch}
+            onResolve={onResolveQuestionBatch}
+          />,
+        );
+      }
+      // One live question batch can contain multiple ask_user tool calls. The
+      // panel owns the whole batch, so suppress the sibling raw tool rows.
       continue;
     }
     if (event.type === 'reasoning' || event.type === 'tool') {
@@ -433,6 +463,8 @@ export function TranscriptRenderer(props: TranscriptRendererProps) {
                 quotes={props.quotes}
                 contextOrder={props.contextOrder}
                 activeSearchEventId={props.activeSearchMatch?.eventId}
+                questionBatch={props.questionBatch}
+                onResolveQuestionBatch={props.onResolveQuestionBatch}
               />
             )}
           </div>

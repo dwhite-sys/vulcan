@@ -59,6 +59,16 @@ const preload = read(path.join(appRoot, 'electron', 'preload.cjs'));
 assert.match(preload, /desktop:\s*\{/);
 assert.match(preload, /onOpenChat/);
 
+const transcriptRenderer = read(path.join(appRoot, 'src', 'app', 'components', 'TranscriptRenderer.tsx'));
+const questionToolPanel = read(path.join(appRoot, 'src', 'app', 'components', 'QuestionToolPanel.tsx'));
+assert.match(transcriptRenderer, /<QuestionToolPanel/);
+assert.match(transcriptRenderer, /activeQuestionCallIds\.has\(event\.callId\)/);
+assert.doesNotMatch(transcriptRenderer, /<AskUserCard/);
+assert.match(transcriptRenderer, /Reserved for the future tool-visualization\/history pass/);
+assert.match(questionToolPanel, /onResolve\(next\)/);
+assert.match(questionToolPanel, /Something else\.\.\./);
+assert.match(questionToolPanel, /status: 'skipped'/);
+
 const coordinator = read(path.join(appRoot, 'electron', 'installCoordinator.cjs'));
 const setupWindow = read(path.join(appRoot, 'electron', 'setupWindow.cjs'));
 const setupPreload = read(path.join(appRoot, 'electron', 'setupPreload.cjs'));

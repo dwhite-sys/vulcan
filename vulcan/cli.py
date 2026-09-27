@@ -330,14 +330,14 @@ def cmd_start(args):
     if args.verbose:
         proc = subprocess.Popen(
             [sys.executable, "-m", "uvicorn", "vulcan.server:app",
-             "--host", "0.0.0.0", "--port", str(port)],
+             "--host", "0.0.0.0", "--port", str(port), *_UVICORN_WS_ARGS],
             env=env,
         )
     else:
         proc = subprocess.Popen(
             [sys.executable, "-m", "uvicorn", "vulcan.server:app",
              "--host", "0.0.0.0", "--port", str(port),
-             "--log-level", "error"],
+             "--log-level", "error", *_UVICORN_WS_ARGS],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             env=env,
@@ -362,6 +362,17 @@ def cmd_start(args):
 
 
 
+# uvicorn closes any WebSocket whose single inbound frame exceeds 16 MiB
+# (close 1009). One encrypted General-WS frame carries one application
+# message, so a chat of ~12 MB (images, large tool output) made every full
+# chat upload drop the whole connection and every in-flight request with it.
+# Renderers now avoid most large uploads (runs/start by reference); this
+# keeps the remaining legitimate ones (full-chat fallback, chats/upsert)
+# from tearing the control connection down. Bounded, since frames are read
+# before authentication.
+_UVICORN_WS_ARGS = ("--ws-max-size", str(256 * 1024 * 1024))
+
+
 def cmd_serve(args):
     """Run the Vulcan server in the foreground for systemd/launch supervision."""
     config = cfg.load()
@@ -372,6 +383,7 @@ def cmd_serve(args):
         sys.executable, "-m", "uvicorn", "vulcan.server:app",
         "--host", "0.0.0.0", "--port", str(port),
         "--log-level", "info" if getattr(args, "verbose", False) else "error",
+        *_UVICORN_WS_ARGS,
     ]
     os.execve(sys.executable, argv, env)
 

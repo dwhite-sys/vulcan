@@ -724,7 +724,7 @@ class GeneralWSSession:
             snapshot = run.subscription_snapshot() if include_chat else {"chat": None, "seqs": dict(run.stream_seq)}
             chat, seqs = snapshot["chat"], snapshot["seqs"]
         elif include_chat:
-            chat = await asyncio.to_thread(chat_store.load_chat, chat_id)
+            chat = await chat_store.run_db(chat_store.load_chat, chat_id, branch_refs=bool(p.get("branch_refs")))
             # A run may have started while the transcript was loading.
             run = agent_runtime.MANAGER.runs.get(chat_id)
             if run is not None:
@@ -756,7 +756,7 @@ class GeneralWSSession:
         # r14 clients request a sidebar-only projection and hydrate one chat on
         # selection.  Keep the old full-list contract for older renderers.
         loader = chat_store.load_chat_summaries if p.get("summary_only") else chat_store.load_all_chats
-        chat_list = await asyncio.to_thread(loader)
+        chat_list = await chat_store.run_db(loader)
         await self.respond(req_id, "chats/list", {"chats": chat_list})
 
     async def _chats_topics(self, req_id: str, p: dict):
@@ -765,26 +765,26 @@ class GeneralWSSession:
         if isinstance(since, int) and since == version:
             await self.respond(req_id, "chats/topics", {"unchanged": True, "version": version})
             return
-        tags = await asyncio.to_thread(chat_store.topic_tags)
+        tags = await chat_store.run_db(chat_store.topic_tags)
         await self.respond(req_id, "chats/topics", {"tags": tags, "version": version})
 
     async def _chats_search(self, req_id: str, p: dict):
         # Universal message search is intentionally one direct FTS path. Title,
         # auto-tag and folder matching already happen from sidebar metadata on the
         # client, so do not run a second SQLite search or merge two result sets.
-        result = await asyncio.to_thread(
+        result = await chat_store.run_db(
             chat_store.search_current_transcripts, str(p.get("query", ""))
         )
         await self.respond(req_id, "chats/search", result)
 
     async def _chats_branch_search(self, req_id: str, p: dict):
-        result = await asyncio.to_thread(
+        result = await chat_store.run_db(
             chat_store.search_branches, str(p.get("chat_id", "")), str(p.get("query", ""))
         )
         await self.respond(req_id, "chats/branch-search", result)
 
     async def _chats_get(self, req_id: str, p: dict):
-        chat = await asyncio.to_thread(chat_store.load_chat, p["chat_id"])
+        chat = await chat_store.run_db(chat_store.load_chat, p["chat_id"], branch_refs=bool(p.get("branch_refs")))
         if chat is None:
             await self.error(req_id, "Chat not found")
         else:
@@ -797,7 +797,7 @@ class GeneralWSSession:
             active.materialize_all()
             chat = active.chat
         else:
-            chat = await asyncio.to_thread(chat_store.load_chat, chat_id)
+            chat = await chat_store.run_db(chat_store.load_chat, chat_id)
         if chat is None:
             await self.error(req_id, "Chat not found")
             return
@@ -811,18 +811,24 @@ class GeneralWSSession:
         active = agent_runtime.MANAGER.runs.get(chat["id"])
         if active and active.task and not active.task.done():
             # Legacy renderer metadata saves must never replace the event stream
-            # currently being authored by the server-owned background task.
+            # currently being authored by the server-owned background task. A
+            # summary-only sidebar projection cannot replace topology either.
+            excluded = {"events", "updatedAt", "tags", "_summaryOnly"}
+            if chat.get("_summaryOnly"):
+                excluded.add("branching")
             for key, value in chat.items():
-                if key not in ("events", "updatedAt", "tags"):
+                if key not in excluded:
                     active.chat[key] = value
             await active.checkpoint()
             await self.respond(req_id, "chats/upsert", {"ok": True})
             return
-        await asyncio.to_thread(chat_store.save_chat, chat)
+        # save_chat writes only changed rows and treats a summary-only
+        # projection as a metadata update (it can never truncate a transcript).
+        await chat_store.run_db(chat_store.save_chat, chat)
         await self.respond(req_id, "chats/upsert", {"ok": True})
 
     async def _chats_delete(self, req_id: str, p: dict):
-        deleted = await asyncio.to_thread(chat_store.delete_chat, p["chat_id"])
+        deleted = await chat_store.run_db(chat_store.delete_chat, p["chat_id"])
         if not deleted:
             await self.error(req_id, "Chat not found")
         else:

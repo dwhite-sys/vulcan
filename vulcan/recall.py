@@ -161,7 +161,7 @@ def lexical_search(query: str, groups: list[list[str]] | None, limit: int,
     scope_sql, scope_arguments = _scope_filter(scope, current_chat_id)
     sql = f"""
         SELECT s.chat_id, s.event_id, s.role, s.content,
-               json_extract(c.metadata_json, '$.title') AS title,
+               COALESCE(json_extract(c.summary_json, '$.title'), json_extract(c.metadata_json, '$.title')) AS title,
                e.timestamp AS timestamp,
                bm25(chat_search) AS rank
           FROM chat_search AS s
@@ -412,7 +412,7 @@ def semantic_search(query: str, limit: int, current_chat_id: str | None, scope: 
     with chats._DB_LOCK, chats._database() as source:
         records = source.execute(f"""
             SELECT s.chat_id, s.event_id, s.role, s.content,
-                   json_extract(c.metadata_json, '$.title') AS title, e.timestamp AS timestamp
+                   COALESCE(json_extract(c.summary_json, '$.title'), json_extract(c.metadata_json, '$.title')) AS title, e.timestamp AS timestamp
               FROM chat_search AS s
               JOIN chats AS c ON c.id = s.chat_id
               JOIN chat_events AS e ON e.chat_id = s.chat_id AND e.event_id = s.event_id

@@ -45,7 +45,7 @@ def _records(chat_id: str | None = None) -> list[dict]:
             for row in source.execute(f"""
                 WITH recent AS (
                     SELECT e.chat_id,e.event_id,e.position,c.updated_at,
-                           json_extract(c.metadata_json, '$.title') AS title,
+                           COALESCE(json_extract(c.summary_json, '$.title'), json_extract(c.metadata_json, '$.title')) AS title,
                            ROW_NUMBER() OVER (
                                PARTITION BY e.chat_id ORDER BY e.position DESC
                            ) AS in_chat

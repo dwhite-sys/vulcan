@@ -688,6 +688,13 @@ class AgentRun:
     live_events: dict[str, dict[str, Any]] = field(default_factory=dict)
     flush_handle: Any = None
     last_flush: float = 0
+    # Incremental persistence state: events before persist_base belong to the
+    # already-persisted history; persisted_json caches the last stored payload
+    # of each tail event; dirty_ids marks tail events touched since then.
+    persist_base: int = 0
+    persisted_json: dict[str, str] = field(default_factory=dict)
+    dirty_ids: set[str] = field(default_factory=set)
+    persisted_branching: Any = field(default=None)
 
     @property
     def events(self) -> list[dict[str, Any]]:
@@ -766,6 +773,7 @@ class AgentRun:
                 stream.pending_set = {}
             seq = self.stream_seq.get(event_id, 0) + 1
             self.stream_seq[event_id] = seq
+            self.dirty_ids.add(event_id)
             payload["seq"] = seq
             self.manager.publish_delta(self, event_id, payload)
 
@@ -836,6 +844,7 @@ class AgentRun:
         if event_id in self.streams:
             self.flush_deltas()
             self.materialize(event_id)
+        self.dirty_ids.add(event_id)
         self.manager.publish(self.chat["id"], "push/run-event", {
             "chat_id": self.chat["id"], "run_id": self.run_id,
             "event": event, "seq": self.stream_seq.get(event_id, 0),
@@ -847,17 +856,62 @@ class AgentRun:
         self.materialize_all()
         return {"chat": self.chat, "seqs": dict(self.stream_seq)}
 
+    def _build_checkpoint(self, *, full_compare: bool) -> tuple["chats.RunCheckpoint", dict[str, str], set[str]]:
+        """Build a small immutable mutation on the loop (no chat deepcopy).
+
+        History before ``persist_base`` is never rewritten by a run. In the
+        run's own tail only new or touched events are serialized, and only
+        payloads that differ from what was last persisted are sent. The final
+        checkpoint compares the whole tail as a safety net.
+        """
+        events = self.events
+        base = min(self.persist_base, len(events))
+        path_ids = tuple(str(event.get("id", "")) for event in events)
+        changed: list[tuple[int, str]] = []
+        written: dict[str, str] = {}
+        for position in range(base, len(events)):
+            event_id = path_ids[position]
+            if not full_compare and event_id in self.persisted_json and event_id not in self.dirty_ids:
+                continue
+            payload = json.dumps(events[position], default=str)
+            if self.persisted_json.get(event_id) != payload:
+                changed.append((position, payload))
+                written[event_id] = payload
+        metadata = {key: value for key, value in self.chat.items() if key not in ("events", "tags", "branching")}
+        branching = self.chat.get("branching")
+        replaced = branching is not self.persisted_branching
+        checkpoint = chats.RunCheckpoint(
+            chat_id=self.chat["id"],
+            metadata_json=json.dumps(metadata, default=str),
+            branching=branching,
+            branching_replaced=replaced,
+            has_branching="branching" in self.chat,
+            created_at=self.chat.get("createdAt"),
+            updated_at=self.chat.get("updatedAt"),
+            base=base,
+            path_ids=path_ids,
+            changed=tuple(changed),
+            prefix_events=tuple(events[:base]),
+        )
+        dirty, self.dirty_ids = self.dirty_ids, set()
+        return checkpoint, written, dirty
+
     async def checkpoint(self, *, publish_full: bool = False):
         self.materialize_all()
         self.chat["updatedAt"] = now()
-        # Snapshot before leaving the event loop: persistence must never serialize
-        # a dict that is concurrently being mutated by provider streaming.
-        snapshot = copy.deepcopy(self.chat)
+        checkpoint, written, dirty = self._build_checkpoint(full_compare=publish_full)
+        branching = self.chat.get("branching")
         # All writes for one run are ordered. start_async may have an initial
         # background save in flight; later checkpoints naturally queue behind it
         # instead of allowing the old snapshot to overwrite newer state.
-        async with self.persistence_lock:
-            await asyncio.to_thread(chats.save_chat, snapshot)
+        try:
+            async with self.persistence_lock:
+                await chats.run_db(chats.apply_run_checkpoint, checkpoint)
+        except BaseException:
+            self.dirty_ids |= dirty
+            raise
+        self.persisted_json.update(written)
+        self.persisted_branching = branching
         self.dirty = False
         if publish_full:
             self._publish()
@@ -1036,6 +1090,8 @@ class RunManager:
             if self.runs.get(chat["id"]) is run:
                 self.runs.pop(chat["id"], None)
             raise
+        run.persist_base = len(chat["events"])
+        run.persisted_branching = chat.get("branching")
         return self._launch(run, session)
 
     async def start_async(self, chat: dict[str, Any], options: dict[str, Any], session: Any | None = None) -> AgentRun:
@@ -1050,15 +1106,20 @@ class RunManager:
             except Exception:
                 pass
         run = self._prepare_start(chat, options)
-        # Provider dispatch must not wait for a potentially multi-megabyte
-        # SQLite/FTS rewrite. Persist an immutable snapshot in the background;
+        # Provider dispatch must not wait for SQLite. Persist in the background
+        # from a *shallow* snapshot: the run only ever appends new events to
+        # the live list and never mutates the submitted history dicts or the
+        # client-authored branching object, so no deepcopy of the whole chat
+        # is needed. save_chat itself only writes rows that changed.
         # AgentRun.checkpoint uses the same lock so durability remains ordered.
-        snapshot = copy.deepcopy(chat)
+        snapshot = {**chat, "events": list(chat["events"])}
+        run.persist_base = len(snapshot["events"])
+        run.persisted_branching = chat.get("branching")
 
         async def persist_initial() -> None:
             try:
                 async with run.persistence_lock:
-                    await asyncio.to_thread(chats.save_chat, snapshot)
+                    await chats.run_db(chats.save_chat, snapshot)
             except Exception:
                 logger.exception("Initial background persistence failed for %s", chat["id"])
 
@@ -1088,12 +1149,11 @@ class RunManager:
             return
         # A manual rename during the first run always wins. Re-check persisted state
         # immediately before committing the deterministic title.
-        persisted = await asyncio.to_thread(chats.load_chat, run.chat["id"])
+        persisted = await chats.run_db(chats.load_chat_metadata, run.chat["id"])
         if persisted is None or persisted.get("title") != "New Chat" or run.chat.get("title") != "New Chat":
             return
         run.chat["title"] = title
-        run.chat["updatedAt"] = now()
-        await asyncio.to_thread(chats.save_chat, run.chat)
+        await run.checkpoint()
         self.publish(run.chat["id"], "push/chat-updated", {
             "chat_id": run.chat["id"], "title": title, "updatedAt": run.chat["updatedAt"],
         })

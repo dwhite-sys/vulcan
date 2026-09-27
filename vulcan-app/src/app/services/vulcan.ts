@@ -84,6 +84,16 @@ export async function loadChatTopics(): Promise<Record<string, string[]>> {
   return data.tags ?? {};
 }
 
+/**
+ * Versioned topic refresh: `tags` is omitted when the server reports that the
+ * projection has not changed since `version` (older servers always send tags).
+ */
+export async function loadChatTopicsSince(version: number | null): Promise<{ tags?: Record<string, string[]>; version?: number }> {
+  const data = await wsRequest('chats/topics', version === null ? {} : { since_version: version });
+  if (data?.unchanged) return { version: data.version };
+  return { tags: data?.tags ?? {}, version: typeof data?.version === 'number' ? data.version : undefined };
+}
+
 export interface TranscriptSearchHitDescriptor {
   event_id: string;
   event_type: string;
@@ -470,7 +480,7 @@ export async function remoteLoadChats(): Promise<any[]> {
 
 export async function remoteLoadChat(chatId: string): Promise<any | null> {
   try {
-    const data = await wsRequest('chats/get', { chat_id: chatId });
+    const data = await wsRequest('chats/get', { chat_id: chatId, branch_refs: true });
     return data.chat ?? null;
   } catch {
     return null;

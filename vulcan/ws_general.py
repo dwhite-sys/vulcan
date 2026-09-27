@@ -386,7 +386,7 @@ class GeneralWSSession:
         etna_registry.register_client(client_id, self)
         await self.respond(req_id, "client/register", {
             "ok": True, "client_id": client_id,
-            "capabilities": ["run-delta-v1", "relay-credit-v1", "subscribe-include-chat-v1"],
+            "capabilities": ["run-delta-v1", "relay-credit-v1", "subscribe-include-chat-v1", "branch-refs-v1", "topics-push-v1"],
         })
 
 

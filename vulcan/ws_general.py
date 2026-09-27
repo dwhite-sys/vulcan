@@ -67,6 +67,7 @@ from vulcan import workspace
 from vulcan import agent_runtime
 from vulcan import container_lifecycle
 from vulcan import etna_registry
+from vulcan import traffic
 from vulcan.secure_ws import SecureWebSocketSession
 
 logger = logging.getLogger("vulcan.ws_general")
@@ -102,6 +103,84 @@ def _save_blobs(blobs: dict):
 
 # ── Message handler ───────────────────────────────────────────────────────────
 
+# ── Egress lane classification ────────────────────────────────────────────────
+
+# Responses to these requests are tiny and latency-critical: CONTROL lane.
+_CONTROL_REQUESTS = frozenset({
+    "auth/login", "client/proof-of-life", "client/register", "client/state",
+    "runs/start", "runs/cancel", "runs/answer", "runs/status", "ping",
+    "etna/http-response", "client/http-event", "design/action-response",
+    "server/metrics", "workspace/path", "terminal/slots",
+})
+# Server pushes that are control traffic (relay requests are awaited by a
+# server-owned run; cancellation must never queue behind the data it cancels).
+_CONTROL_PUSHES = frozenset({
+    "push/connected", "push/client-http-request", "push/client-http-cancel",
+    "push/client-http-credit", "push/etna-http-request", "push/design-action",
+})
+_STREAM_PUSHES = frozenset({"push/run-delta"})
+# Responses that establish a transcript baseline: live deltas enqueued after
+# them must not overtake them.
+_ORDERED_RESPONSES = frozenset({"runs/subscribe"})
+# Handlers whose response payload is freshly built (never a live run dict), so
+# its encoding may safely leave the event loop.
+_OWNED_BULK_RESPONSES = frozenset({
+    "chats/list", "chats/get", "chats/search", "chats/branch-search", "chats/topics",
+    "workspace/read-file", "workspace/read-file-base64", "workspace/list-files",
+    "workspace/export/chunk", "network/http-json", "network/http-bytes",
+    "git/log", "git/show", "git/changed", "library/search", "snapshot/list", "snapshot/show",
+    "workspace/list-all",
+})
+_OFFLOAD_ENCODE_HINT = 64 * 1024
+
+
+def _lane_for(msg: dict, request_type: str | None = None) -> int:
+    msg_type = str(msg.get("type") or "")
+    if msg.get("id"):
+        if request_type is None:
+            request_type = msg_type[:-len("/response")] if msg_type.endswith("/response") else msg_type
+        return traffic.CONTROL if request_type in _CONTROL_REQUESTS else traffic.BULK
+    if msg_type in _CONTROL_PUSHES:
+        return traffic.CONTROL
+    if msg_type in _STREAM_PUSHES:
+        return traffic.STREAM
+    return traffic.STATE
+
+
+_UNJOURNALED_TYPES = frozenset({
+    "container/status", "terminal/slots", "runs/status", "terminal/active-chats",
+    "containers/chat-presence",
+})
+_ACTIVITY_INTERVAL_SECONDS = 5.0
+
+
+# Live sessions, for server-wide notices (e.g. topic projection changes).
+_LIVE_SESSIONS: "set[GeneralWSSession]" = set()
+_NOTICE_LOOP: asyncio.AbstractEventLoop | None = None
+
+
+def _broadcast_topics_changed(version: int) -> None:
+    """Called from the topic worker thread; hop onto the event loop."""
+    loop = _NOTICE_LOOP
+    if loop is None or loop.is_closed():
+        return
+
+    def notify() -> None:
+        message = {"type": "push/topics-changed", "payload": {"version": version}}
+        encoded = agent_runtime.encode_message(message)
+        for session in list(_LIVE_SESSIONS):
+            if session.authenticated:
+                session.post(message, plaintext=encoded)
+
+    try:
+        loop.call_soon_threadsafe(notify)
+    except RuntimeError:
+        pass
+
+
+chat_store.add_topic_listener(_broadcast_topics_changed)
+
+
 class GeneralWSSession:
     def __init__(self, secure_ws: SecureWebSocketSession):
         self.ws           = secure_ws
@@ -109,65 +188,44 @@ class GeneralWSSession:
         self.session_token: str | None = None
         self.client_presence_id = uuid_mod.uuid4().hex
         self.client_device_id: str | None = None
+        # Renderers that understand push/run-delta receive ordered deltas;
+        # older renderers keep receiving coalesced event snapshots.
+        self.supports_run_deltas = False
         self._uploads: dict[str, dict[str, Any]] = {}
         self._workspace_exports: dict[str, dict[str, Any]] = {}
-        self._latest_messages: dict[str, dict[str, Any]] = {}
-        self._latest_tasks: dict[str, asyncio.Task] = {}
-        self._send_queue: asyncio.PriorityQueue[tuple[int, int, dict, asyncio.Future]] = asyncio.PriorityQueue()
-        self._send_sequence = 0
-        self._send_task = asyncio.create_task(self._drain_send_queue(), name="general-ws-send")
+        self._activity_recorded: dict[str, float] = {}
+        self.admission: traffic.Admission | None = None
+        self.egress = traffic.EgressScheduler(
+            self._transmit, agent_runtime.encode_message, on_overflow=self._egress_overflow,
+        )
+        traffic.LOOP_LAG.ensure_started()
+        global _NOTICE_LOOP
+        _NOTICE_LOOP = asyncio.get_running_loop()
+        _LIVE_SESSIONS.add(self)
 
-    @staticmethod
-    def _message_priority(msg: dict) -> int:
-        """Lower numbers are latency-sensitive; bulk snapshots go last.
+    async def _transmit(self, plaintext: bytes) -> None:
+        sender = getattr(self.ws, "send_plaintext", None)
+        if sender is not None:
+            await sender(plaintext)
+        else:
+            await self.ws.send_json(json.loads(plaintext))
 
-        SecureWebSocket still owns encryption sequence/order.  This queue only
-        decides which *not-yet-sent* application frame gets that next sequence
-        number, so tiny RPC responses cannot sit behind a backlog of replaceable
-        renderer updates.
-        """
-        msg_type = str(msg.get("type") or "")
-        # Response frames inherit the cost/latency class of their originating
-        # RPC instead of all jumping to the front merely because they have an id.
-        if msg.get("id"):
-            if msg_type.startswith("runs/start/") or msg_type.startswith("runs/cancel/") or msg_type.startswith("client/proof-of-life/"):
-                return 0
-            if msg_type.startswith("workspace/path/") or msg_type.startswith("terminal/slots/") or msg_type.startswith("runs/status/"):
-                return 1
-            if msg_type.startswith("chats/upsert/") or msg_type.startswith("semantic/embed/"):
-                return 7
-            if msg_type.startswith("workspace/list-files/") or msg_type.startswith("chats/list/") or msg_type.startswith("transcript/search/"):
-                return 8
-            return 3
-        if msg_type in {"push/client-http-request", "push/client-http-cancel"}:
-            return 0
-        if msg_type in {
-            "push/connected", "push/run-status", "push/generation-complete", "push/run-question", "push/design-action",
-        }:
-            return 1
-        if msg_type == "push/run-events":
-            return 9
-        if msg_type == "push/run-event":
-            return 6
-        return 3
+    def _egress_overflow(self, reason: str) -> None:
+        logger.warning("Closing General WS %s: %s", self.client_presence_id, reason)
+        transport = getattr(self.ws, "ws", None)
+        if transport is not None:
+            async def close() -> None:
+                try:
+                    await transport.close(code=1013)
+                except Exception:
+                    pass
+            asyncio.create_task(close())
 
-    async def _drain_send_queue(self) -> None:
-        while True:
-            _priority, _order, msg, future = await self._send_queue.get()
-            if future.cancelled():
-                continue
-            try:
-                await self.ws.send_json(msg)
-            except asyncio.CancelledError:
-                if not future.done():
-                    future.cancel()
-                raise
-            except Exception as exc:
-                if not future.done():
-                    future.set_exception(exc)
-            else:
-                if not future.done():
-                    future.set_result(None)
+    def _note_capabilities(self, payload: Any) -> None:
+        if isinstance(payload, dict):
+            capabilities = payload.get("capabilities")
+            if isinstance(capabilities, list) and "run-delta-v1" in capabilities:
+                self.supports_run_deltas = True
 
     def cleanup(self):
         # A disconnected client loses its subscription/presence, never the
@@ -180,69 +238,59 @@ class GeneralWSSession:
             self._cleanup_upload_state(state)
         self._uploads.clear()
         self._workspace_exports.clear()
-        self._latest_messages.clear()
-        for task in self._latest_tasks.values():
-            task.cancel()
-        self._latest_tasks.clear()
-        self._send_task.cancel()
-        while not self._send_queue.empty():
-            try:
-                _priority, _order, _msg, future = self._send_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-            if not future.done():
-                future.cancel()
+        _LIVE_SESSIONS.discard(self)
+        self.egress.close()
 
-    async def send(self, msg: dict):
-        loop = asyncio.get_running_loop()
-        future = loop.create_future()
-        self._send_sequence += 1
+    async def send(self, msg: dict, *, lane: int | None = None, request_type: str | None = None):
+        """Deliver one message through its lane; waits for lane capacity.
+
+        Failures are swallowed (a dead socket is handled by the receive loop),
+        matching the historical contract of this method.
+        """
+        if lane is None:
+            lane = _lane_for(msg, request_type)
+        kind = request_type or str(msg.get("type") or "")
         try:
-            await self._send_queue.put((self._message_priority(msg), self._send_sequence, msg, future))
-            await future
+            if lane == traffic.BULK and kind in _OWNED_BULK_RESPONSES:
+                plaintext = await asyncio.to_thread(agent_runtime.encode_message, msg)
+            else:
+                plaintext = agent_runtime.encode_message(msg)
+            await self.egress.send(plaintext, lane, ordered=kind in _ORDERED_RESPONSES)
+        except asyncio.CancelledError:
+            raise
         except Exception:
             pass
 
-    def queue_latest(self, key: str, msg: dict) -> None:
-        """Coalesce replaceable server-push snapshots behind the WS send lock.
+    def post(self, msg: dict, *, plaintext: bytes | None = None) -> bool:
+        """Non-blocking push (server-initiated). Never creates a task."""
+        return self.egress.post(
+            plaintext if plaintext is not None else agent_runtime.encode_message(msg),
+            _lane_for(msg),
+        )
 
-        Streaming run updates contain the whole event projection. If encryption or
-        the socket briefly falls behind, obsolete intermediate snapshots are worse
-        than useless: they consume CPU/bandwidth before the newest state can arrive.
-        Keep at most one unsent snapshot per logical stream.
-        """
-        self._latest_messages[key] = msg
-        task = self._latest_tasks.get(key)
-        if task is not None and not task.done():
-            return
+    def post_run_delta(self, key: str, msg: dict, plaintext: bytes, build) -> None:
+        self.egress.post_stream(key, plaintext if self.supports_run_deltas else None, build)
 
-        async def drain() -> None:
-            try:
-                while key in self._latest_messages:
-                    current = self._latest_messages.pop(key)
-                    await self.send(current)
-                    await asyncio.sleep(0)
-            finally:
-                self._latest_tasks.pop(key, None)
-                # A message may have arrived between the final lookup and task
-                # cleanup. Restart once so no latest state is stranded.
-                if key in self._latest_messages:
-                    self.queue_latest(key, self._latest_messages[key])
-
-        self._latest_tasks[key] = asyncio.create_task(drain(), name=f"general-ws-latest:{key}")
+    def metrics(self) -> dict[str, Any]:
+        return {
+            "egress": self.egress.snapshot(),
+            "admission": self.admission.snapshot() if self.admission else None,
+            "run_deltas": self.supports_run_deltas,
+        }
 
     async def respond(self, req_id: str, msg_type: str, payload: Any):
         # One-way client pushes deliberately have no request id.  The encrypted
         # WebSocket is ordered/reliable already, so do not manufacture ACK frames.
         if not req_id:
             return
-        await self.send({"id": req_id, "type": f"{msg_type}/response", "payload": payload})
+        await self.send({"id": req_id, "type": f"{msg_type}/response", "payload": payload}, request_type=msg_type)
 
-    async def error(self, req_id: str, message: str):
+    async def error(self, req_id: str, message: str, request_type: str | None = None):
         if not req_id:
             logger.warning("One-way General WS message failed: %s", message)
             return
-        await self.send({"id": req_id, "type": "error", "payload": {"message": message}})
+        await self.send({"id": req_id, "type": "error", "payload": {"message": message}},
+                        request_type=request_type or "error")
 
     async def handle_message(self, msg: dict):
         req_id   = str(msg.get("id") or "")
@@ -254,7 +302,7 @@ class GeneralWSSession:
             if msg_type == "auth/login":
                 await self._handle_auth_login(req_id, payload)
             else:
-                await self.error(req_id, "Authentication required. Send auth/login first.")
+                await self.error(req_id, "Authentication required. Send auth/login first.", msg_type)
             return
 
         # Dispatch
@@ -264,20 +312,27 @@ class GeneralWSSession:
                 chat_id = payload.get("chat_id") if isinstance(payload, dict) else None
                 if msg_type == "runs/start" and isinstance(payload.get("chat"), dict):
                     chat_id = payload["chat"].get("id")
-                if chat_id and msg_type not in {
-                    "container/status", "terminal/slots", "runs/status", "terminal/active-chats",
-                    "containers/chat-presence",
-                }:
-                    # Activity journaling is lifecycle bookkeeping, not part of
-                    # the networking critical path. Never stall an RPC on its
-                    # file lock / atomic JSON write.
-                    asyncio.create_task(asyncio.to_thread(container_lifecycle.record_activity, chat_id, msg_type))
+                if chat_id and msg_type not in _UNJOURNALED_TYPES:
+                    self._record_activity(str(chat_id), msg_type)
                 await handler(req_id, payload)
             except Exception as e:
                 logger.warning(f"WS handler error [{msg_type}]: {e}")
-                await self.error(req_id, str(e))
+                await self.error(req_id, str(e), msg_type)
         else:
-            await self.error(req_id, f"Unknown message type: {msg_type}")
+            await self.error(req_id, f"Unknown message type: {msg_type}", msg_type)
+
+    def _record_activity(self, chat_id: str, msg_type: str) -> None:
+        """Journal lifecycle activity at most once per chat per interval.
+
+        Activity journaling is lifecycle bookkeeping, not part of the
+        networking critical path: never stall an RPC on its file lock/atomic
+        JSON write, and never spawn one worker job per chatty RPC.
+        """
+        instant = time.monotonic()
+        if instant - self._activity_recorded.get(chat_id, -1e9) < _ACTIVITY_INTERVAL_SECONDS:
+            return
+        self._activity_recorded[chat_id] = instant
+        asyncio.create_task(asyncio.to_thread(container_lifecycle.record_activity, chat_id, msg_type))
 
     async def _handle_auth_login(self, req_id: str, payload: dict):
         password = payload.get("password", "")
@@ -325,10 +380,14 @@ class GeneralWSSession:
         client_id = str(payload.get("client_id") or "").strip()
         if not client_id:
             raise ValueError("client_id is required")
+        self._note_capabilities(payload)
         etna_registry.unregister_client(self.client_device_id, self)
         self.client_device_id = client_id
         etna_registry.register_client(client_id, self)
-        await self.respond(req_id, "client/register", {"ok": True, "client_id": client_id})
+        await self.respond(req_id, "client/register", {
+            "ok": True, "client_id": client_id,
+            "capabilities": ["run-delta-v1", "relay-credit-v1", "subscribe-include-chat-v1"],
+        })
 
 
     async def _client_state(self, req_id: str, payload: dict):
@@ -378,8 +437,21 @@ class GeneralWSSession:
     async def _client_http_chunk(self, _req_id: str, payload: dict):
         # Stream data is intentionally one-way. The secure WebSocket preserves
         # message order; headers/done/error remain acknowledged control frames.
+        # ``n`` is the sender's own size accounting for this chunk; credits are
+        # returned in exactly those units (JS and Python string lengths differ).
         relay_id = str(payload.get("relay_id") or "")
-        etna_registry.resolve_http_event(relay_id, {"event": "chunk", "data": payload.get("data", "")})
+        etna_registry.resolve_http_event(relay_id, {
+            "event": "chunk", "data": payload.get("data", ""), "n": payload.get("n"),
+        })
+
+    async def _server_metrics(self, req_id: str, payload: dict):
+        await self.respond(req_id, "server/metrics", {
+            "loop_lag": traffic.LOOP_LAG.snapshot(),
+            "session": self.metrics(),
+            "relay": etna_registry.relay_metrics(),
+            "runs": agent_runtime.MANAGER.metrics(),
+            "chat_db": chat_store.db_metrics(),
+        })
 
     async def _design_action_response(self, req_id: str, payload: dict):
         relay_id = str(payload.get("relay_id") or "")
@@ -396,6 +468,7 @@ class GeneralWSSession:
             "etna/http-response":          self._etna_http_response,
             "client/http-event":             self._client_http_event,
             "client/http-chunk":             self._client_http_chunk,
+            "server/metrics":                self._server_metrics,
             "design/action-response":         self._design_action_response,
             # Ping
             "ping":                        self._ping,
@@ -581,6 +654,7 @@ class GeneralWSSession:
         await self.respond(req_id, "providers/models", {"data": data.get("data", [])})
 
     async def _runs_start(self, req_id: str, p: dict):
+        self._note_capabilities(p)
         chat = p.get("chat")
         if not isinstance(chat, dict) or not chat.get("id"):
             raise ValueError("Missing chat or chat.id")
@@ -631,14 +705,39 @@ class GeneralWSSession:
         await self.respond(req_id, "runs/cancel", {"ok": stopped})
 
     async def _runs_subscribe(self, req_id: str, p: dict):
+        """One chat-open transaction: subscription + transcript + run state.
+
+        ``include_chat`` (default true for older renderers) lets a client that
+        already holds the transcript subscribe without a second full transfer.
+        The response is an *ordered* frame: live deltas published after the
+        snapshot below cannot overtake it, and ``seqs`` tells the renderer
+        which deltas the snapshot already contains.
+        """
         chat_id = p["chat_id"]
+        self._note_capabilities(p)
         agent_runtime.MANAGER.subscribe(chat_id, self)
+        include_chat = p.get("include_chat", True) is not False
         run = agent_runtime.MANAGER.runs.get(chat_id)
-        chat = run.chat if run else await asyncio.to_thread(chat_store.load_chat, chat_id)
-        await self.respond(req_id, "runs/subscribe", {
-            "chat_id": chat_id, "chat": chat, "status": ("complete" if run and run.generation_complete else run.status) if run else "idle",
+        chat = None
+        seqs: dict[str, int] = {}
+        if run is not None:
+            snapshot = run.subscription_snapshot() if include_chat else {"chat": None, "seqs": dict(run.stream_seq)}
+            chat, seqs = snapshot["chat"], snapshot["seqs"]
+        elif include_chat:
+            chat = await asyncio.to_thread(chat_store.load_chat, chat_id)
+            # A run may have started while the transcript was loading.
+            run = agent_runtime.MANAGER.runs.get(chat_id)
+            if run is not None:
+                snapshot = run.subscription_snapshot()
+                chat, seqs = snapshot["chat"], snapshot["seqs"]
+        payload = {
+            "chat_id": chat_id, "status": ("complete" if run and run.generation_complete else run.status) if run else "idle",
             "run_id": run.run_id if run else None, "question": run.question_batch if run else None,
-        })
+            "seqs": seqs,
+        }
+        if include_chat:
+            payload["chat"] = chat
+        await self.respond(req_id, "runs/subscribe", payload)
 
     async def _runs_answer(self, req_id: str, p: dict):
         agent_runtime.MANAGER.answer(p["chat_id"], p["batch_id"], p.get("answers", {}))
@@ -661,8 +760,13 @@ class GeneralWSSession:
         await self.respond(req_id, "chats/list", {"chats": chat_list})
 
     async def _chats_topics(self, req_id: str, p: dict):
+        version = chat_store.topic_version()
+        since = p.get("since_version")
+        if isinstance(since, int) and since == version:
+            await self.respond(req_id, "chats/topics", {"unchanged": True, "version": version})
+            return
         tags = await asyncio.to_thread(chat_store.topic_tags)
-        await self.respond(req_id, "chats/topics", {"tags": tags})
+        await self.respond(req_id, "chats/topics", {"tags": tags, "version": version})
 
     async def _chats_search(self, req_id: str, p: dict):
         # Universal message search is intentionally one direct FTS path. Title,
@@ -689,7 +793,11 @@ class GeneralWSSession:
     async def _chats_export(self, req_id: str, p: dict):
         chat_id = str(p["chat_id"])
         active = agent_runtime.MANAGER.runs.get(chat_id)
-        chat = active.chat if active and active.task and not active.task.done() else await asyncio.to_thread(chat_store.load_chat, chat_id)
+        if active and active.task and not active.task.done():
+            active.materialize_all()
+            chat = active.chat
+        else:
+            chat = await asyncio.to_thread(chat_store.load_chat, chat_id)
         if chat is None:
             await self.error(req_id, "Chat not found")
             return
@@ -1276,9 +1384,8 @@ class GeneralWSSession:
 
 # ── Main WebSocket handler ────────────────────────────────────────────────────
 
-# Messages in this set are latency/order-sensitive and intentionally complete in
-# the receive loop.  Everything else gets bounded concurrent dispatch so a slow
-# disk/network RPC cannot head-of-line-block provider chunks or proof-of-life.
+# Messages in this set are cheap, order-sensitive and complete in the receive
+# loop itself (relay data/acks must keep exact arrival order).
 _INLINE_MESSAGE_TYPES = frozenset({
     "auth/login",
     "client/proof-of-life",
@@ -1288,23 +1395,44 @@ _INLINE_MESSAGE_TYPES = frozenset({
     "client/http-chunk",
     "etna/http-response",
     "design/action-response",
-    "runs/cancel",
 })
-_GENERAL_CONCURRENCY = 32
-_CRITICAL_CONCURRENCY = 8
-_CRITICAL_MESSAGE_TYPES = frozenset({
-    "runs/start", "runs/cancel", "client/proof-of-life", "workspace/path",
-    "terminal/slots", "runs/status", "runs/answer",
+# Admission classes. Each owns its active slots *and* a bounded waiting room,
+# so generic/bulk floods cannot consume capacity reserved for control work.
+_CONTROL_MESSAGE_TYPES = frozenset({
+    "runs/start", "runs/cancel", "runs/status", "runs/answer", "runs/subscribe",
+    "workspace/path", "terminal/slots", "ping", "server/metrics",
 })
+_BULK_MESSAGE_TYPES = frozenset({
+    "chats/list", "chats/get", "chats/search", "chats/branch-search", "chats/export",
+    "chats/upsert", "chats/topics", "semantic/embed", "network/http-json", "network/http-bytes",
+    "providers/models", "library/search", "library/attach", "workspace/list-files",
+    "workspace/read-file", "workspace/read-file-base64", "workspace/download-folder",
+    "workspace/export", "workspace/export/prepare", "workspace/export/chunk",
+    "attachment/upload/start", "attachment/upload/chunk", "attachment/upload/finish",
+    "git/log", "git/show", "git/commit", "git/restore", "git/changed",
+    "snapshot/save", "snapshot/list", "snapshot/show", "workspace/list-all", "workspace/delete",
+})
+_ADMISSION_CLASSES = [
+    traffic.AdmissionClass("control", active=16, queued=256, queued_bytes=16 * 1024 * 1024),
+    traffic.AdmissionClass("general", active=16, queued=256, queued_bytes=32 * 1024 * 1024),
+    traffic.AdmissionClass("bulk", active=4, queued=128, queued_bytes=256 * 1024 * 1024),
+]
 _SLOW_HANDLER_SECONDS = 0.250
+
+
+def _admission_class(msg_type: str) -> str:
+    if msg_type in _CONTROL_MESSAGE_TYPES:
+        return "control"
+    if msg_type in _BULK_MESSAGE_TYPES:
+        return "bulk"
+    return "general"
 
 
 async def handle(ws: WebSocket):
     secure_ws = await SecureWebSocketSession.accept(ws)
     session = GeneralWSSession(secure_ws)
-    dispatch_slots = asyncio.Semaphore(_GENERAL_CONCURRENCY)
-    critical_slots = asyncio.Semaphore(_CRITICAL_CONCURRENCY)
-    tasks: set[asyncio.Task] = set()
+    admission = traffic.Admission(_ADMISSION_CLASSES)
+    session.admission = admission
 
     # Authentication begins only after the encrypted session is established.
     requires_auth = auth.server_requires_auth()
@@ -1313,21 +1441,20 @@ async def handle(ws: WebSocket):
         "payload": {"requires_auth": requires_auth, "version": "0.1.0", "encrypted": True},
     })
 
-    async def dispatch(message: dict) -> None:
-        msg_type = str(message.get("type") or "")
-        started = time.perf_counter()
-        try:
-            gate = critical_slots if msg_type in _CRITICAL_MESSAGE_TYPES else dispatch_slots
-            async with gate:
+    def dispatcher(message: dict, msg_type: str):
+        async def dispatch() -> None:
+            started = time.perf_counter()
+            try:
                 await session.handle_message(message)
-        finally:
-            elapsed = time.perf_counter() - started
-            if elapsed >= _SLOW_HANDLER_SECONDS:
-                logger.warning("General WS handler %s took %.3fs", msg_type or "<unknown>", elapsed)
+            finally:
+                elapsed = time.perf_counter() - started
+                if elapsed >= _SLOW_HANDLER_SECONDS:
+                    logger.warning("General WS handler %s took %.3fs", msg_type or "<unknown>", elapsed)
+        return dispatch
 
     try:
         while True:
-            message = await secure_ws.receive_json()
+            message, size = await secure_ws.receive_json_sized()
             if not isinstance(message, dict):
                 raise ValueError("Secure application message must be an object")
             msg_type = str(message.get("type") or "")
@@ -1340,9 +1467,21 @@ async def handle(ws: WebSocket):
                 if elapsed >= _SLOW_HANDLER_SECONDS:
                     logger.warning("Inline General WS handler %s took %.3fs", msg_type or "<unknown>", elapsed)
                 continue
-            task = asyncio.create_task(dispatch(message), name=f"general-ws:{msg_type or 'unknown'}")
-            tasks.add(task)
-            task.add_done_callback(tasks.discard)
+            if msg_type == "runs/cancel":
+                # Stop takes effect in the receive loop itself, before any
+                # admission queue; only the wait-for-finalization + ack runs as
+                # a (reserved control) task.
+                payload = message.get("payload")
+                if isinstance(payload, dict) and payload.get("chat_id"):
+                    agent_runtime.MANAGER.cancel(str(payload["chat_id"]))
+            name = _admission_class(msg_type)
+            if not admission.submit(name, dispatcher(message, msg_type), size, msg_type):
+                logger.warning("General WS %s admission full; rejecting %s", name, msg_type)
+                req_id = str(message.get("id") or "")
+                if req_id:
+                    session.egress.post(agent_runtime.encode_message({"id": req_id, "type": "error", "payload": {
+                        "message": "Vulcan server is busy; request was not admitted", "busy": True,
+                    }}), traffic.CONTROL)
     except WebSocketDisconnect:
         if session.session_token:
             auth.revoke_session(session.session_token)
@@ -1355,8 +1494,5 @@ async def handle(ws: WebSocket):
         except Exception:
             pass
     finally:
-        for task in tasks:
-            task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+        await admission.close()
         session.cleanup()

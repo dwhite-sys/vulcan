@@ -7,12 +7,101 @@ sessions long enough to relay CLIENT-POV HTTP work for server-owned agent runs.
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid
+from collections import deque
 from typing import Any
+
+logger = logging.getLogger("vulcan.etna_registry")
+
+# Client-POV provider relay flow control. The client may have at most
+# RELAY_WINDOW_BYTES of stream data outstanding (sent but not yet consumed by
+# the server-side run); consumption returns credit. The chain is therefore
+#   run slow -> no credit -> browser relay waits -> fetch reader waits
+# which is real backpressure all the way to the provider connection.
+RELAY_WINDOW_BYTES = 256 * 1024
+# Clients that predate credits cannot be slowed; bound what they can queue.
+RELAY_HARD_CAP_BYTES = 16 * 1024 * 1024
+_CREDIT_FRACTION = 4
+
+
+def _post(session: Any, message: dict[str, Any]) -> None:
+    """Non-blocking control push to a client session (never parks a task on
+    lane-aware sessions)."""
+    post = getattr(session, "post", None)
+    if post is not None:
+        post(message)
+    else:
+        asyncio.create_task(session.send(message))
+
+
+class RelayStream:
+    """Byte-accounted relay backlog for one client HTTP stream."""
+
+    def __init__(self, session: Any, relay_id: str, window: int = RELAY_WINDOW_BYTES) -> None:
+        self.session = session
+        self.relay_id = relay_id
+        self.window = window
+        self._items: deque[tuple[dict[str, Any], int]] = deque()
+        self._event = asyncio.Event()
+        self.bytes = 0
+        self.peak_bytes = 0
+        self.consumed_unacked = 0
+        self.overflowed = False
+
+    def put(self, payload: dict[str, Any]) -> None:
+        if self.overflowed:
+            return
+        size = 0
+        if payload.get("event") == "chunk":
+            declared = payload.get("n")
+            size = declared if isinstance(declared, int) and declared >= 0 else len(str(payload.get("data") or ""))
+        if self.bytes + size > RELAY_HARD_CAP_BYTES:
+            # Refuse to become an unbounded buffer. The stream fails loudly;
+            # the run surfaces the error instead of eating server memory.
+            self.overflowed = True
+            self._items.clear()
+            self.bytes = 0
+            self._items.append(({"event": "error", "error": "Client relay backlog exceeded"}, 0))
+            self._event.set()
+            return
+        self._items.append((payload, size))
+        self.bytes += size
+        self.peak_bytes = max(self.peak_bytes, self.bytes)
+        self._event.set()
+
+    async def get(self, timeout: float) -> dict[str, Any]:
+        while not self._items:
+            self._event.clear()
+            await asyncio.wait_for(self._event.wait(), timeout=timeout)
+        payload, size = self._items.popleft()
+        self.bytes -= size
+        if size:
+            self.consumed_unacked += size
+        # Batch credits, but always return them once the backlog is drained:
+        # a sender blocked on a full window must never wait on a remainder
+        # smaller than the batch threshold (that would deadlock both ends).
+        if self.consumed_unacked and (
+            not self._items or self.consumed_unacked >= max(1, self.window // _CREDIT_FRACTION)
+        ):
+            self.grant()
+        return payload
+
+    def grant(self) -> None:
+        if not self.consumed_unacked:
+            return
+        credit, self.consumed_unacked = self.consumed_unacked, 0
+        try:
+            _post(self.session, {"type": "push/client-http-credit", "payload": {
+                "relay_id": self.relay_id, "bytes": credit,
+            }})
+        except Exception:
+            logger.debug("Could not grant relay credit", exc_info=True)
+
 
 CLIENT_SESSIONS: dict[str, Any] = {}
 RELAY_FUTURES: dict[str, asyncio.Future] = {}
-HTTP_STREAMS: dict[str, asyncio.Queue] = {}
+HTTP_STREAMS: dict[str, RelayStream] = {}
 RELAY_CLIENTS: dict[str, str] = {}
 CLIENT_STATES: dict[str, dict[str, Any]] = {}
 
@@ -29,9 +118,9 @@ def unregister_client(client_id: str | None, session: Any) -> None:
         for relay_id, owner in list(RELAY_CLIENTS.items()):
             if owner != client_id:
                 continue
-            queue = HTTP_STREAMS.get(relay_id)
-            if queue is not None:
-                queue.put_nowait({"event": "error", "error": "Client disconnected during HTTP request"})
+            stream = HTTP_STREAMS.get(relay_id)
+            if stream is not None:
+                stream.put({"event": "error", "error": "Client disconnected during HTTP request"})
             future = RELAY_FUTURES.get(relay_id)
             if future is not None and not future.done():
                 future.set_result({"error": "Client disconnected during HTTP request"})
@@ -158,8 +247,8 @@ async def relay_http_stream(
     if session is None:
         raise RuntimeError("The client selected for this endpoint is not connected")
     relay_id = uuid.uuid4().hex
-    queue: asyncio.Queue = asyncio.Queue()
-    HTTP_STREAMS[relay_id] = queue
+    stream = RelayStream(session, relay_id)
+    HTTP_STREAMS[relay_id] = stream
     RELAY_CLIENTS[relay_id] = client_id
     completed = False
     try:
@@ -167,9 +256,11 @@ async def relay_http_stream(
             "relay_id": relay_id, "url": url, "method": method,
             "headers": headers or {}, "body": body, "stream": True,
             "timeout_ms": int(timeout * 1000),
+            # Credit-based flow control (clients without it ignore this).
+            "flow": {"window_bytes": stream.window},
         }})
         while True:
-            event = await asyncio.wait_for(queue.get(), timeout=timeout + 2)
+            event = await stream.get(timeout + 2)
             kind = event.get("event")
             if kind == "headers":
                 status = int(event.get("status", 0))
@@ -177,7 +268,7 @@ async def relay_http_stream(
                     # The client follows with body chunks and done; collect a compact error.
                     chunks = []
                     while True:
-                        item = await asyncio.wait_for(queue.get(), timeout=timeout + 2)
+                        item = await stream.get(timeout + 2)
                         if item.get("event") == "chunk":
                             chunks.append(str(item.get("data") or ""))
                         elif item.get("event") == "done":
@@ -212,12 +303,21 @@ async def relay_http_stream(
 
 
 def resolve_http_event(relay_id: str, payload: dict[str, Any]) -> bool:
-    queue = HTTP_STREAMS.get(relay_id)
-    if queue is not None:
-        queue.put_nowait(payload)
+    stream = HTTP_STREAMS.get(relay_id)
+    if stream is not None:
+        stream.put(payload)
         return True
     future = RELAY_FUTURES.get(relay_id)
     if future is not None and not future.done():
         future.set_result(payload)
         return True
     return False
+
+
+def relay_metrics() -> dict[str, Any]:
+    return {
+        "streams": len(HTTP_STREAMS),
+        "backlog_bytes": sum(stream.bytes for stream in HTTP_STREAMS.values()),
+        "peak_bytes": max((stream.peak_bytes for stream in HTTP_STREAMS.values()), default=0),
+        "pending_requests": len(RELAY_FUTURES),
+    }

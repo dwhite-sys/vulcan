@@ -2140,14 +2140,18 @@ class BackgroundAgentTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(await manager.cancel_and_wait("cancel"))
             self.assertTrue(run.task.done())
             self.assertNotIn("cancel", manager.runs)
+            self.assertEqual(run.status, "interrupted")
+            thought = next(event for event in chats.load_chat("cancel")["events"] if event["type"] == "reasoning")
+            self.assertEqual(thought["content"], "In progress")
+            self.assertEqual(thought["status"], "interrupted")
             # Once Stop has been acknowledged, this chat must be immediately reusable.
             replacement = manager.start(chat("cancel"), options())
+            # Stop before the task's first step must still finalize the run
+            # (interrupted status + chat released), not strand it as running.
             manager.cancel("cancel")
             await asyncio.wait_for(replacement.task, timeout=2)
-        self.assertEqual(run.status, "interrupted")
-        thought = next(event for event in chats.load_chat("cancel")["events"] if event["type"] == "reasoning")
-        self.assertEqual(thought["content"], "In progress")
-        self.assertEqual(thought["status"], "interrupted")
+            self.assertEqual(replacement.status, "interrupted")
+            self.assertNotIn("cancel", manager.runs)
 
     async def test_native_terminal_tools_preserve_original_result_shapes(self):
         value = chat("terminal-contract")

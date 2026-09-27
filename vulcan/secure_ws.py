@@ -27,6 +27,8 @@ from fastapi import WebSocket
 from vulcan import config as cfg
 
 PROTOCOL_VERSION = 1
+# Frames at least this large are sealed/opened in a worker thread.
+OFFLOAD_BYTES = 256 * 1024
 _CONTEXT = b"vulcan-secure-session-v1\x00"
 _IDENTITY_FILE = cfg.CONFIG_DIR / "server-identity.ed25519"
 _IDENTITY_LOCK = threading.RLock()
@@ -193,21 +195,37 @@ class SecureWebSocketSession:
         return session
 
     async def send_json(self, payload: Any) -> None:
+        plaintext = json.dumps(payload, default=str, separators=(",", ":")).encode("utf-8")
+        await self.send_plaintext(plaintext)
+
+    def _seal(self, plaintext: bytes, sequence: int) -> str:
+        ciphertext = self.send_cipher.encrypt(
+            _nonce(self.send_prefix, sequence), plaintext, _aad(sequence)
+        )
+        return json.dumps({
+            "type": "secure",
+            "sequence": sequence,
+            "ciphertext": _b64(ciphertext),
+        }, separators=(",", ":"))
+
+    async def send_plaintext(self, plaintext: bytes) -> None:
+        """Encrypt and send one already-encoded application frame.
+
+        Sequence assignment + write stay serialized under the lock. Large
+        frames are sealed (AES-GCM + base64 + envelope) in a worker thread so
+        a multi-megabyte hydration cannot monopolize the event loop that is
+        also serving register/cancel/status for every other client.
+        """
         async with self._send_lock:
-            plaintext = json.dumps(payload, default=str, separators=(",", ":")).encode("utf-8")
             sequence = self.send_sequence
-            ciphertext = self.send_cipher.encrypt(
-                _nonce(self.send_prefix, sequence), plaintext, _aad(sequence)
-            )
-            await self.ws.send_text(json.dumps({
-                "type": "secure",
-                "sequence": sequence,
-                "ciphertext": _b64(ciphertext),
-            }, separators=(",", ":")))
+            if len(plaintext) >= OFFLOAD_BYTES:
+                frame = await asyncio.to_thread(self._seal, plaintext, sequence)
+            else:
+                frame = self._seal(plaintext, sequence)
+            await self.ws.send_text(frame)
             self.send_sequence += 1
 
-    async def receive_json(self) -> Any:
-        raw = await self.ws.receive_text()
+    def _open(self, raw: str) -> Any:
         try:
             envelope = json.loads(raw)
             if envelope.get("type") != "secure":
@@ -225,3 +243,20 @@ class SecureWebSocketSession:
             return json.loads(plaintext.decode("utf-8"))
         except (KeyError, TypeError, ValueError, InvalidTag, json.JSONDecodeError) as exc:
             raise ValueError(f"Invalid secure WebSocket frame: {exc}") from exc
+
+    async def receive_json(self) -> Any:
+        message, _size = await self.receive_json_sized()
+        return message
+
+    async def receive_json_sized(self) -> tuple[Any, int]:
+        """Receive one frame, returning it with its wire size.
+
+        Receiving is inherently sequential (strict sequence numbers), but the
+        decode of a large frame need not occupy the loop: other tasks keep
+        running while a worker opens it. Order is preserved because the next
+        receive only starts after this one returns.
+        """
+        raw = await self.ws.receive_text()
+        if len(raw) >= OFFLOAD_BYTES:
+            return await asyncio.to_thread(self._open, raw), len(raw)
+        return self._open(raw), len(raw)

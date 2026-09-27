@@ -537,12 +537,49 @@ def chat_exists(chat_id: str) -> bool:
     return load_chat(chat_id) is not None
 
 
+# Monotonic version of the derived topic projection. Clients poll with
+# ``since_version`` (cheap "unchanged" answers) and are pushed a notice when it
+# advances, instead of re-downloading every tag every few seconds.
+_TOPIC_VERSION = 0
+_TOPIC_LISTENERS: list = []
+
+
+def topic_version() -> int:
+    return _TOPIC_VERSION
+
+
+def add_topic_listener(callback) -> None:
+    if callback not in _TOPIC_LISTENERS:
+        _TOPIC_LISTENERS.append(callback)
+
+
+def _topics_changed() -> None:
+    global _TOPIC_VERSION
+    _TOPIC_VERSION += 1
+    for callback in list(_TOPIC_LISTENERS):
+        try:
+            callback(_TOPIC_VERSION)
+        except Exception:
+            pass
+
+
 def replace_topic_tags(
     assignments: dict[str, list[tuple[str, float]]],
     *,
     chat_ids: set[str] | None = None,
 ) -> int:
     """Atomically replace selected conversations' derived topic projections."""
+    try:
+        return _replace_topic_tags(assignments, chat_ids=chat_ids)
+    finally:
+        _topics_changed()
+
+
+def _replace_topic_tags(
+    assignments: dict[str, list[tuple[str, float]]],
+    *,
+    chat_ids: set[str] | None = None,
+) -> int:
     with _DB_LOCK, _database() as connection:
         if chat_ids is None:
             connection.execute("DELETE FROM chat_tags")
@@ -786,3 +823,7 @@ def search_chat_ids(query: str) -> list[str]:
         row["id"] for row in rows
         if all(word in f"{row['title'] or ''} {row['tags']}".lower() for word in words)
     ]
+
+
+def db_metrics() -> dict:
+    return {}

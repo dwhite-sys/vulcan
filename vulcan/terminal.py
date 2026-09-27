@@ -609,8 +609,13 @@ else
 fi
 # tmux is the durable shell transport. Wrap Vulcan's private OSC markers in
 # tmux DCS passthrough so the outer PTY collector receives the original OSC.
-PS0=$'\033Ptmux;\033\033]777;vulcan-terminal;busy\007\033\\'"${{PS0-}}"
-PS1=$'\033Ptmux;\033\033]777;vulcan-terminal;idle\007\033\\'"{prompt_identity}:\w\$ "
+# Prompt strings are backslash-decoded, so the DCS terminator's backslash is
+# doubled (a lone one would swallow the next prompt character). In PS1 the
+# whole marker sits between readline's \001/\002 ignore bytes: it prints
+# nothing, and counting its bytes as prompt width made readline wrap early
+# and redraw typed input over the prompt line.
+PS0=$'\033Ptmux;\033\033]777;vulcan-terminal;busy\007\033\\\\'"${{PS0-}}"
+PS1=$'\001\033Ptmux;\033\033]777;vulcan-terminal;idle\007\033\\\\\002'"{prompt_identity}:\w\$ "
 export PS0 PS1
 """
     try:

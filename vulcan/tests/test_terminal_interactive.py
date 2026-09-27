@@ -556,3 +556,32 @@ class TmuxTerminalPersistenceTests(unittest.TestCase):
         args = run.call_args.args[0]
         self.assertIn("kill-session", args)
         self.assertEqual(args[-1], "vulcan-agent-3")
+
+
+class ShellIntegrationPromptTests(unittest.TestCase):
+    """The tmux passthrough markers must not change what readline thinks the prompt is."""
+
+    def _rc(self, chat_id: str) -> str:
+        captured = {}
+
+        def run_docker(args, **kwargs):
+            captured["rc"] = kwargs.get("input", "")
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with mock.patch.object(terminal.docker, "run_docker", side_effect=run_docker):
+            terminal._install_slot_shell_integration(chat_id, "user", 1)
+        return captured["rc"]
+
+    def _expand(self, rc: str, variable: str) -> bytes:
+        lines = "\n".join(line for line in rc.splitlines() if line.startswith(("PS0=", "PS1=")))
+        script = f"PS0=; {lines}\ncd /\nprintf %s \"${{{variable}@P}}\""
+        return subprocess.run(["bash", "--norc", "--noprofile", "-c", script], capture_output=True, check=True).stdout
+
+    def test_prompt_markers_are_invisible_to_readline_and_do_not_eat_the_prompt(self):
+        chat_id = "0d6f5a2e-1b7c-4c0e-9a51-3f2d8e7b6c41"
+        rc = self._rc(chat_id)
+        idle = b"\x1bPtmux;\x1b\x1b]777;vulcan-terminal;idle\x07\x1b\\"
+        busy = b"\x1bPtmux;\x1b\x1b]777;vulcan-terminal;busy\x07\x1b\\"
+        # \001..\002 = readline's ignore markers: the passthrough occupies zero columns.
+        self.assertEqual(self._expand(rc, "PS1"), b"\x01" + idle + b"\x02" + f"{chat_id}@vulcan:/$ ".encode())
+        self.assertEqual(self._expand(rc, "PS0"), busy)

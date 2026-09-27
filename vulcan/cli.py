@@ -370,7 +370,13 @@ def cmd_start(args):
 # keeps the remaining legitimate ones (full-chat fallback, chats/upsert)
 # from tearing the control connection down. Bounded, since frames are read
 # before authentication.
-_UVICORN_WS_ARGS = ("--ws-max-size", str(256 * 1024 * 1024))
+#
+# permessage-deflate is off: every General-WS frame is AES-GCM ciphertext in
+# base64, which deflate cannot meaningfully shrink, and uvicorn compresses
+# outbound frames synchronously on the event loop. A 4 MB chat open spent
+# ~150 ms of loop time in zlib per client (stalling every other connection
+# meanwhile) and the browser paid again to inflate it.
+_UVICORN_WS_ARGS = ("--ws-max-size", str(256 * 1024 * 1024), "--ws-per-message-deflate", "false")
 
 
 def cmd_serve(args):

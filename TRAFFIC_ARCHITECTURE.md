@@ -91,6 +91,32 @@ Root causes, all fixed, each of which scales with chat size or corpus size:
 6. **O(chat) work on the event loop.** History projection, provider body
    encoding and large frame encoding happened on the loop, or in single
    GIL-holding calls. They now run in workers, in GIL-releasing pieces.
+7. **Every outbound frame was deflated on the event loop.** uvicorn enables
+   permessage-deflate by default and Chromium accepts it, so each frame
+   (AES-GCM ciphertext in base64, which barely compresses) went through
+   zlib synchronously on the loop. Opening a 4 MB chat spent ~150 ms of
+   loop time there (stalling every other connection meanwhile) and the
+   browser paid again to inflate it. Launch now passes
+   `--ws-per-message-deflate false`: the `runs/subscribe` round trip for a
+   3–4 MB chat went from 180–295 ms to 60–115 ms.
+
+### Chat-open latency (click → transcript painted)
+
+Measured in Chromium against 16 chats of 300–570 events (images, tool
+output, markdown), medians:
+
+| Build | First open | Re-open |
+| --- | --- | --- |
+| r24 (pre-release baseline) | 746 ms | 194 ms |
+| RC31 | 474 ms | 204 ms |
+| + deflate off | 327 ms | 179 ms |
+| + markdown parse cache | 253 ms | 78 ms |
+
+The markdown cache matters because the transcript is virtualized: each row
+measurement re-renders the visible blocks synchronously, and every chat
+switch remounts them, so the same messages were re-parsed several times per
+open. `MarkdownRenderer` now reuses parsed output by source text (bounded
+LRU; quote-marked content bypasses it).
 
 ## Status by handoff section
 

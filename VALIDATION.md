@@ -89,3 +89,10 @@ Validated in the build environment:
 - `vite build` succeeds.
 
 Not exercised here: a packaged Electron app against a real provider, and a real client-POV provider under sustained load.
+
+### Field-symptom soak
+
+`vulcan/tests/soak/run.sh <tree> <port> <messages> <background-chats>` runs a real uvicorn
+server plus separate speaker/prober processes over TCP (see `TRAFFIC_ARCHITECTURE.md`).
+The original tree froze at message 4 (`runs/start` unacknowledged for 60 s). This branch ran
+30 consecutive agentic messages (to an 18.6 MB chat) with flat run times and zero errors.

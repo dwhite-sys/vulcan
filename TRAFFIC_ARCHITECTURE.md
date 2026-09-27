@@ -39,6 +39,59 @@ Persistence (`test_persistence_architecture.py`, measured directly):
 Before this branch, every checkpoint was a full save (`DELETE` plus reinsert of
 all rows and a per-chat FTS rebuild), with a whole-chat `deepcopy` on the loop.
 
+## The field symptom, reproduced and fixed
+
+The field report: after about 5 messages the whole server slows and freezes.
+Clients can't connect, chats can't be opened, and opening a chat takes
+forever. It clears after tens of minutes, then freezes again as soon as you
+speak in that chat.
+
+`vulcan/tests/soak/` reproduces it out-of-process: a real uvicorn server,
+separate client processes over TCP, a 100-chat corpus, and a single chat that
+receives message after message. Each message is an agentic turn: streamed
+reasoning, four tool calls returning ~150 KB each, and a streamed answer. The
+first message carries an image, and the post-message indexing/tagging
+pipeline is live. A second client keeps connecting, listing chats and
+re-opening that chat.
+
+| | original tree | this branch |
+|---|---|---|
+| message 1 | run 1.0 s | run 2.0 s (startup work still running) |
+| message 2 | second client completed **0** probes | run 1.2 s, worst navigation 0.17 s |
+| message 3 | `runs/start` ack **9.7 s**, run 10.8 s | ack 66 ms, run 1.1 s |
+| message 4 | **`runs/start` not acknowledged within 60 s: frozen** | ack 16 ms, run 1.05 s |
+| message 10 | — | ack 34 ms, run 1.6 s, worst navigation 0.67 s |
+| message 20 (12.5 MB chat) | — | ack 35 ms, run 1.9 s, worst navigation 0.78 s |
+| message 30 (18.6 MB chat) | — | ack 40 ms, run 1.7 s, worst navigation 1.6 s; 0 errors |
+
+On this branch, run time stays flat. Opening a chat grows with the size of the
+transcript it has to transfer. The in-process variant is
+`test_chat_soak_e2e.py`.
+
+Root causes, all fixed, each of which scales with chat size or corpus size:
+
+1. **Every checkpoint rewrote the entire chat.** The rewrite ran after a
+   whole-chat `deepcopy` on the loop, and each save also did a whole-corpus
+   FTS scan (`DELETE ... WHERE chat_id` on an UNINDEXED column), all under
+   the global DB lock. A tool loop checkpoints after every tool call.
+2. **The post-message tagging and indexing path scanned the whole corpus.**
+   `topics._records` and `recall.index_message` looked up `chat_search` rows
+   by UNINDEXED columns, so tagging one chat after a message held the DB lock
+   for ~3.3 s at 200 chats. Now 5 ms (keyed-rowid joins).
+3. **Navigation queued behind all of the above.** Every read took the
+   same writer lock. Reads now run in WAL snapshots on their own
+   connections and executor.
+4. **Every message re-uploaded and re-parsed the whole chat.** `runs/start`
+   carried the entire conversation, and the old branch graph embedded every
+   event a second time. `runs/start` now references server-held history.
+5. **Large chats killed the connection.** uvicorn closes any WebSocket
+   whose inbound frame exceeds 16 MiB. Past ~12 MB of chat, every full-chat
+   upload dropped the whole control connection. The limit is raised
+   (bounded), and uploads are small anyway.
+6. **O(chat) work on the event loop.** History projection, provider body
+   encoding and large frame encoding happened on the loop, or in single
+   GIL-holding calls. They now run in workers, in GIL-releasing pieces.
+
 ## Status by handoff section
 
 Legend: **done** = implemented and tested; **partial** = the core is done and
@@ -76,12 +129,12 @@ the remainder is noted; **deferred** = intentionally not in this change.
 | 5.4 / C2 incremental search projections | **done** | FTS rows use stable keyed rowids (`fts_rowids`), so per-event maintenance is O(log n) instead of an FTS scan per save. Very large events are committed first and indexed immediately afterwards (latest-wins, order-independent). |
 | 5.2 / 5.7 / C3 reference branch topology + migration | **done** | Stored nodes are `{eventId, parentId}`; off-path payloads are canonical in `branch_events`. Legacy embedded graphs are read transparently and migrated lazily, only after every reference is verified. Old renderers still receive the embedded form; new ones request `branch_refs` and send compact graphs (`branch-refs-v1`). |
 | 5.5 / C4 no giant deepcopy on the loop | **done** | Checkpoints are built from strings and tuples on the loop; the initial persist uses a shallow snapshot. |
-| 6 / C5 deliberate DB executor | **done** | `chats.run_db` uses a dedicated 2-thread executor, cached per-thread connections, and schema checks keyed on SQLite's schema cookie. |
+| 6 / C5 deliberate DB executor | **done** | Writes go through `chats.run_db` (a dedicated 2-thread writer executor, serialized by the writer lock). Reads go through `run_db_read` (their own executor, lock-free WAL snapshots). Connections are cached per thread, and schema checks are keyed on SQLite's schema cookie. |
 | 5.6 durability boundaries | **done** | Per-run checkpoints stay ordered by `persistence_lock`; the question and final boundaries are awaited. A failed checkpoint re-marks its events dirty. |
 | 7 / C6 metadata-sized sidebar | **done** | The `chats.summary_json` column (lazily backfilled) means `chats/list(summary_only)` never parses metadata. |
 | 8 / C7 one chat-open transaction, one reconnect owner | **done** | Opening a summary-only chat is a single `runs/subscribe {include_chat, branch_refs}` carrying the transcript, seqs, status and question. Reconnect is owned only by `push/connected`; the old effect that re-subscribed whenever *Etna* health changed is gone. |
 | Summary-only upsert data loss | **fixed** | Previously, dragging an un-hydrated chat into a folder sent `events: []` and wiped the transcript. Such upserts are now metadata-only. |
-| 9 / C8 slim `runs/start` | **deferred** | The request still carries the chat and tool universe; compact branching already removes the duplicated branch payloads. Moving to chat/head/new-turn semantics changes state ownership, and the handoff schedules it last. |
+| 9 / C8 slim `runs/start` | **done (chat)** | `runs/start` sends `chat_ref {base_len, base_last_id, new_events}` and the server rebuilds the chat from stored history; the initial persist becomes a mutation. Divergence returns `stale_base`, and the renderer falls back to a full upload (`runs-start-ref-v1`). The tool universe/settings are still sent each turn; they are small next to a transcript. |
 
 ### Pass D — instrumentation
 

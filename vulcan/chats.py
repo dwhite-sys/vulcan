@@ -15,6 +15,7 @@ import sqlite3
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -92,6 +93,18 @@ async def run_db(function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any
     _DB_QUEUED += 1
     _DB_PEAK_QUEUED = max(_DB_PEAK_QUEUED, _DB_QUEUED)
     return await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, job)
+
+
+# Reads get their own small pool so navigation never waits for a free worker
+# behind writer jobs (which may be waiting on the writer lock).
+_DB_READ_EXECUTOR = ThreadPoolExecutor(max_workers=3, thread_name_prefix="vulcan-chat-db-read")
+
+
+async def run_db_read(function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    """Run one read-only chat-storage job on the dedicated read executor."""
+    return await asyncio.get_running_loop().run_in_executor(
+        _DB_READ_EXECUTOR, lambda: function(*args, **kwargs)
+    )
 
 
 def db_metrics() -> dict:
@@ -309,7 +322,7 @@ def _index_event(connection: sqlite3.Connection, chat_id: str, event: dict, *, o
     return False
 
 
-def _defer_index(chat_id: str, event_id: str) -> None:
+def _defer_index(chat_id: str, event_id: str | None) -> None:
     global _DEFERRED_RUNNING
     with _DEFERRED_LOCK:
         _DEFERRED_INDEX.add((chat_id, event_id))
@@ -332,6 +345,9 @@ def _run_deferred_index() -> None:
                 _DEFERRED_RUNNING = False
                 return
             chat_id, event_id = _DEFERRED_INDEX.pop()
+        if event_id is None:
+            _migrate_chat_now(chat_id)
+            continue
         try:
             with _DB_LOCK, _database() as connection:
                 row = connection.execute(
@@ -349,6 +365,28 @@ def _run_deferred_index() -> None:
                                  on_current_path=on_path, defer_large=False)
         except Exception:
             logger.exception("Deferred search indexing failed for %s/%s", chat_id, event_id)
+
+
+def _defer_migration(chat_id: str) -> None:
+    """Queue a legacy branch-graph migration for the background writer."""
+    _defer_index(chat_id, None)  # type: ignore[arg-type]
+
+
+def _migrate_chat_now(chat_id: str) -> None:
+    try:
+        with _DB_LOCK, _database() as connection:
+            row = connection.execute("SELECT metadata_json FROM chats WHERE id = ?", (chat_id,)).fetchone()
+            if row is None:
+                return
+            metadata = json.loads(row["metadata_json"])
+            if not _has_embedded_nodes(metadata.get("branching")):
+                return
+            events = [json.loads(item["payload_json"]) for item in connection.execute(
+                "SELECT payload_json FROM chat_events WHERE chat_id = ? ORDER BY position", (chat_id,)
+            )]
+            _migrate_legacy_branching(connection, chat_id, metadata, events)
+    except Exception:
+        logger.exception("Legacy branch migration failed for %s", chat_id)
 
 
 def wait_for_index(timeout: float = 30.0) -> bool:
@@ -573,9 +611,32 @@ def _database() -> sqlite3.Connection:
         connections[path] = connection
     cookie = int(connection.execute("PRAGMA schema_version").fetchone()[0])
     if _SCHEMA_READY.get(path) != cookie:
-        _ensure_schema(connection)
-        _SCHEMA_READY[path] = int(connection.execute("PRAGMA schema_version").fetchone()[0])
+        with _DB_LOCK:
+            _ensure_schema(connection)
+            _SCHEMA_READY[path] = int(connection.execute("PRAGMA schema_version").fetchone()[0])
     return connection
+
+
+@contextmanager
+def _reader():
+    """Consistent read-only snapshot that never waits for the writer lock.
+
+    SQLite WAL lets readers proceed while a writer commits. Navigation (chat
+    open, sidebar list, search) therefore must not queue behind checkpoints,
+    deferred search indexing or topic tagging, which all hold _DB_LOCK. The
+    explicit transaction pins one snapshot across the several SELECTs of a
+    load so metadata and events can never come from different commits.
+    """
+    connection = _database()
+    if connection.in_transaction:
+        # Re-entrant use on this thread (inside a writer): reuse its view.
+        yield connection
+        return
+    connection.execute("BEGIN")
+    try:
+        yield connection
+    finally:
+        connection.execute("COMMIT")
 
 
 # ── Canonical load/save ───────────────────────────────────────────────────────
@@ -938,7 +999,8 @@ def _migrate_legacy_branching(connection: sqlite3.Connection, chat_id: str, meta
     return normalized, off_path
 
 
-def _row_to_chat(connection: sqlite3.Connection, row: sqlite3.Row, *, branch_refs: bool = False) -> dict:
+def _row_to_chat(connection: sqlite3.Connection, row: sqlite3.Row, *, branch_refs: bool = False,
+                 migrate: bool = False) -> dict:
     chat = json.loads(row["metadata_json"])
     chat_id = str(row["id"])
     chat["events"] = [
@@ -951,7 +1013,18 @@ def _row_to_chat(connection: sqlite3.Connection, row: sqlite3.Row, *, branch_ref
     branching = chat.get("branching")
     if _is_branch_graph(branching):
         if _has_embedded_nodes(branching):
-            branching, off_path = _migrate_legacy_branching(connection, chat_id, chat, chat["events"])
+            if migrate:
+                branching, off_path = _migrate_legacy_branching(connection, chat_id, chat, chat["events"])
+            else:
+                # Readers never write: serve the legacy graph as stored and let
+                # the background writer normalize it (verified) later.
+                on_path = {str(event.get("id", "")) for event in chat["events"]}
+                off_path = {
+                    _node_event_id(node): node["event"] for node in branching["nodes"]
+                    if isinstance(node, dict) and isinstance(node.get("event"), dict)
+                    and _node_event_id(node) not in on_path
+                }
+                _defer_migration(chat_id)
         else:
             off_path = _off_path_events(connection, chat_id)
         if branch_refs:
@@ -988,7 +1061,7 @@ def load_chat_metadata(chat_id: str) -> Optional[dict]:
     Hot routing paths (notably Design asset proxying) need a few metadata fields
     and must not deserialize the entire conversation for every HTTP request.
     """
-    with _DB_LOCK, _database() as connection:
+    with _reader() as connection:
         row = connection.execute("SELECT metadata_json FROM chats WHERE id = ?", (chat_id,)).fetchone()
         if row is not None:
             return json.loads(row["metadata_json"])
@@ -1035,35 +1108,42 @@ def load_chat_summaries() -> list[dict]:
     if cfg.CHATS_DIR.exists():
         for entry in cfg.CHATS_DIR.iterdir():
             if entry.is_dir() and (entry / "chat.json").exists():
-                with _DB_LOCK, _database() as connection:
+                with _reader() as connection:
                     exists = connection.execute(
                         "SELECT 1 FROM chats WHERE id = ?", (entry.name,)
                     ).fetchone()
                 if exists is None:
                     load_chat(entry.name)
 
-    with _DB_LOCK, _database() as connection:
+    with _reader() as connection:
         rows = connection.execute(
             "SELECT id, summary_json FROM chats ORDER BY updated_at DESC"
         ).fetchall()
-        missing = [str(row["id"]) for row in rows if row["summary_json"] is None]
-        backfilled: dict[str, dict] = {}
-        for chat_id in missing:
-            metadata = json.loads(connection.execute(
-                "SELECT metadata_json FROM chats WHERE id = ?", (chat_id,)
-            ).fetchone()["metadata_json"])
-            backfilled[chat_id] = _summary_fields(metadata)
-            connection.execute("UPDATE chats SET summary_json = ? WHERE id = ?",
-                               (json.dumps(backfilled[chat_id], default=str), chat_id))
         tags_by_chat: dict[str, list[str]] = {}
         for tag_row in connection.execute(
             "SELECT chat_id, tag FROM chat_tags ORDER BY chat_id, score DESC, tag"
         ):
             tags_by_chat.setdefault(str(tag_row["chat_id"]), []).append(str(tag_row["tag"]))
+    missing = [str(row["id"]) for row in rows if row["summary_json"] is None]
+    backfilled: dict[str, dict] = {}
+    if missing:
+        # One-time backfill for rows written before summary_json existed.
+        with _DB_LOCK, _database() as connection:
+            for chat_id in missing:
+                found = connection.execute(
+                    "SELECT metadata_json FROM chats WHERE id = ?", (chat_id,)
+                ).fetchone()
+                if found is None:
+                    continue
+                backfilled[chat_id] = _summary_fields(json.loads(found["metadata_json"]))
+                connection.execute("UPDATE chats SET summary_json = ? WHERE id = ?",
+                                   (json.dumps(backfilled[chat_id], default=str), chat_id))
 
     result: list[dict] = []
     for row in rows:
         chat_id = str(row["id"])
+        if row["summary_json"] is None and chat_id not in backfilled:
+            continue
         summary = backfilled.get(chat_id) or json.loads(row["summary_json"])
         summary.setdefault("id", chat_id)
         result.append(_summary_from_metadata(summary, tags_by_chat.get(chat_id)))
@@ -1076,7 +1156,7 @@ def load_chat(chat_id: str, *, branch_refs: bool = False) -> Optional[dict]:
     ``branch_refs`` returns compact reference-form branching (nodes carry ids;
     off-path payloads listed once) for renderers that understand it.
     """
-    with _DB_LOCK, _database() as connection:
+    with _reader() as connection:
         row = connection.execute("SELECT id, metadata_json FROM chats WHERE id = ?", (chat_id,)).fetchone()
         if row is not None:
             return _row_to_chat(connection, row, branch_refs=branch_refs)
@@ -1100,7 +1180,7 @@ def load_all_chats() -> list[dict]:
         for entry in cfg.CHATS_DIR.iterdir():
             if entry.is_dir() and (entry / "chat.json").exists():
                 load_chat(entry.name)
-    with _DB_LOCK, _database() as connection:
+    with _reader() as connection:
         rows = connection.execute("SELECT id, metadata_json FROM chats ORDER BY updated_at DESC").fetchall()
         return [_row_to_chat(connection, row) for row in rows]
 
@@ -1130,7 +1210,7 @@ def delete_chat(chat_id: str) -> bool:
 
 
 def chat_exists(chat_id: str) -> bool:
-    with _DB_LOCK, _database() as connection:
+    with _reader() as connection:
         if connection.execute("SELECT 1 FROM chats WHERE id = ?", (chat_id,)).fetchone():
             return True
     return _chat_file(chat_id).exists() and load_chat(chat_id) is not None
@@ -1217,7 +1297,7 @@ def _replace_topic_tags(
 def topic_tags() -> dict[str, list[str]]:
     """Return lightweight server-authoritative tag projections for live clients."""
     result: dict[str, list[str]] = {}
-    with _DB_LOCK, _database() as connection:
+    with _reader() as connection:
         for row in connection.execute(
             "SELECT chat_id,tag FROM chat_tags ORDER BY chat_id,score DESC,tag"
         ):
@@ -1373,7 +1453,7 @@ def search_current_transcripts(query: str) -> dict:
     clean = str(query).strip()
     if not clean:
         return {"chat_ids": [], "hits_by_chat": {}}
-    with _DB_LOCK, _database() as connection:
+    with _reader() as connection:
         rows = _direct_current_search_rows(connection, clean)
 
     chat_ids: list[str] = []
@@ -1392,7 +1472,7 @@ def search_branches(chat_id: str, query: str) -> dict:
     clean = str(query).strip()
     if not clean:
         return {"branch_ids": [], "hits_by_branch": {}}
-    with _DB_LOCK, _database() as connection:
+    with _reader() as connection:
         rows = _direct_branch_search_rows(connection, chat_id, clean)
         chat_row = connection.execute("SELECT metadata_json FROM chats WHERE id = ?", (chat_id,)).fetchone()
 
@@ -1409,7 +1489,7 @@ def search_branches(chat_id: str, query: str) -> dict:
 def search_chat_ids(query: str) -> list[str]:
     """Search conversation titles and derived tags through canonical SQLite."""
     words = [part for part in str(query).lower().split() if part]
-    with _DB_LOCK, _database() as connection:
+    with _reader() as connection:
         rows = connection.execute("""
             SELECT c.id, json_extract(c.metadata_json, '$.title') AS title,
                    COALESCE(GROUP_CONCAT(t.tag, ' '), '') AS tags

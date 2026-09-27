@@ -1795,8 +1795,9 @@ class BackgroundAgentTests(unittest.IsolatedAsyncioTestCase):
             async def __aexit__(self, *args):
                 return False
 
-            def stream(self, method, url, json, headers, **kwargs):
-                captured.update({"method": method, "url": url, "body": json, "headers": headers})
+            def stream(self, method, url, headers, content=None, json=None, **kwargs):
+                body = json if json is not None else __import__("json").loads(content)
+                captured.update({"method": method, "url": url, "body": body, "headers": headers})
                 return Response()
 
         value = chat("wire")

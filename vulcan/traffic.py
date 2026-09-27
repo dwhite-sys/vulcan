@@ -134,7 +134,12 @@ class EgressScheduler:
 
     # ── Producers ─────────────────────────────────────────────────────────
 
-    async def send(self, plaintext: bytes, lane: int, *, ordered: bool = False) -> None:
+    def reserve_ordered(self) -> int:
+        """Claim an ordering slot now for a frame whose content is captured
+        now but encoded later (e.g. in a worker); pass it to send()."""
+        return self._reserve_ordered()
+
+    async def send(self, plaintext: bytes, lane: int, *, ordered: bool = False, reserved: int = 0) -> None:
         """Enqueue and wait for delivery; waits for lane capacity first.
 
         CONTROL is never budget-blocked. Budget waits admit at least one item
@@ -145,7 +150,8 @@ class EgressScheduler:
         # An ordered frame claims its place in the ordering *before* waiting
         # for capacity: its content was captured now, so no live delta
         # produced while it waits may overtake it.
-        reserved = self._reserve_ordered() if ordered else 0
+        if not reserved:
+            reserved = self._reserve_ordered() if ordered else 0
         try:
             soft = self._soft_budget(lane)
             while soft is not None and self._bytes[lane] and self._bytes[lane] + len(plaintext) > soft:
@@ -204,6 +210,12 @@ class EgressScheduler:
             self._enqueue(STREAM, item, ordered=False)
             return
         self._enqueue(STREAM, _Item(plaintext, barrier=self._ordered_seq), ordered=False)
+
+    def release_reservation(self, reserved: int) -> None:
+        """Give back an unused ordering slot (the frame will not be sent)."""
+        if reserved:
+            self._ordered_done.add(reserved)
+            self._wakeup.set()
 
     def close(self) -> None:
         if self._closed:

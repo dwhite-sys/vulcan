@@ -188,9 +188,15 @@ class ChatSoakTests(unittest.TestCase):
                     worst = max(during) if during else 0.0
                     per_message.append((run_seconds, worst, len(during)))
                     if REPORT:
+                        lag = ""
+                        try:
+                            metrics, _ = speaker.request("server/metrics", {}, timeout=10)
+                            lag = f", loop lag peak so far {metrics['payload']['loop_lag']['peak_ms']:.0f}ms"
+                        except Exception:
+                            pass  # pre-overhaul servers have no metrics RPC
                         print(f"message {message + 1}: run {run_seconds:.2f}s, worst second-client "
                               f"connect+list+open {worst * 1000:.0f}ms over {len(during)} probes, "
-                              f"events {len(chat['events'])}", flush=True)
+                              f"events {len(chat['events'])}{lag}", flush=True)
             finally:
                 stop_probe.set()
                 prober.join(timeout=120)

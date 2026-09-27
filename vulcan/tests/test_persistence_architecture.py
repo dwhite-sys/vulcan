@@ -214,6 +214,8 @@ class BranchNormalizationTests(unittest.TestCase):
         loaded = chats.load_chat("legacy-branchy")
         self.assertEqual(loaded["events"], original["events"])
         self.assertEqual(loaded["branching"], original["branching"])
+        # Readers never write: the verified migration runs on the background writer.
+        self.assertTrue(chats.wait_for_index())
         # Storage is now reference-based; off-path payloads live once, canonically.
         with chats._DB_LOCK, chats._database() as connection:
             stored = json.loads(connection.execute(
@@ -256,6 +258,39 @@ class BranchNormalizationTests(unittest.TestCase):
         self.assertEqual(set(by_id), {"u1", "a1", "u1-edit", "a1-edit"})
         self.assertEqual(chats.search_current_transcripts("apricots")["chat_ids"], ["switch-branch"])
         self.assertEqual(chats.search_branches("switch-branch", "blueberries")["branch_ids"], ["edit"])
+
+
+class ReaderIsolationTests(unittest.TestCase):
+    def test_navigation_reads_never_wait_for_the_writer(self):
+        import threading
+        chat = make_chat("reader-free", 30)
+        chats.save_chat(chat)
+        holding, release = threading.Event(), threading.Event()
+
+        def slow_writer():
+            # A long background write (e.g. indexing a huge tool result).
+            with chats._DB_LOCK, chats._database() as connection:
+                connection.execute("UPDATE chats SET updated_at = 'writing' WHERE id = 'reader-free'")
+                connection.execute("INSERT INTO fts_rowids(chat_id, event_id) VALUES('reader-free', 'uncommitted')")
+                holding.set()
+                release.wait(10)
+
+        writer = threading.Thread(target=slow_writer)
+        writer.start()
+        self.assertTrue(holding.wait(5))
+        try:
+            started = time.perf_counter()
+            loaded = chats.load_chat("reader-free")
+            listed = chats.load_chat_summaries()
+            found = chats.search_current_transcripts("historical")
+            elapsed = time.perf_counter() - started
+        finally:
+            release.set()
+            writer.join()
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual(loaded["events"], chat["events"])
+        self.assertIn("reader-free", [item["id"] for item in listed])
+        self.assertIn("reader-free", found["chat_ids"])
 
 
 class SummaryTests(unittest.TestCase):

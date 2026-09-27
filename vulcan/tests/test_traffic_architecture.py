@@ -252,6 +252,41 @@ class RunDeltaProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(mirror.events[run.events[-1]["id"]]["content"], "first second")
         session.cleanup()
 
+    async def test_active_subscribe_response_equals_direct_snapshot_and_orders_deltas(self):
+        transport = RecordingTransport()
+        session = ws_general.GeneralWSSession(transport)
+        session.supports_run_deltas = True
+        chat = base_chat("sub-splice")
+        chat["events"] = [{"id": f"h{index}", "type": "assistant_text", "content": "history " * 50,
+                           "timestamp": "t"} for index in range(30)] + chat["events"]
+        chat["branching"] = {"version": 1, "currentBranchId": "root", "nodes": [], "branches": []}
+        run = agent.AgentRun(chat=chat, options={}, manager=agent.MANAGER, run_id="run")
+        run.persist_base = len(chat["events"])
+        run.task = asyncio.get_running_loop().create_future()  # looks active
+        agent.MANAGER.runs["sub-splice"] = run
+        try:
+            run.stream_event({"type": "text_delta", "delta": "before "}, "turn")
+            run.flush_deltas()
+            await session.handle_message({"id": "s", "type": "runs/subscribe", "payload": {"chat_id": "sub-splice"}})
+            run.stream_event({"type": "text_delta", "delta": "after"}, "turn")
+            run.flush_deltas()
+            await asyncio.sleep(0.05)
+            response = next(frame for frame in transport.frames if frame.get("id") == "s")["payload"]
+            expected = json.loads(json.dumps(run.subscription_snapshot()["chat"]))
+            expected["events"][-1]["content"] = "before "
+            self.assertEqual(response["chat"], expected)
+            mirror = TranscriptMirror()
+            mirror.apply({"type": "push/run-events", "payload": {"events": response["chat"]["events"], "seqs": response["seqs"]}})
+            after = transport.frames[transport.frames.index(next(f for f in transport.frames if f.get("id") == "s")) + 1:]
+            for frame in after:
+                mirror.apply(frame)
+            self.assertEqual(mirror.gaps, 0)
+            self.assertEqual(mirror.events[run.events[-1]["id"]]["content"], "before after")
+        finally:
+            agent.MANAGER.runs.pop("sub-splice", None)
+            agent.MANAGER.unsubscribe(session)
+            session.cleanup()
+
     async def test_subscription_snapshot_is_consistent_with_seq(self):
         manager = agent.RunManager()
         chat = base_chat("snapshot-seq")

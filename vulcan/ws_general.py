@@ -134,6 +134,15 @@ _OWNED_BULK_RESPONSES = frozenset({
 _OFFLOAD_ENCODE_HINT = 64 * 1024
 
 
+def _join_json_arrays(left: str, right: str) -> str:
+    """Concatenate two encoded JSON arrays."""
+    if left == "[]":
+        return right
+    if right == "[]":
+        return left
+    return left[:-1] + "," + right[1:]
+
+
 def _lane_for(msg: dict, request_type: str | None = None) -> int:
     msg_type = str(msg.get("type") or "")
     if msg.get("id"):
@@ -254,7 +263,7 @@ class GeneralWSSession:
         kind = request_type or str(msg.get("type") or "")
         try:
             if lane == traffic.BULK and kind in _OWNED_BULK_RESPONSES:
-                plaintext = await asyncio.to_thread(agent_runtime.encode_message, msg)
+                plaintext = await asyncio.to_thread(agent_runtime.encode_message_chunked, msg)
             else:
                 plaintext = agent_runtime.encode_message(msg)
             await self.egress.send(plaintext, lane, ordered=kind in _ORDERED_RESPONSES)
@@ -738,8 +747,9 @@ class GeneralWSSession:
         ``include_chat`` (default true for older renderers) lets a client that
         already holds the transcript subscribe without a second full transfer.
         The response is an *ordered* frame: live deltas published after the
-        snapshot below cannot overtake it, and ``seqs`` tells the renderer
-        which deltas the snapshot already contains.
+        snapshot cannot overtake it, and ``seqs`` tells the renderer which
+        deltas the snapshot already contains. Large transcripts are encoded
+        off the event loop in GIL-friendly pieces.
         """
         chat_id = p["chat_id"]
         self._note_capabilities(p)
@@ -747,26 +757,68 @@ class GeneralWSSession:
         agent_runtime.MANAGER.subscribe(chat_id, self)
         include_chat = p.get("include_chat", True) is not False
         run = agent_runtime.MANAGER.runs.get(chat_id)
-        chat = None
-        seqs: dict[str, int] = {}
-        if run is not None:
-            snapshot = run.subscription_snapshot() if include_chat else {"chat": None, "seqs": dict(run.stream_seq)}
-            chat, seqs = snapshot["chat"], snapshot["seqs"]
-        elif include_chat:
-            chat = await chat_store.run_db(chat_store.load_chat, chat_id, branch_refs=bool(p.get("branch_refs")))
+        loaded = None
+        if run is None and include_chat:
+            loaded = await chat_store.run_db_read(chat_store.load_chat, chat_id, branch_refs=bool(p.get("branch_refs")))
             # A run may have started while the transcript was loading.
             run = agent_runtime.MANAGER.runs.get(chat_id)
-            if run is not None:
-                snapshot = run.subscription_snapshot()
-                chat, seqs = snapshot["chat"], snapshot["seqs"]
-        payload = {
-            "chat_id": chat_id, "status": ("complete" if run and run.generation_complete else run.status) if run else "idle",
-            "run_id": run.run_id if run else None, "question": run.question_batch if run else None,
-            "seqs": seqs,
-        }
-        if include_chat:
-            payload["chat"] = chat
-        await self.respond(req_id, "runs/subscribe", payload)
+
+        def state(active) -> dict[str, Any]:
+            return {
+                "chat_id": chat_id,
+                "status": ("complete" if active.generation_complete else active.status) if active else "idle",
+                "run_id": active.run_id if active else None,
+                "question": active.question_batch if active else None,
+            }
+
+        if not include_chat:
+            await self.respond(req_id, "runs/subscribe", {**state(run), "seqs": dict(run.stream_seq) if run else {}})
+            return
+        if run is None:
+            payload = {**state(None), "seqs": {}, "chat": loaded}
+            message = {"id": req_id, "type": "runs/subscribe/response", "payload": payload}
+            reserved = self.egress.reserve_ordered()
+            try:
+                plaintext = await asyncio.to_thread(agent_runtime.encode_message_chunked, message)
+            except BaseException:
+                self.egress.release_reservation(reserved)
+                raise
+            await self._send_reserved(plaintext, reserved)
+            return
+        # Active run: capture everything at one loop instant (consistent with
+        # seqs), claim the ordering slot now, encode the immutable bulk later.
+        metadata, history, tail, branching, seqs = run.subscription_parts()
+        has_branching = "branching" in run.chat
+        head = agent_runtime.dumps_chunked({**state(run), "seqs": seqs})
+        meta_json = agent_runtime.dumps_chunked(metadata)
+        tail_json = agent_runtime.dumps_chunked(list(tail))
+        reserved = self.egress.reserve_ordered()
+
+        def assemble() -> bytes:
+            history_json = agent_runtime.dumps_chunked(list(history))
+            events_json = _join_json_arrays(history_json, tail_json)
+            chat_json = meta_json[:-1] + ("," if len(meta_json) > 2 else "")
+            if has_branching:
+                chat_json += '"branching":' + agent_runtime.dumps_chunked(branching) + ","
+            chat_json += '"events":' + events_json + "}"
+            payload_json = head[:-1] + ("," if len(head) > 2 else "") + '"chat":' + chat_json + "}"
+            return ('{"id":' + json.dumps(req_id) + ',"type":"runs/subscribe/response","payload":'
+                    + payload_json + "}").encode("utf-8")
+
+        try:
+            plaintext = await asyncio.to_thread(assemble)
+        except BaseException:
+            self.egress.release_reservation(reserved)
+            raise
+        await self._send_reserved(plaintext, reserved)
+
+    async def _send_reserved(self, plaintext: bytes, reserved: int) -> None:
+        try:
+            await self.egress.send(plaintext, traffic.BULK, reserved=reserved)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
 
     async def _runs_answer(self, req_id: str, p: dict):
         agent_runtime.MANAGER.answer(p["chat_id"], p["batch_id"], p.get("answers", {}))
@@ -785,7 +837,7 @@ class GeneralWSSession:
         # r14 clients request a sidebar-only projection and hydrate one chat on
         # selection.  Keep the old full-list contract for older renderers.
         loader = chat_store.load_chat_summaries if p.get("summary_only") else chat_store.load_all_chats
-        chat_list = await chat_store.run_db(loader)
+        chat_list = await chat_store.run_db_read(loader)
         await self.respond(req_id, "chats/list", {"chats": chat_list})
 
     async def _chats_topics(self, req_id: str, p: dict):
@@ -794,26 +846,26 @@ class GeneralWSSession:
         if isinstance(since, int) and since == version:
             await self.respond(req_id, "chats/topics", {"unchanged": True, "version": version})
             return
-        tags = await chat_store.run_db(chat_store.topic_tags)
+        tags = await chat_store.run_db_read(chat_store.topic_tags)
         await self.respond(req_id, "chats/topics", {"tags": tags, "version": version})
 
     async def _chats_search(self, req_id: str, p: dict):
         # Universal message search is intentionally one direct FTS path. Title,
         # auto-tag and folder matching already happen from sidebar metadata on the
         # client, so do not run a second SQLite search or merge two result sets.
-        result = await chat_store.run_db(
+        result = await chat_store.run_db_read(
             chat_store.search_current_transcripts, str(p.get("query", ""))
         )
         await self.respond(req_id, "chats/search", result)
 
     async def _chats_branch_search(self, req_id: str, p: dict):
-        result = await chat_store.run_db(
+        result = await chat_store.run_db_read(
             chat_store.search_branches, str(p.get("chat_id", "")), str(p.get("query", ""))
         )
         await self.respond(req_id, "chats/branch-search", result)
 
     async def _chats_get(self, req_id: str, p: dict):
-        chat = await chat_store.run_db(chat_store.load_chat, p["chat_id"], branch_refs=bool(p.get("branch_refs")))
+        chat = await chat_store.run_db_read(chat_store.load_chat, p["chat_id"], branch_refs=bool(p.get("branch_refs")))
         if chat is None:
             await self.error(req_id, "Chat not found")
         else:
@@ -826,7 +878,7 @@ class GeneralWSSession:
             active.materialize_all()
             chat = active.chat
         else:
-            chat = await chat_store.run_db(chat_store.load_chat, chat_id)
+            chat = await chat_store.run_db_read(chat_store.load_chat, chat_id)
         if chat is None:
             await self.error(req_id, "Chat not found")
             return

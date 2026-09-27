@@ -39,7 +39,7 @@ def _records(chat_id: str | None = None) -> list[dict]:
 
     selection = "AND e.chat_id = ?" if chat_id is not None else ""
     parameters = ((chat_id,) if chat_id is not None else ()) + (_MAX_MESSAGES_PER_CHAT, _MAX_MESSAGES)
-    with chats._DB_LOCK, chats._database() as source:
+    with chats._reader() as source:
         canonical = {
             (row["chat_id"], row["event_id"]): row
             for row in source.execute(f"""

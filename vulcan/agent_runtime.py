@@ -136,6 +136,28 @@ def encode_message(message: Any) -> bytes:
     return json.dumps(message, default=str, separators=(",", ":")).encode("utf-8")
 
 
+def dumps_chunked(value: Any, _depth: int = 0) -> str:
+    """json.dumps(value, default=str, separators=(",", ":")) in small pieces.
+
+    CPython's C JSON encoder holds the GIL for one whole call, so encoding a
+    15 MB transcript even in a worker thread freezes the event loop for that
+    long. Encoding container members separately yields the GIL between
+    pieces (each event / message is its own call) with identical output.
+    """
+    if _depth < 4 and isinstance(value, dict) and all(isinstance(key, str) for key in value):
+        return "{" + ",".join(
+            json.dumps(key) + ":" + dumps_chunked(item, _depth + 1) for key, item in value.items()
+        ) + "}"
+    if _depth < 4 and isinstance(value, (list, tuple)) and len(value) > 1:
+        return "[" + ",".join(dumps_chunked(item, _depth + 1) for item in value) + "]"
+    return json.dumps(value, default=str, separators=(",", ":"))
+
+
+def encode_message_chunked(message: Any) -> bytes:
+    """encode_message, GIL-friendly for large payloads (run it in a worker)."""
+    return dumps_chunked(message).encode("utf-8")
+
+
 def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
@@ -856,6 +878,18 @@ class AgentRun:
             "status": self.status, "updatedAt": self.chat.get("updatedAt"),
         })
 
+    def subscription_parts(self) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]], Any, dict[str, int]]:
+        """Split a consistent snapshot into (metadata, history, tail, branching, seqs).
+
+        History (before persist_base) and the client-authored branching object
+        are never mutated by the run, so they may be encoded off the loop; the
+        small live tail and metadata must be encoded immediately.
+        """
+        self.materialize_all()
+        base = min(self.persist_base, len(self.events))
+        metadata = {key: value for key, value in self.chat.items() if key not in ("events", "branching")}
+        return metadata, self.events[:base], self.events[base:], self.chat.get("branching"), dict(self.stream_seq)
+
     def subscription_snapshot(self) -> dict[str, Any]:
         """Materialized chat plus per-event seqs for a (re)subscribing client."""
         self.materialize_all()
@@ -1467,13 +1501,17 @@ async def _provider_response(run: AgentRun, messages: list[dict[str, Any]], tool
         except (json.JSONDecodeError, IndexError, TypeError):
             return False
 
+    # The request body carries the whole conversation; encoding it on the
+    # loop would stall every other client for every provider turn. The turn's
+    # message list is not mutated until this response returns.
+    encoded_body = await asyncio.to_thread(dumps_chunked, body)
     if provider.get("networkPointOfView") == "client":
         client_id = provider.get("clientId")
         if not client_id:
             raise RuntimeError("Client provider has no connected Vulcan client")
         pending = ""
         provider_stream = etna_registry.relay_http_stream(
-            str(client_id), endpoint, "POST", headers=headers, body=body, timeout=3600,
+            str(client_id), endpoint, "POST", headers=headers, body=encoded_body, timeout=3600,
         )
         terminal = False
         try:
@@ -1504,7 +1542,7 @@ async def _provider_response(run: AgentRun, messages: list[dict[str, Any]], tool
         for attempt in range(2):
             try:
                 async with client.stream(
-                    "POST", endpoint, json=body, headers=headers,
+                    "POST", endpoint, content=encoded_body.encode("utf-8"), headers=headers,
                     timeout=httpx.Timeout(None, connect=10.0, pool=5.0),
                 ) as response:
                     if response.status_code >= 400:
@@ -1633,8 +1671,14 @@ async def execute_run(run: AgentRun):
         if user_event.get("attachmentNotices"):
             user_content = (user_content + "\n\n" + user_event["attachmentNotices"]).strip()
     disabled_tools = set(run.options.get("disabledTools", []))
+    # Projecting the history serializes every earlier tool result: O(chat) work
+    # that grows with every message. The pre-run history is never mutated by
+    # the run, so project it in a worker instead of stalling the loop that
+    # serves every other client.
+    history = list(run.events[:-1])
+    projected = await asyncio.to_thread(project_history, history)
     messages = [{"role": "system", "content": build_prompt(run.chat, settings, kits, enabled, disabled_tools)},
-                *project_history(run.events[:-1]), {"role": "user", "content": _user_content(user_event, user_content)}]
+                *projected, {"role": "user", "content": _user_content(user_event, user_content)}]
     tools = _toolset(run)
     promoted_tools: set[str] = set()
     if settings.get("cliWorkspaceEnabled"):

@@ -1150,6 +1150,16 @@ def load_chat_summaries() -> list[dict]:
     return result
 
 
+def load_chat_events(chat_id: str) -> Optional[list[dict]]:
+    """Current-path events only (no metadata/branch work); None if unknown."""
+    with _reader() as connection:
+        if connection.execute("SELECT 1 FROM chats WHERE id = ?", (chat_id,)).fetchone() is None:
+            return None
+        return [json.loads(row["payload_json"]) for row in connection.execute(
+            "SELECT payload_json FROM chat_events WHERE chat_id = ? ORDER BY position", (chat_id,)
+        )]
+
+
 def load_chat(chat_id: str, *, branch_refs: bool = False) -> Optional[dict]:
     """Load a single chat by ID. Returns None if not found.
 

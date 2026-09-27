@@ -402,7 +402,8 @@ class GeneralWSSession:
         etna_registry.register_client(client_id, self)
         await self.respond(req_id, "client/register", {
             "ok": True, "client_id": client_id,
-            "capabilities": ["run-delta-v1", "relay-credit-v1", "subscribe-include-chat-v1", "branch-refs-v1", "topics-push-v1"],
+            "capabilities": ["run-delta-v1", "relay-credit-v1", "subscribe-include-chat-v1", "branch-refs-v1",
+                             "topics-push-v1", "runs-start-ref-v1"],
         })
 
 
@@ -669,11 +670,47 @@ class GeneralWSSession:
         data = response.json()
         await self.respond(req_id, "providers/models", {"data": data.get("data", [])})
 
+    async def _chat_from_reference(self, meta: dict, ref: dict) -> tuple[dict, int]:
+        """Rebuild a run's chat from server-held history plus the new turn.
+
+        The renderer names the history it built on (length + last event id)
+        and sends only the new events, so a message no longer re-uploads and
+        re-parses the entire conversation. Any divergence is refused with
+        ``stale_base`` and the renderer falls back to a full upload.
+        """
+        chat_id = str(meta["id"])
+        existing = agent_runtime.MANAGER.runs.get(chat_id)
+        if existing and existing.task and not existing.task.done() and existing.generation_complete:
+            # The previous run is only finishing its final checkpoint.
+            try:
+                await asyncio.shield(existing.task)
+            except Exception:
+                pass
+        existing = agent_runtime.MANAGER.runs.get(chat_id)
+        if existing and existing.task and not existing.task.done():
+            raise ValueError("An agent run is already active for this chat")
+        base_len = ref.get("base_len")
+        new_events = ref.get("new_events")
+        if not isinstance(base_len, int) or base_len < 0 or not isinstance(new_events, list) or not new_events:
+            raise ValueError("stale_base: invalid chat reference")
+        stored = await chat_store.run_db_read(chat_store.load_chat_events, chat_id)
+        base_last_id = ref.get("base_last_id")
+        if stored is None or len(stored) < base_len or (
+            base_len and str(stored[base_len - 1].get("id")) != str(base_last_id)
+        ):
+            raise ValueError("stale_base: server history differs from the renderer's")
+        chat = {key: value for key, value in meta.items() if key != "events"}
+        chat["events"] = [*stored[:base_len], *new_events]
+        return chat, base_len
+
     async def _runs_start(self, req_id: str, p: dict):
         self._note_capabilities(p)
         chat = p.get("chat")
         if not isinstance(chat, dict) or not chat.get("id"):
             raise ValueError("Missing chat or chat.id")
+        persisted_base = None
+        if isinstance(p.get("chat_ref"), dict):
+            chat, persisted_base = await self._chat_from_reference(chat, p["chat_ref"])
         options = p.get("options") or {}
         if not isinstance(options, dict):
             raise ValueError("Invalid run options")
@@ -708,7 +745,7 @@ class GeneralWSSession:
         # deterministic user+assistant title classifier; provider inference is
         # never used for chat naming.
         self.focused_chat_id = str(chat["id"])
-        run = await agent_runtime.MANAGER.start_async(chat, options, session=self)
+        run = await agent_runtime.MANAGER.start_async(chat, options, session=self, persisted_base=persisted_base)
         # Keep the acknowledgement tiny. The renderer already owns the submitted
         # transcript; live/final pushes carry authoritative changes after dispatch.
         await self.respond(req_id, "runs/start", {

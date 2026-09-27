@@ -260,6 +260,76 @@ class BranchNormalizationTests(unittest.TestCase):
         self.assertEqual(chats.search_branches("switch-branch", "blueberries")["branch_ids"], ["edit"])
 
 
+class RunStartByReferenceTests(unittest.IsolatedAsyncioTestCase):
+    async def _start(self, session, payload):
+        from vulcan import ws_general  # noqa: F401
+        await session.handle_message({"id": "start", "type": "runs/start", "payload": payload})
+        response = next(frame for frame in session.ws.frames if frame.get("id") == "start")
+        session.ws.frames.clear()
+        return response
+
+    async def test_new_turn_travels_without_the_history(self):
+        from unittest import mock
+        from vulcan import ws_general
+
+        class Transport:
+            def __init__(self):
+                self.frames = []
+
+            async def send_plaintext(self, plaintext):
+                self.frames.append(json.loads(plaintext))
+
+        seen = []
+
+        async def provider(run, messages, tools, turn_id):
+            seen.append([message.get("content") for message in messages if message["role"] == "user"])
+            run.stream_event({"type": "text_delta", "delta": "ok"}, turn_id)
+            return {"thinking": "", "content": "ok", "toolCalls": [], "providerTerminal": True}
+
+        history = make_chat("by-ref", 40)
+        history["events"][0]["content"] = "original first question"
+        chats.save_chat(copy.deepcopy(history))
+        session = ws_general.GeneralWSSession(Transport())
+        options = {"provider": {"baseUrl": "http://p/v1", "model": "m", "networkPointOfView": "server"},
+                   "settings": {"toolMode": "search", "cliWorkspaceEnabled": False}}
+        meta = {key: value for key, value in history.items() if key != "events"}
+        new_turn = event("by-ref-u2", "user_message", "follow-up question")
+        with mock.patch.object(agent, "_provider_response", provider):
+            reply = await self._start(session, {
+                "chat": {**meta, "events": []}, "options": options,
+                "chat_ref": {"base_len": 40, "base_last_id": history["events"][-1]["id"], "new_events": [new_turn]},
+            })
+            self.assertEqual(reply["type"], "runs/start/response")
+            await asyncio.wait_for(agent.MANAGER.runs["by-ref"].task, timeout=5)
+        stored = chats.load_chat("by-ref")
+        self.assertEqual([item["id"] for item in stored["events"][:41]],
+                         [item["id"] for item in history["events"]] + ["by-ref-u2"])
+        self.assertEqual(stored["events"][-1]["content"], "ok")
+        self.assertIn("original first question", seen[0])
+
+        # Edit of the first message: the renderer builds on a 0-length prefix.
+        edited = event("by-ref-u0-edit", "user_message", "edited first question")
+        with mock.patch.object(agent, "_provider_response", provider):
+            await self._start(session, {
+                "chat": {**meta, "events": []}, "options": options,
+                "chat_ref": {"base_len": 0, "base_last_id": None, "new_events": [edited]},
+            })
+            await asyncio.wait_for(agent.MANAGER.runs["by-ref"].task, timeout=5)
+        stored = chats.load_chat("by-ref")
+        self.assertEqual([item["id"] for item in stored["events"]][:1], ["by-ref-u0-edit"])
+        self.assertEqual(len(stored["events"]), 2)
+        self.assertEqual(chats.search_current_transcripts("follow-up")["chat_ids"], [])
+
+        # A renderer whose history diverged is told to upload the full chat.
+        reply = await self._start(session, {
+            "chat": {**meta, "events": []}, "options": options,
+            "chat_ref": {"base_len": 5, "base_last_id": "nope", "new_events": [event("x", "user_message", "x")]},
+        })
+        self.assertEqual(reply["type"], "error")
+        self.assertIn("stale_base", reply["payload"]["message"])
+        session.cleanup()
+
+
 class ReaderIsolationTests(unittest.TestCase):
     def test_navigation_reads_never_wait_for_the_writer(self):
         import threading

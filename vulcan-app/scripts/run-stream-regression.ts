@@ -170,4 +170,9 @@ const select = app.slice(app.indexOf('const handleSelectChat = (chatId: string) 
 assert.doesNotMatch(select, /loadChat\(/, 'chat open must not hydrate via chats/get and then subscribe again');
 assert.match(select, /'runs\/subscribe'/);
 
+const start = app.slice(app.indexOf('const runOptions = {'), app.indexOf("response = await vulcan.generalWS.send('runs/start', fullPayload())"));
+assert.match(start, /hasServerCapability\('runs-start-ref-v1'\)/, 'new turns are sent by reference when supported');
+assert.match(start, /chat_ref: \{ base_len: history\.length, base_last_id/);
+assert.match(start, /\/stale_base\//, 'a diverged reference falls back to a full upload');
+
 console.log('Run stream regression: ok');

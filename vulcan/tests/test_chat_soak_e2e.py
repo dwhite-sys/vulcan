@@ -153,7 +153,8 @@ class ChatSoakTests(unittest.TestCase):
             prober = threading.Thread(target=probe, args=(test_client,), daemon=True)
             prober.start()
             try:
-                speaker.request("client/register", {"client_id": "speaker", "capabilities": ["run-delta-v1"]})
+                registered, _ = speaker.request("client/register", {"client_id": "speaker", "capabilities": ["run-delta-v1"]})
+                capabilities = registered["payload"].get("capabilities") or []
                 for message in range(MESSAGES):
                     user = {"id": f"soak-u{message}", "type": "user_message",
                             "content": f"message {message}: " + words(40, rng), "timestamp": "t"}
@@ -172,8 +173,16 @@ class ChatSoakTests(unittest.TestCase):
                     provider.base_tools = sum(1 for event in chat["events"] if event.get("type") == "tool")
                     samples.clear()
                     started = time.perf_counter()
-                    speaker.request("runs/start", {"chat": chat, "options": options,
-                                                   "capabilities": ["run-delta-v1"]}, timeout=120)
+                    payload = {"chat": chat, "options": options, "capabilities": ["run-delta-v1"]}
+                    if message and "runs-start-ref-v1" in capabilities:
+                        # Current renderer: send only the new turn.
+                        meta = {key: value for key, value in chat.items() if key != "events"}
+                        payload = {**payload, "chat": {**meta, "events": []}, "chat_ref": {
+                            "base_len": len(chat["events"]) - 1,
+                            "base_last_id": chat["events"][-2]["id"],
+                            "new_events": chat["events"][-1:],
+                        }}
+                    speaker.request("runs/start", payload, timeout=120)
                     while True:
                         status, _ = speaker.request("runs/status", {"chat_id": "soak"}, timeout=120)
                         if status["payload"]["status"] in ("idle", "complete"):

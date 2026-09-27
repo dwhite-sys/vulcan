@@ -2510,25 +2510,45 @@ Narrate at the level of intent. Say what you're doing and why; don't narrate eac
       void repairToolSemanticIndex(kitsWithTools).then((repaired) => {
         if (repaired) toolSemanticIndexRef.current = repaired;
       });
-      const response = await vulcan.generalWS.send('runs/start', {
-        chat: chatForWire(chat),
-        capabilities: CLIENT_CAPABILITIES,
-        options: {
-          userContent,
-          autoGenerateTitle: isPending,
-          provider,
-          settings: vulcanSettings,
-          enabledKits,
-          disabledTools: Array.from(disabledTools),
-          kitsWithTools,
-          enabledGeneralSkills: skills.filter((skill) => skill.enabled)
-            .map(({ name, description, source }) => ({ name, description, source })),
-          etnaSkills: etnaSkillDescriptors,
-          toolSemanticIndex,
-          renderWidth: renderWidthRef.current,
-          modelVision: isVisionModel(selectedModel),
-        },
-      });
+      const runOptions = {
+        userContent,
+        autoGenerateTitle: isPending,
+        provider,
+        settings: vulcanSettings,
+        enabledKits,
+        disabledTools: Array.from(disabledTools),
+        kitsWithTools,
+        enabledGeneralSkills: skills.filter((skill) => skill.enabled)
+          .map(({ name, description, source }) => ({ name, description, source })),
+        etnaSkills: etnaSkillDescriptors,
+        toolSemanticIndex,
+        renderWidth: renderWidthRef.current,
+        modelVision: isVisionModel(selectedModel),
+      };
+      // The server already holds this chat's history: send only the new turn,
+      // anchored on the history it was built from, instead of re-uploading
+      // (and making the server re-parse) the whole conversation every message.
+      // Divergence is refused as stale_base and falls back to a full upload.
+      const wireChat = chatForWire(chat);
+      const byReference = !isPending && vulcan.generalWS.hasServerCapability('runs-start-ref-v1') && chat.events.length > 0;
+      const referencePayload = () => {
+        const history = chat.events.slice(0, -1);
+        const { events: _events, ...meta } = wireChat;
+        return {
+          chat: { ...meta, events: [] },
+          chat_ref: { base_len: history.length, base_last_id: history.at(-1)?.id ?? null, new_events: chat.events.slice(-1) },
+          capabilities: CLIENT_CAPABILITIES,
+          options: runOptions,
+        };
+      };
+      const fullPayload = () => ({ chat: wireChat, capabilities: CLIENT_CAPABILITIES, options: runOptions });
+      let response: any;
+      try {
+        response = await vulcan.generalWS.send('runs/start', byReference ? referencePayload() : fullPayload());
+      } catch (error: any) {
+        if (!byReference || !/stale_base/.test(String(error?.message ?? ''))) throw error;
+        response = await vulcan.generalWS.send('runs/start', fullPayload());
+      }
       // r15 deliberately keeps runs/start acknowledgement tiny. The renderer
       // already owns the submitted active-branch transcript; live/final server
       // pushes are authoritative for changes after dispatch.

@@ -1147,7 +1147,8 @@ class RunManager:
         run.persisted_branching = chat.get("branching")
         return self._launch(run, session)
 
-    async def start_async(self, chat: dict[str, Any], options: dict[str, Any], session: Any | None = None) -> AgentRun:
+    async def start_async(self, chat: dict[str, Any], options: dict[str, Any], session: Any | None = None,
+                          *, persisted_base: int | None = None) -> AgentRun:
         # The renderer is released as soon as the provider explicitly ends the
         # final completion. If a user submits the next turn while the previous
         # run is only finishing persistence/title cleanup, accept that send and
@@ -1166,13 +1167,24 @@ class RunManager:
         # is needed. save_chat itself only writes rows that changed.
         # AgentRun.checkpoint uses the same lock so durability remains ordered.
         snapshot = {**chat, "events": list(chat["events"])}
+        initial_checkpoint = None
+        if persisted_base is not None:
+            # History up to persisted_base was read from storage just now: the
+            # initial persist is a mutation (new turn + metadata), not a save
+            # of the whole conversation.
+            run.persist_base = persisted_base
+            chat["updatedAt"] = now()
+            initial_checkpoint, _written, _dirty = run._build_checkpoint(full_compare=True)
         run.persist_base = len(snapshot["events"])
         run.persisted_branching = chat.get("branching")
 
         async def persist_initial() -> None:
             try:
                 async with run.persistence_lock:
-                    await chats.run_db(chats.save_chat, snapshot)
+                    if initial_checkpoint is not None:
+                        await chats.run_db(chats.apply_run_checkpoint, initial_checkpoint)
+                    else:
+                        await chats.run_db(chats.save_chat, snapshot)
             except Exception:
                 logger.exception("Initial background persistence failed for %s", chat["id"])
 

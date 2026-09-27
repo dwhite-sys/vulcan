@@ -74,6 +74,25 @@ interface SettingsDialogProps {
   onToggleSkill: (stem: string, enabled: boolean) => void;
 }
 
+
+/**
+ * Periodic probes must never stack: when a probe is slower than its interval,
+ * skip ticks instead of piling more requests onto the congestion that made it
+ * slow in the first place.
+ */
+function singleFlight(task: () => Promise<void>): () => Promise<void> {
+  let running = false;
+  return async () => {
+    if (running) return;
+    running = true;
+    try {
+      await task();
+    } finally {
+      running = false;
+    }
+  };
+}
+
 export function SettingsDialog({
   isOpen,
   onClose,
@@ -270,7 +289,7 @@ export function SettingsDialog({
     // preserve the last confirmed state until a new result is available.
     setInferenceTestStatus('testing');
 
-    const poll = async () => {
+    const poll = singleFlight(async () => {
       const baseUrl = llmUrl.trim();
       if (!baseUrl) {
         if (!cancelled && settingsSessionRef.current === session) setInferenceTestStatus('fail');
@@ -295,7 +314,7 @@ export function SettingsDialog({
           setInferenceTestStatus('fail');
         }
       }
-    };
+    });
 
     void poll();
     const timer = window.setInterval(() => { void poll(); }, 3000);
@@ -308,7 +327,7 @@ export function SettingsDialog({
     if (!isOpen) return;
     let cancelled = false;
     const session = settingsSessionRef.current;
-    const poll = async () => {
+    const poll = singleFlight(async () => {
       const results = await Promise.all(vulcanServers.map(async (server) => {
         try {
           const response = await fetch(`${server.url}/ping`);
@@ -320,7 +339,7 @@ export function SettingsDialog({
       if (!cancelled && settingsSessionRef.current === session) {
         setVulcanServerStatuses(Object.fromEntries(results));
       }
-    };
+    });
     void poll();
     const timer = window.setInterval(() => { void poll(); }, 5000);
     return () => { cancelled = true; window.clearInterval(timer); };
@@ -338,7 +357,7 @@ export function SettingsDialog({
       return;
     }
     let cancelled = false;
-    const scan = async () => {
+    const scan = singleFlight(async () => {
       const results = await Promise.all(providers.map(async (provider) => {
         try {
           const models = await listModelsForProvider(provider);
@@ -354,7 +373,7 @@ export function SettingsDialog({
       if (cancelled) return;
       setProviderStatuses(Object.fromEntries(results.map((result) => [result.providerId, result.online])));
       setDiscoveredModels(results.flatMap((result) => result.models));
-    };
+    });
     void scan();
     const timer = window.setInterval(() => { void scan(); }, 3000);
     return () => { cancelled = true; window.clearInterval(timer); };
@@ -551,7 +570,7 @@ export function SettingsDialog({
     // A changed endpoint starts pending, while routine re-polls leave the
     // current visual state intact until their result arrives.
     setVulcanEndpointTestStatus('testing');
-    const poll = async () => {
+    const poll = singleFlight(async () => {
       const candidate = vulcanEndpointInput.trim().replace(/\/$/, '');
       if (!candidate) {
         if (!cancelled && settingsSessionRef.current === session) setVulcanEndpointTestStatus('fail');
@@ -563,7 +582,7 @@ export function SettingsDialog({
       } catch {
         if (!cancelled && settingsSessionRef.current === session) setVulcanEndpointTestStatus('fail');
       }
-    };
+    });
     void poll();
     const timer = window.setInterval(() => { void poll(); }, 3000);
     return () => { cancelled = true; window.clearInterval(timer); };

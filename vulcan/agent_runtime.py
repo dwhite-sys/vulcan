@@ -8,7 +8,6 @@ Runs belong to the server, never to a WebSocket connection.
 from __future__ import annotations
 
 import asyncio
-import copy
 import base64
 import html
 import hashlib
@@ -130,6 +129,33 @@ def _tool_semantic_scores(query: str, documents: list[str], index: dict[str, Any
         corpus.append(vector)
     query_vector = recall._normalize(list(recall.embedder().embed([query])))[0]
     return [float(np.dot(vector, query_vector)) for vector in corpus]
+
+
+def encode_message(message: Any) -> bytes:
+    """Canonical General-WS plaintext encoding (shared by every lane)."""
+    return json.dumps(message, default=str, separators=(",", ":")).encode("utf-8")
+
+
+def dumps_chunked(value: Any, _depth: int = 0) -> str:
+    """json.dumps(value, default=str, separators=(",", ":")) in small pieces.
+
+    CPython's C JSON encoder holds the GIL for one whole call, so encoding a
+    15 MB transcript even in a worker thread freezes the event loop for that
+    long. Encoding container members separately yields the GIL between
+    pieces (each event / message is its own call) with identical output.
+    """
+    if _depth < 4 and isinstance(value, dict) and all(isinstance(key, str) for key in value):
+        return "{" + ",".join(
+            json.dumps(key) + ":" + dumps_chunked(item, _depth + 1) for key, item in value.items()
+        ) + "}"
+    if _depth < 4 and isinstance(value, (list, tuple)) and len(value) > 1:
+        return "[" + ",".join(dumps_chunked(item, _depth + 1) for item in value) + "]"
+    return json.dumps(value, default=str, separators=(",", ":"))
+
+
+def encode_message_chunked(message: Any) -> bytes:
+    """encode_message, GIL-friendly for large payloads (run it in a worker)."""
+    return dumps_chunked(message).encode("utf-8")
 
 
 def now() -> str:
@@ -490,13 +516,25 @@ class ProviderStreamParser:
 
     def __init__(self, emit: Callable[[dict[str, Any]], None]):
         self.emit = emit
-        self.thinking = ""
-        self.content = ""
+        # Chunk builders, never growing aggregate strings: `str +=` on a value
+        # that grows for the whole response copies it on every token (O(n^2)).
+        # The complete values are materialized once, in finish().
+        self._thinking_parts: list[str] = []
+        self._content_parts: list[str] = []
         self.tool_calls: dict[int, dict[str, Any]] = {}
+        self._tool_parts: dict[int, tuple[list[str], list[str]]] = {}
         self.reasoning_wire: str | None = None
         self.reasoning_details: list[Any] = []
         self.inline_buffer = ""
         self.in_think = False
+
+    @property
+    def content(self) -> str:
+        return "".join(self._content_parts)
+
+    @property
+    def thinking(self) -> str:
+        return "".join(self._thinking_parts)
 
     @staticmethod
     def _partial_suffix(text: str, tags: list[str]) -> int:
@@ -507,7 +545,7 @@ class ProviderStreamParser:
 
     def _reason(self, text: str, wire: str | None = None, details: list[Any] | None = None):
         if text:
-            self.thinking += text
+            self._thinking_parts.append(text)
             event: dict[str, Any] = {"type": "reasoning_delta", "delta": text}
             if wire:
                 event["wire"] = wire
@@ -517,7 +555,7 @@ class ProviderStreamParser:
 
     def _text(self, text: str):
         if text:
-            self.content += text
+            self._content_parts.append(text)
             self.emit({"type": "text_delta", "delta": text})
 
     def _drain(self, final: bool = False):
@@ -581,22 +619,57 @@ class ProviderStreamParser:
         for fragment in delta.get("tool_calls") or []:
             index = int(fragment.get("index", 0))
             call = self.tool_calls.setdefault(index, {"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+            name_parts, argument_parts = self._tool_parts.setdefault(index, ([], []))
             if fragment.get("id"):
                 call["id"] = fragment["id"]
             function = fragment.get("function") or {}
-            call["function"]["name"] += function.get("name") or ""
-            call["function"]["arguments"] += function.get("arguments") or ""
+            if function.get("name"):
+                name_parts.append(function["name"])
+            if function.get("arguments"):
+                argument_parts.append(function["arguments"])
             self.emit({"type": "tool_call_delta", "index": index, "id": fragment.get("id"),
                        "nameDelta": function.get("name"), "argumentsDelta": function.get("arguments")})
 
     def finish(self) -> dict[str, Any]:
         self._drain(final=True)
+        for index, (name_parts, argument_parts) in self._tool_parts.items():
+            function = self.tool_calls[index]["function"]
+            function["name"] = "".join(name_parts)
+            function["arguments"] = "".join(argument_parts)
         calls = [self.tool_calls[index] for index in sorted(self.tool_calls)]
         for index, call in enumerate(calls):
             if not call["id"]:
                 call["id"] = f"call_{uuid.uuid4().hex}_{index}"
         return {"content": self.content, "thinking": self.thinking, "toolCalls": calls,
                 "reasoningWire": self.reasoning_wire, "reasoningDetails": self.reasoning_details}
+
+
+# Live token traffic is flushed as ordered deltas at most this often per run.
+# Anything that arrives inside the window is joined into one delta frame; a
+# timer guarantees a quiet provider never strands already-received text.
+_STREAM_FLUSH_SECONDS = 0.04
+_STREAMED_TEXT_FIELDS = ("content", "tool", "rawArguments")
+
+
+class _EventStream:
+    """Chunk builder for one live event.
+
+    ``flushed`` holds text parts already published as ``push/run-delta``
+    frames; ``pending`` holds parts received since the last flush. The event
+    dict's streamed fields are only materialized (joined) at boundaries that
+    need an authoritative full value: snapshots, checkpoints, sealing.
+    """
+
+    __slots__ = ("flushed", "pending", "pending_items", "pending_set")
+
+    def __init__(self) -> None:
+        self.flushed: dict[str, list[str]] = {}
+        self.pending: dict[str, list[str]] = {}
+        self.pending_items: dict[str, list[Any]] = {}
+        self.pending_set: dict[str, Any] = {}
+
+    def has_pending(self) -> bool:
+        return bool(self.pending or self.pending_items or self.pending_set)
 
 
 @dataclass
@@ -616,7 +689,6 @@ class AgentRun:
     active_semantic_id: str | None = None
     active_semantic_type: str | None = None
     streamed_tool_ids: dict[int, str] = field(default_factory=dict)
-    last_broadcast: float = 0
     dirty: bool = False
     persistence_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     initial_persist_task: asyncio.Task | None = None
@@ -625,6 +697,25 @@ class AgentRun:
     checkpoint_task: asyncio.Task | None = None
     checkpoint_requested: bool = False
     generation_complete: bool = False
+    # Stop may arrive before the task's first step. Cancelling an unstarted
+    # task skips _run's try/finally entirely (no interrupted state, no
+    # run-status push, chat never released), so that case is a flag instead.
+    started: bool = False
+    cancel_requested: bool = False
+    # Live delta streaming state (see _EventStream). ``stream_seq`` survives
+    # finalization so later authoritative snapshots carry the event's seq.
+    streams: dict[str, _EventStream] = field(default_factory=dict)
+    stream_seq: dict[str, int] = field(default_factory=dict)
+    live_events: dict[str, dict[str, Any]] = field(default_factory=dict)
+    flush_handle: Any = None
+    last_flush: float = 0
+    # Incremental persistence state: events before persist_base belong to the
+    # already-persisted history; persisted_json caches the last stored payload
+    # of each tail event; dirty_ids marks tail events touched since then.
+    persist_base: int = 0
+    persisted_json: dict[str, str] = field(default_factory=dict)
+    dirty_ids: set[str] = field(default_factory=set)
+    persisted_branching: Any = field(default=None)
 
     @property
     def events(self) -> list[dict[str, Any]]:
@@ -634,35 +725,232 @@ class AgentRun:
         self.sequence += 1
         return f"{self.run_id}:{kind}:{self.sequence}"
 
+    def find_event(self, event_id: str) -> dict[str, Any] | None:
+        live = self.live_events.get(event_id)
+        if live is not None:
+            return live
+        return next((item for item in reversed(self.events) if item.get("id") == event_id), None)
+
+    # ── Live stream builders ──────────────────────────────────────────────
+
+    def _stream(self, event: dict[str, Any]) -> _EventStream:
+        event_id = event["id"]
+        stream = self.streams.get(event_id)
+        if stream is None:
+            stream = self.streams[event_id] = _EventStream()
+            self.live_events[event_id] = event
+            for name in _STREAMED_TEXT_FIELDS:
+                value = event.get(name)
+                if isinstance(value, str) and value:
+                    stream.flushed[name] = [value]
+        return stream
+
+    def _append_stream(self, event: dict[str, Any], name: str, text: str) -> None:
+        if text:
+            self._stream(event).pending.setdefault(name, []).append(text)
+
+    def _schedule_flush(self) -> None:
+        instant = time.monotonic()
+        if instant - self.last_flush >= _STREAM_FLUSH_SECONDS:
+            self.flush_deltas()
+            return
+        if self.flush_handle is None:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                return
+            self.flush_handle = loop.call_later(
+                _STREAM_FLUSH_SECONDS - (instant - self.last_flush), self.flush_deltas
+            )
+
+    def flush_deltas(self) -> None:
+        """Publish every pending chunk as one ordered delta per live event."""
+        if self.flush_handle is not None:
+            self.flush_handle.cancel()
+            self.flush_handle = None
+        self.last_flush = time.monotonic()
+        for event_id, stream in list(self.streams.items()):
+            if not stream.has_pending():
+                continue
+            payload: dict[str, Any] = {
+                "chat_id": self.chat["id"], "run_id": self.run_id, "event_id": event_id,
+            }
+            if stream.pending:
+                append: dict[str, str] = {}
+                for name, parts in stream.pending.items():
+                    text = "".join(parts)
+                    stream.flushed.setdefault(name, []).append(text)
+                    append[name] = text
+                payload["append"] = append
+                stream.pending = {}
+            if stream.pending_items:
+                event = self.live_events[event_id]
+                for name, items in stream.pending_items.items():
+                    event[name] = [*(event.get(name) or []), *items]
+                payload["extend"] = stream.pending_items
+                stream.pending_items = {}
+            if stream.pending_set:
+                payload["set"] = stream.pending_set
+                stream.pending_set = {}
+            seq = self.stream_seq.get(event_id, 0) + 1
+            self.stream_seq[event_id] = seq
+            self.dirty_ids.add(event_id)
+            payload["seq"] = seq
+            self.manager.publish_delta(self, event_id, payload)
+
+    def materialize(self, event_id: str) -> None:
+        """Join already-flushed parts into the event dict (never pending text).
+
+        Excluding pending parts keeps every snapshot consistent with its seq:
+        a snapshot at seq S contains exactly the deltas 1..S.
+        """
+        stream = self.streams.get(event_id)
+        event = self.live_events.get(event_id)
+        if stream is None or event is None:
+            return
+        for name, parts in stream.flushed.items():
+            if len(parts) > 1:
+                parts[:] = ["".join(parts)]
+            event[name] = parts[0] if parts else ""
+
+    def materialize_all(self) -> None:
+        """Make every event dict authoritative (flush first, then join)."""
+        self.flush_deltas()
+        for event_id in list(self.streams):
+            self.materialize(event_id)
+
+    def finalize_stream(self, event_id: str) -> None:
+        """End live streaming for one event; its dict becomes the only source."""
+        if event_id not in self.streams:
+            return
+        self.flush_deltas()
+        self.materialize(event_id)
+        self.streams.pop(event_id, None)
+        self.live_events.pop(event_id, None)
+
+    def finalize_streams(self) -> None:
+        self.materialize_all()
+        self.streams.clear()
+        self.live_events.clear()
+
+    def stream_snapshot_message(self, event_id: str) -> dict[str, Any] | None:
+        """Lazily built replacement snapshot for a lagging/legacy subscriber."""
+        event = self.find_event(event_id)
+        if event is None:
+            return None
+        self.materialize(event_id)
+        return {"type": "push/run-event", "payload": {
+            "chat_id": self.chat["id"], "run_id": self.run_id, "event": event,
+            "seq": self.stream_seq.get(event_id, 0), "status": self.status,
+            "updatedAt": self.chat.get("updatedAt"),
+        }}
+
+    # ── Authoritative publication ─────────────────────────────────────────
+
     def _publish(self):
-        # Full snapshots are authoritative resync/checkpoint frames. They are
-        # deliberately *not* the token-stream transport: on a long chat, sending
-        # the whole transcript for every token can consume hundreds of Mbit/s and
-        # starve unrelated General-WS RPC responses behind the secure send lock.
-        self.manager.publish(self.chat["id"], "push/run-events", {
-            "chat_id": self.chat["id"], "run_id": self.run_id,
-            "events": self.events, "status": self.status, "updatedAt": self.chat.get("updatedAt"),
+        # Authoritative end-of-run reconciliation, never the token transport.
+        # Delta-capable renderers already hold the pre-run history, so they get
+        # only this run's tail (anchored on the last history event id); older
+        # renderers keep receiving the complete transcript.
+        self.materialize_all()
+        base = min(self.persist_base, len(self.events))
+        common = {"chat_id": self.chat["id"], "run_id": self.run_id, "status": self.status,
+                  "updatedAt": self.chat.get("updatedAt"), "seqs": dict(self.stream_seq)}
+        self.manager.publish_variants(self.chat["id"], "push/run-events", full={
+            **common, "events": self.events,
+        }, tail={
+            **common, "events": self.events[base:], "tail_from": base,
+            "base_last_id": self.events[base - 1]["id"] if base else None,
         })
 
     def _publish_stream_event(self, event: dict[str, Any]):
-        # Streaming updates carry only the event currently changing. The client
-        # already has the rest of the transcript from runs/start/subscribe, and a
-        # later checkpoint snapshot remains the recovery authority.
+        # One authoritative event snapshot (created / finalized / tool result).
+        # Ordinary tokens travel as push/run-delta; ``seq`` lets the renderer
+        # discard any delta this snapshot already contains.
+        event_id = str(event.get("id") or "")
+        if event_id in self.streams:
+            self.flush_deltas()
+            self.materialize(event_id)
+        self.dirty_ids.add(event_id)
         self.manager.publish(self.chat["id"], "push/run-event", {
             "chat_id": self.chat["id"], "run_id": self.run_id,
-            "event": event, "status": self.status, "updatedAt": self.chat.get("updatedAt"),
+            "event": event, "seq": self.stream_seq.get(event_id, 0),
+            "status": self.status, "updatedAt": self.chat.get("updatedAt"),
         })
 
+    def subscription_parts(self) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]], Any, dict[str, int]]:
+        """Split a consistent snapshot into (metadata, history, tail, branching, seqs).
+
+        History (before persist_base) and the client-authored branching object
+        are never mutated by the run, so they may be encoded off the loop; the
+        small live tail and metadata must be encoded immediately.
+        """
+        self.materialize_all()
+        base = min(self.persist_base, len(self.events))
+        metadata = {key: value for key, value in self.chat.items() if key not in ("events", "branching")}
+        return metadata, self.events[:base], self.events[base:], self.chat.get("branching"), dict(self.stream_seq)
+
+    def subscription_snapshot(self) -> dict[str, Any]:
+        """Materialized chat plus per-event seqs for a (re)subscribing client."""
+        self.materialize_all()
+        return {"chat": self.chat, "seqs": dict(self.stream_seq)}
+
+    def _build_checkpoint(self, *, full_compare: bool) -> tuple["chats.RunCheckpoint", dict[str, str], set[str]]:
+        """Build a small immutable mutation on the loop (no chat deepcopy).
+
+        History before ``persist_base`` is never rewritten by a run. In the
+        run's own tail only new or touched events are serialized, and only
+        payloads that differ from what was last persisted are sent. The final
+        checkpoint compares the whole tail as a safety net.
+        """
+        events = self.events
+        base = min(self.persist_base, len(events))
+        path_ids = tuple(str(event.get("id", "")) for event in events)
+        changed: list[tuple[int, str]] = []
+        written: dict[str, str] = {}
+        for position in range(base, len(events)):
+            event_id = path_ids[position]
+            if not full_compare and event_id in self.persisted_json and event_id not in self.dirty_ids:
+                continue
+            payload = json.dumps(events[position], default=str)
+            if self.persisted_json.get(event_id) != payload:
+                changed.append((position, payload))
+                written[event_id] = payload
+        metadata = {key: value for key, value in self.chat.items() if key not in ("events", "tags", "branching")}
+        branching = self.chat.get("branching")
+        replaced = branching is not self.persisted_branching
+        checkpoint = chats.RunCheckpoint(
+            chat_id=self.chat["id"],
+            metadata_json=json.dumps(metadata, default=str),
+            branching=branching,
+            branching_replaced=replaced,
+            has_branching="branching" in self.chat,
+            created_at=self.chat.get("createdAt"),
+            updated_at=self.chat.get("updatedAt"),
+            base=base,
+            path_ids=path_ids,
+            changed=tuple(changed),
+            prefix_events=tuple(events[:base]),
+        )
+        dirty, self.dirty_ids = self.dirty_ids, set()
+        return checkpoint, written, dirty
+
     async def checkpoint(self, *, publish_full: bool = False):
+        self.materialize_all()
         self.chat["updatedAt"] = now()
-        # Snapshot before leaving the event loop: persistence must never serialize
-        # a dict that is concurrently being mutated by provider streaming.
-        snapshot = copy.deepcopy(self.chat)
+        checkpoint, written, dirty = self._build_checkpoint(full_compare=publish_full)
+        branching = self.chat.get("branching")
         # All writes for one run are ordered. start_async may have an initial
         # background save in flight; later checkpoints naturally queue behind it
         # instead of allowing the old snapshot to overwrite newer state.
-        async with self.persistence_lock:
-            await asyncio.to_thread(chats.save_chat, snapshot)
+        try:
+            async with self.persistence_lock:
+                await chats.run_db(chats.apply_run_checkpoint, checkpoint)
+        except BaseException:
+            self.dirty_ids |= dirty
+            raise
+        self.persisted_json.update(written)
+        self.persisted_branching = branching
         self.dirty = False
         if publish_full:
             self._publish()
@@ -703,43 +991,46 @@ class AgentRun:
                 self.events.append(item)
                 self.active_semantic_id = item["id"]
                 self.active_semantic_type = semantic
-            item = next(value for value in reversed(self.events) if value["id"] == self.active_semantic_id)
-            item["content"] += event.get("delta", "")
+                self._stream(item)
+                self._publish_stream_event(item)
+            item = self.live_events[self.active_semantic_id]
+            self._append_stream(item, "content", event.get("delta", ""))
             if event.get("details"):
-                item.setdefault("reasoningDetails", []).extend(event["details"])
+                self._stream(item).pending_items.setdefault("reasoningDetails", []).extend(event["details"])
         elif kind == "tool_call_delta":
             self.seal_semantic()
             index = int(event.get("index", 0))
             existing_id = self.streamed_tool_ids.get(index)
-            if not existing_id:
+            item = self.find_event(existing_id) if existing_id else None
+            if item is None:
                 existing_id = self.event_id(f"tool:{index}")
                 self.streamed_tool_ids[index] = existing_id
-                self.events.append({"id": existing_id, "type": "tool", "callId": event.get("id") or "",
-                                    "tool": "", "arguments": {}, "rawArguments": "", "status": "running",
-                                    "timestamp": now(), "runId": self.run_id, "turnId": turn_id})
-            item = next(value for value in self.events if value["id"] == existing_id)
-            if event.get("id"):
+                item = {"id": existing_id, "type": "tool", "callId": event.get("id") or "",
+                        "tool": "", "arguments": {}, "rawArguments": "", "status": "running",
+                        "timestamp": now(), "runId": self.run_id, "turnId": turn_id}
+                self.events.append(item)
+                self._stream(item)
+                self._publish_stream_event(item)
+            stream = self._stream(item)
+            if event.get("id") and item.get("callId") != event["id"]:
                 item["callId"] = event["id"]
-            item["tool"] += event.get("nameDelta") or ""
-            item["rawArguments"] += event.get("argumentsDelta") or ""
+                stream.pending_set["callId"] = event["id"]
+            self._append_stream(item, "tool", event.get("nameDelta") or "")
+            self._append_stream(item, "rawArguments", event.get("argumentsDelta") or "")
+        else:
+            return
         self.dirty = True
-        instant = time.monotonic()
-        if instant - self.last_broadcast >= 0.04:
-            self.last_broadcast = instant
-            # Do not retransmit the full transcript for every streamed delta.
-            # A single-event snapshot is enough to render the live token/tool
-            # state and is coalesced by event id if the socket falls behind.
-            self._publish_stream_event(item)
+        self._schedule_flush()
 
     def seal_semantic(self, status: str = "complete"):
         if self.active_semantic_id:
-            item = next((value for value in self.events if value["id"] == self.active_semantic_id), None)
+            item = self.find_event(self.active_semantic_id)
             if item:
+                self.finalize_stream(self.active_semantic_id)
                 item["status"] = status
                 if item["type"] == "reasoning":
                     item["completedAt"] = now()
-                # Ensure the renderer sees the terminal status even when the last
-                # token arrived inside the 40ms stream throttle window.
+                # Authoritative boundary: the final content + terminal status.
                 self._publish_stream_event(item)
         self.active_semantic_id = None
         self.active_semantic_type = None
@@ -758,19 +1049,58 @@ class RunManager:
             sessions.discard(session)
 
     def publish(self, chat_id: str, event_type: str, payload: dict[str, Any]):
+        """Fan one authoritative (STATE) message out to the chat's subscribers.
+
+        Lane-aware sessions encode it immediately into their bounded egress
+        lanes (so later mutation of live dicts cannot leak into an older
+        snapshot); plain transports keep the historical task-per-send path.
+        """
         message = {"type": event_type, "payload": payload}
-        for session in list(self.subscribers.get(chat_id, set())):
-            if hasattr(session, "queue_latest"):
-                if event_type == "push/run-events":
-                    session.queue_latest(f"run-events:{chat_id}", message)
-                    continue
-                if event_type == "push/run-event":
-                    event = payload.get("event") if isinstance(payload, dict) else None
-                    event_id = str(event.get("id") or "") if isinstance(event, dict) else ""
-                    if event_id:
-                        session.queue_latest(f"run-event:{chat_id}:{event_id}", message)
-                        continue
+        encoded: bytes | None = None
+        for session in list(self.subscribers.get(chat_id, ())):
+            post = getattr(session, "post", None)
+            if post is not None:
+                if encoded is None:
+                    encoded = encode_message(message)
+                post(message, plaintext=encoded)
+                continue
             asyncio.create_task(session.send(message))
+
+    def publish_variants(self, chat_id: str, event_type: str, *, full: dict[str, Any], tail: dict[str, Any]) -> None:
+        """Publish a compact variant to delta-capable sessions, full to others."""
+        encoded: dict[str, bytes] = {}
+        for session in list(self.subscribers.get(chat_id, ())):
+            variant = "tail" if getattr(session, "supports_run_deltas", False) else "full"
+            message = {"type": event_type, "payload": tail if variant == "tail" else full}
+            post = getattr(session, "post", None)
+            if post is not None:
+                if variant not in encoded:
+                    encoded[variant] = encode_message(message)
+                post(message, plaintext=encoded[variant])
+                continue
+            asyncio.create_task(session.send(message))
+
+    def publish_delta(self, run: "AgentRun", event_id: str, payload: dict[str, Any]) -> None:
+        """Fan one ordered live delta out; lagging/legacy clients get snapshots."""
+        chat_id = run.chat["id"]
+        message = {"type": "push/run-delta", "payload": payload}
+        encoded: bytes | None = None
+        key = f"{chat_id}:{event_id}"
+        for session in list(self.subscribers.get(chat_id, ())):
+            post_delta = getattr(session, "post_run_delta", None)
+            if post_delta is not None:
+                if encoded is None:
+                    encoded = encode_message(message)
+                post_delta(chat_id, key, message, encoded, lambda: run.stream_snapshot_message(event_id))
+                continue
+            asyncio.create_task(session.send(message))
+
+    def metrics(self) -> dict[str, Any]:
+        return {
+            "active": sum(1 for run in self.runs.values() if run.task and not run.task.done()),
+            "live_streams": sum(len(run.streams) for run in self.runs.values()),
+            "subscribers": sum(len(sessions) for sessions in self.subscribers.values()),
+        }
 
     def _prepare_start(self, chat: dict[str, Any], options: dict[str, Any]) -> AgentRun:
         chat_id = chat["id"]
@@ -813,9 +1143,12 @@ class RunManager:
             if self.runs.get(chat["id"]) is run:
                 self.runs.pop(chat["id"], None)
             raise
+        run.persist_base = len(chat["events"])
+        run.persisted_branching = chat.get("branching")
         return self._launch(run, session)
 
-    async def start_async(self, chat: dict[str, Any], options: dict[str, Any], session: Any | None = None) -> AgentRun:
+    async def start_async(self, chat: dict[str, Any], options: dict[str, Any], session: Any | None = None,
+                          *, persisted_base: int | None = None) -> AgentRun:
         # The renderer is released as soon as the provider explicitly ends the
         # final completion. If a user submits the next turn while the previous
         # run is only finishing persistence/title cleanup, accept that send and
@@ -827,15 +1160,31 @@ class RunManager:
             except Exception:
                 pass
         run = self._prepare_start(chat, options)
-        # Provider dispatch must not wait for a potentially multi-megabyte
-        # SQLite/FTS rewrite. Persist an immutable snapshot in the background;
+        # Provider dispatch must not wait for SQLite. Persist in the background
+        # from a *shallow* snapshot: the run only ever appends new events to
+        # the live list and never mutates the submitted history dicts or the
+        # client-authored branching object, so no deepcopy of the whole chat
+        # is needed. save_chat itself only writes rows that changed.
         # AgentRun.checkpoint uses the same lock so durability remains ordered.
-        snapshot = copy.deepcopy(chat)
+        snapshot = {**chat, "events": list(chat["events"])}
+        initial_checkpoint = None
+        if persisted_base is not None:
+            # History up to persisted_base was read from storage just now: the
+            # initial persist is a mutation (new turn + metadata), not a save
+            # of the whole conversation.
+            run.persist_base = persisted_base
+            chat["updatedAt"] = now()
+            initial_checkpoint, _written, _dirty = run._build_checkpoint(full_compare=True)
+        run.persist_base = len(snapshot["events"])
+        run.persisted_branching = chat.get("branching")
 
         async def persist_initial() -> None:
             try:
                 async with run.persistence_lock:
-                    await asyncio.to_thread(chats.save_chat, snapshot)
+                    if initial_checkpoint is not None:
+                        await chats.run_db(chats.apply_run_checkpoint, initial_checkpoint)
+                    else:
+                        await chats.run_db(chats.save_chat, snapshot)
             except Exception:
                 logger.exception("Initial background persistence failed for %s", chat["id"])
 
@@ -865,34 +1214,48 @@ class RunManager:
             return
         # A manual rename during the first run always wins. Re-check persisted state
         # immediately before committing the deterministic title.
-        persisted = await asyncio.to_thread(chats.load_chat, run.chat["id"])
+        persisted = await chats.run_db(chats.load_chat_metadata, run.chat["id"])
         if persisted is None or persisted.get("title") != "New Chat" or run.chat.get("title") != "New Chat":
             return
         run.chat["title"] = title
-        run.chat["updatedAt"] = now()
-        await asyncio.to_thread(chats.save_chat, run.chat)
+        await run.checkpoint()
         self.publish(run.chat["id"], "push/chat-updated", {
             "chat_id": run.chat["id"], "title": title, "updatedAt": run.chat["updatedAt"],
         })
 
+    @staticmethod
+    def _request_cancel(run: AgentRun) -> bool:
+        if not run.task or run.task.done():
+            return False
+        if run.cancel_requested:
+            # A repeated Stop must never interrupt the finalization checkpoint
+            # the first Stop already triggered.
+            return True
+        run.cancel_requested = True
+        if run.started:
+            run.task.cancel()
+        # Unstarted: _run observes cancel_requested on its first step.
+        return True
+
     def cancel(self, chat_id: str) -> bool:
         # Request cancellation without waiting for run finalization.
         run = self.runs.get(chat_id)
-        if not run or not run.task or run.task.done():
+        if not run:
             return False
-        run.task.cancel()
-        return True
+        return self._request_cancel(run)
 
     async def cancel_and_wait(self, chat_id: str) -> bool:
         # Cancel a run and return only after the chat is free for another run.
         run = self.runs.get(chat_id)
-        if not run or not run.task or run.task.done():
+        if not run or not self._request_cancel(run):
             return False
-        run.task.cancel()
         try:
-            await run.task
+            await asyncio.shield(run.task)
         except asyncio.CancelledError:
-            pass
+            if run.task.cancelled():
+                pass
+            else:
+                raise
         return True
 
     def answer(self, chat_id: str, batch_id: str, answers: dict[str, Any]):
@@ -904,9 +1267,13 @@ class RunManager:
         run.question_future.set_result(answers)
 
     async def _run(self, run: AgentRun):
+        run.started = True
         self.publish(run.chat["id"], "push/run-status", {"chat_id": run.chat["id"], "status": "running", "run_id": run.run_id})
         try:
+            if run.cancel_requested:
+                raise asyncio.CancelledError()
             await execute_run(run)
+            run.finalize_streams()
             run.status = "complete"
             if run.initial_persist_task is not None:
                 try:
@@ -923,6 +1290,7 @@ class RunManager:
                                "timestamp": now(), "runId": run.run_id})
         finally:
             run.seal_semantic("interrupted" if run.status != "complete" else "complete")
+            run.finalize_streams()
             for event in run.events:
                 if event.get("status") in ("streaming", "running"):
                     event["status"] = "interrupted" if run.status != "complete" else "complete"
@@ -1145,13 +1513,17 @@ async def _provider_response(run: AgentRun, messages: list[dict[str, Any]], tool
         except (json.JSONDecodeError, IndexError, TypeError):
             return False
 
+    # The request body carries the whole conversation; encoding it on the
+    # loop would stall every other client for every provider turn. The turn's
+    # message list is not mutated until this response returns.
+    encoded_body = await asyncio.to_thread(dumps_chunked, body)
     if provider.get("networkPointOfView") == "client":
         client_id = provider.get("clientId")
         if not client_id:
             raise RuntimeError("Client provider has no connected Vulcan client")
         pending = ""
         provider_stream = etna_registry.relay_http_stream(
-            str(client_id), endpoint, "POST", headers=headers, body=body, timeout=3600,
+            str(client_id), endpoint, "POST", headers=headers, body=encoded_body, timeout=3600,
         )
         terminal = False
         try:
@@ -1182,7 +1554,7 @@ async def _provider_response(run: AgentRun, messages: list[dict[str, Any]], tool
         for attempt in range(2):
             try:
                 async with client.stream(
-                    "POST", endpoint, json=body, headers=headers,
+                    "POST", endpoint, content=encoded_body.encode("utf-8"), headers=headers,
                     timeout=httpx.Timeout(None, connect=10.0, pool=5.0),
                 ) as response:
                     if response.status_code >= 400:
@@ -1311,8 +1683,14 @@ async def execute_run(run: AgentRun):
         if user_event.get("attachmentNotices"):
             user_content = (user_content + "\n\n" + user_event["attachmentNotices"]).strip()
     disabled_tools = set(run.options.get("disabledTools", []))
+    # Projecting the history serializes every earlier tool result: O(chat) work
+    # that grows with every message. The pre-run history is never mutated by
+    # the run, so project it in a worker instead of stalling the loop that
+    # serves every other client.
+    history = list(run.events[:-1])
+    projected = await asyncio.to_thread(project_history, history)
     messages = [{"role": "system", "content": build_prompt(run.chat, settings, kits, enabled, disabled_tools)},
-                *project_history(run.events[:-1]), {"role": "user", "content": _user_content(user_event, user_content)}]
+                *projected, {"role": "user", "content": _user_content(user_event, user_content)}]
     tools = _toolset(run)
     promoted_tools: set[str] = set()
     if settings.get("cliWorkspaceEnabled"):

@@ -18,7 +18,7 @@ import * as vulcan from './services/vulcan';
 import {
   loadLLMConfig, saveLLMConfig,
   loadSelectedModel, saveSelectedModel,
-  loadChats, loadChat, saveChat, deleteChat, loadChatFolders, saveChatFolders,
+  loadChats, saveChat, deleteChat, loadChatFolders, saveChatFolders, hydrateChatPayload, chatForWire,
   loadDefaultEnabledKits, saveDefaultEnabledKits,
   loadDefaultDisabledTools, saveDefaultDisabledTools,
   loadVulcanSettings, saveVulcanSettings, loadDisabledEtnaSkills, saveDisabledEtnaSkills,
@@ -41,6 +41,9 @@ import { mergeEditedAttachments } from './services/messageEditing';
 import { advanceSearchChatId, advanceSearchIndex, clampSearchIndex, firstSearchMatchPerEvent, searchTranscript, unhydratedTranscriptSearchMatches, type TranscriptSearchMatch } from './services/transcriptSearch';
 import { filterSidebarByQuery } from './services/sidebarOrdering';
 import { branchById, branchEvents, createBranch, ensureBranching, renameBranch, syncCurrentBranch } from './services/branching';
+import { ClientHttpRelay } from './services/clientHttpRelay';
+import { CLIENT_CAPABILITIES } from './services/ws';
+import { applyRunStreamBatch, attachSeqs, type RunStreamMessage } from './services/runStream';
 import { toast, Toaster } from 'sonner';
 import { noteLocalToolRepeat, type ToolRepeatState } from './services/toolRepeatGuard';
 
@@ -419,13 +422,20 @@ export default function App() {
     }
 
     let cancelled = false;
+    let inFlight = false;
     const refresh = async () => {
+      // Single-flight: if the server is slow, skip ticks instead of stacking
+      // requests that would only deepen the backlog making it slow.
+      if (inFlight) return;
+      inFlight = true;
       try {
         const statuses = await vulcan.listTerminalChatStatuses();
         if (!cancelled) setTerminalChatStatuses(statuses);
       } catch {
         // Connection state/toasts are handled elsewhere; a transient poll failure
         // should not interrupt the chat UI.
+      } finally {
+        inFlight = false;
       }
     };
 
@@ -761,7 +771,12 @@ export default function App() {
   useEffect(() => {
     const init = async () => {
       if (!vulcan.generalWS.connected || !vulcan.generalWS.authenticated) return;
-      try { await vulcan.generalWS.send('client/register', { client_id: getEtnaClientDeviceId() }); } catch { return; }
+      try {
+        const registered = await vulcan.generalWS.send('client/register', {
+          client_id: getEtnaClientDeviceId(), capabilities: CLIENT_CAPABILITIES,
+        });
+        vulcan.generalWS.setServerCapabilities(registered?.capabilities);
+      } catch { return; }
       const loadedKits = await loadKits();
       await loadTools(loadedKits);
     };
@@ -834,92 +849,23 @@ export default function App() {
   }), []);
 
   // Generic authenticated client-side HTTP transport. Client-POV Providers use
-  // this for /models and streaming inference; cancellation aborts fetch immediately.
+  // this for /models and streaming inference; cancellation aborts fetch
+  // immediately, and streaming is flow controlled by a server-granted byte
+  // window (see services/clientHttpRelay.ts).
   useEffect(() => {
-    const active = new Map<string, AbortController>();
+    const relay = new ClientHttpRelay({
+      push: (type, payload) => vulcan.generalWS.push(type, payload),
+    });
     const offRequest = vulcan.generalWS.onPush('push/client-http-request', (payload: any) => {
-      void (async () => {
-        const relayId = String(payload?.relay_id || '');
-        if (!relayId) return;
-        const controller = new AbortController();
-        active.set(relayId, controller);
-        const timeoutMs = Math.max(1000, Number(payload?.timeout_ms || 30000));
-        const timer = window.setTimeout(() => controller.abort(), timeoutMs);
-        const emit = (event: Record<string, any>) =>
-          vulcan.generalWS.push('client/http-event', { relay_id: relayId, ...event });
-
-        // Browser fetch may expose very small transport chunks. Coalesce only a
-        // couple of milliseconds worth so AES/JSON/WebSocket framing overhead
-        // stays low without making token streaming feel buffered or remote.
-        let chunkBuffer = '';
-        let chunkTimer: number | null = null;
-        let chunkSendChain = Promise.resolve();
-        const flushChunks = () => {
-          if (chunkTimer !== null) { window.clearTimeout(chunkTimer); chunkTimer = null; }
-          if (!chunkBuffer) return chunkSendChain;
-          const data = chunkBuffer;
-          chunkBuffer = '';
-          chunkSendChain = chunkSendChain.then(() =>
-            vulcan.generalWS.push('client/http-chunk', { relay_id: relayId, data })
-          );
-          return chunkSendChain;
-        };
-        const emitChunk = (data: string) => {
-          if (!data) return;
-          chunkBuffer += data;
-          if (chunkBuffer.length >= 8 * 1024) {
-            void flushChunks();
-          } else if (chunkTimer === null) {
-            chunkTimer = window.setTimeout(() => { void flushChunks(); }, 2);
-          }
-        };
-        try {
-          const response = await fetch(String(payload.url || ''), {
-            method: payload.method || 'GET',
-            headers: payload.headers || {},
-            body: payload.body == null || (payload.method || 'GET') === 'GET'
-              ? undefined
-              : (typeof payload.body === 'string' ? payload.body : JSON.stringify(payload.body)),
-            signal: controller.signal,
-            redirect: 'follow',
-          });
-          if (!payload.stream) {
-            const text = await response.text();
-            await emit({ event: 'response', status: response.status, headers: Object.fromEntries(response.headers.entries()), text });
-            return;
-          }
-          await emit({ event: 'headers', status: response.status, headers: Object.fromEntries(response.headers.entries()) });
-          if (response.body) {
-            const reader = response.body.getReader();
-            const decoder = new TextDecoder();
-            while (true) {
-              const { value, done } = await reader.read();
-              if (done) break;
-              const data = decoder.decode(value, { stream: true });
-              if (data) emitChunk(data);
-            }
-            const tail = decoder.decode();
-            if (tail) emitChunk(tail);
-          }
-          await flushChunks();
-          await emit({ event: 'done' });
-        } catch (error: any) {
-          const message = error?.name === 'AbortError' ? 'Client HTTP request cancelled' : (error?.message ?? String(error));
-          await emit({ event: 'error', error: message }).catch(() => {});
-        } finally {
-          window.clearTimeout(timer);
-          active.delete(relayId);
-        }
-      })();
+      void relay.handleRequest(payload);
     });
-    const offCancel = vulcan.generalWS.onPush('push/client-http-cancel', (payload: any) => {
-      active.get(String(payload?.relay_id || ''))?.abort();
-    });
+    const offCancel = vulcan.generalWS.onPush('push/client-http-cancel', (payload: any) => relay.handleCancel(payload));
+    const offCredit = vulcan.generalWS.onPush('push/client-http-credit', (payload: any) => relay.handleCredit(payload));
     return () => {
       offRequest();
       offCancel();
-      for (const controller of active.values()) controller.abort();
-      active.clear();
+      offCredit();
+      relay.abortAll();
     };
   }, []);
 
@@ -943,12 +889,26 @@ export default function App() {
 
   // Topic extraction is server-owned and asynchronous; keep its tiny projection
   // current without reloading transcripts or allowing an old server to bleed over.
+  //
+  // The server pushes push/topics-changed when its projection advances; the
+  // timer is only low-frequency reconciliation (or the historical 3s poll for
+  // servers without that push). Every refresh is single-flight and sends the
+  // last seen version, so an unchanged projection costs one tiny reply.
   useEffect(() => {
     let cancelled = false;
+    let inFlight = false;
+    let rerun = false;
+    let version: number | null = null;
+    let timer: number | null = null;
     const refreshTopics = () => {
+      if (inFlight) { rerun = true; return; }
+      inFlight = true;
       const generation = serverContextGenerationRef.current;
-      void vulcan.loadChatTopics().then((mapping) => {
+      void vulcan.loadChatTopicsSince(version).then((result) => {
         if (cancelled || serverContextGenerationRef.current !== generation) return;
+        if (typeof result.version === 'number') version = result.version;
+        if (!result.tags) return;
+        const mapping = result.tags;
         const merge = (chat: Chat): Chat => {
           const next = mapping[chat.id] ?? [];
           const previous = chat.tags ?? [];
@@ -966,13 +926,23 @@ export default function App() {
           return changed ? next : previous;
         });
         setActiveChat((previous) => previous ? merge(previous) : previous);
-      }).catch(() => { /* reconnects and server switches own their normal recovery */ });
+      }).catch(() => { /* reconnects and server switches own their normal recovery */ })
+        .finally(() => {
+          inFlight = false;
+          if (rerun && !cancelled) { rerun = false; refreshTopics(); }
+        });
     };
+    const schedule = () => {
+      const delay = vulcan.generalWS.hasServerCapability('topics-push-v1') ? 30_000 : 3000;
+      timer = window.setTimeout(() => { refreshTopics(); schedule(); }, delay);
+    };
+    const offTopics = vulcan.generalWS.onPush('push/topics-changed', () => refreshTopics());
     refreshTopics();
-    const interval = window.setInterval(refreshTopics, 3000);
+    schedule();
     return () => {
       cancelled = true;
-      window.clearInterval(interval);
+      offTopics();
+      if (timer !== null) window.clearTimeout(timer);
     };
   }, [activeVulcanEndpoint]);
 
@@ -1043,17 +1013,43 @@ export default function App() {
     const generation = ++chatSelectionGenerationRef.current;
     const candidate = chats.find((c) => c.id === chatId);
     if (!candidate) return;
+    // The sidebar list only receives run boundaries; hand the live transcript
+    // of the chat being left back to it so returning to it shows current text.
+    const leaving = activeChat;
+    if (leaving && leaving.id !== chatId && pendingChatIdRef.current !== leaving.id) {
+      setChats((previous) => previous.map((item) => item.id === leaving.id && !item._summaryOnly ? leaving : item));
+    }
 
     void (async () => {
       let chat = candidate;
+      let subscription: any = null;
       if (candidate._summaryOnly) {
-        const hydrated = await loadChat(chatId);
+        // One chat-open transaction: transcript, run status, waiting question
+        // and live subscription arrive together (no chats/get + subscribe
+        // double transfer of the same transcript).
+        subscribedChatIdRef.current = chatId;
+        try {
+          subscription = await vulcan.generalWS.send('runs/subscribe', subscribePayload(chatId));
+        } catch {
+          if (subscribedChatIdRef.current === chatId) subscribedChatIdRef.current = null;
+          return;
+        }
+        const hydrated = hydrateChatPayload(subscription?.chat);
         if (!hydrated || generation !== chatSelectionGenerationRef.current) return;
+        attachSeqs(hydrated.events, subscription.seqs);
+        runStreamQueueRef.current.delete(chatId);
         chat = hydrated;
         setChats((previous) => previous.map((item) => item.id === chatId ? hydrated : item));
       }
       if (generation !== chatSelectionGenerationRef.current) return;
       setActiveChat(chat);
+      if (subscription) {
+        setProcessing(subscription.status === 'running' || subscription.status === 'waiting_for_user');
+        if (subscription.question) setQuestionBatch(subscription.question);
+      } else {
+        // Cached transcript: one subscribe reconciles it with server state.
+        void subscribeChat(chatId).catch(() => {});
+      }
       pendingChatIdRef.current = null;
       setPendingChat(null);
       const assets = projectWorkspaceAssets(chat.events);
@@ -2514,24 +2510,45 @@ Narrate at the level of intent. Say what you're doing and why; don't narrate eac
       void repairToolSemanticIndex(kitsWithTools).then((repaired) => {
         if (repaired) toolSemanticIndexRef.current = repaired;
       });
-      const response = await vulcan.generalWS.send('runs/start', {
-        chat,
-        options: {
-          userContent,
-          autoGenerateTitle: isPending,
-          provider,
-          settings: vulcanSettings,
-          enabledKits,
-          disabledTools: Array.from(disabledTools),
-          kitsWithTools,
-          enabledGeneralSkills: skills.filter((skill) => skill.enabled)
-            .map(({ name, description, source }) => ({ name, description, source })),
-          etnaSkills: etnaSkillDescriptors,
-          toolSemanticIndex,
-          renderWidth: renderWidthRef.current,
-          modelVision: isVisionModel(selectedModel),
-        },
-      });
+      const runOptions = {
+        userContent,
+        autoGenerateTitle: isPending,
+        provider,
+        settings: vulcanSettings,
+        enabledKits,
+        disabledTools: Array.from(disabledTools),
+        kitsWithTools,
+        enabledGeneralSkills: skills.filter((skill) => skill.enabled)
+          .map(({ name, description, source }) => ({ name, description, source })),
+        etnaSkills: etnaSkillDescriptors,
+        toolSemanticIndex,
+        renderWidth: renderWidthRef.current,
+        modelVision: isVisionModel(selectedModel),
+      };
+      // The server already holds this chat's history: send only the new turn,
+      // anchored on the history it was built from, instead of re-uploading
+      // (and making the server re-parse) the whole conversation every message.
+      // Divergence is refused as stale_base and falls back to a full upload.
+      const wireChat = chatForWire(chat);
+      const byReference = !isPending && vulcan.generalWS.hasServerCapability('runs-start-ref-v1') && chat.events.length > 0;
+      const referencePayload = () => {
+        const history = chat.events.slice(0, -1);
+        const { events: _events, ...meta } = wireChat;
+        return {
+          chat: { ...meta, events: [] },
+          chat_ref: { base_len: history.length, base_last_id: history.at(-1)?.id ?? null, new_events: chat.events.slice(-1) },
+          capabilities: CLIENT_CAPABILITIES,
+          options: runOptions,
+        };
+      };
+      const fullPayload = () => ({ chat: wireChat, capabilities: CLIENT_CAPABILITIES, options: runOptions });
+      let response: any;
+      try {
+        response = await vulcan.generalWS.send('runs/start', byReference ? referencePayload() : fullPayload());
+      } catch (error: any) {
+        if (!byReference || !/stale_base/.test(String(error?.message ?? ''))) throw error;
+        response = await vulcan.generalWS.send('runs/start', fullPayload());
+      }
       // r15 deliberately keeps runs/start acknowledgement tiny. The renderer
       // already owns the submitted active-branch transcript; live/final server
       // pushes are authoritative for changes after dispatch.
@@ -2562,37 +2579,142 @@ Narrate at the level of intent. Say what you're doing and why; don't narrate eac
     }
   };
 
+  // ── Live run transcript ────────────────────────────────────────────────────
   // Server push is the sole authority for active transcripts. Never write a pushed
   // snapshot back to the server: doing so can race a newer agent-side checkpoint.
+  //
+  // Token deltas (push/run-delta) and event snapshots (push/run-event) are
+  // queued and applied at most once per frame, in arrival order. A token is a
+  // pure transcript edit: it updates only the live transcript (active/pending
+  // chat) — never branch topology, never the sidebar list. The sidebar entry
+  // only receives authoritative event boundaries. Branch state is re-derived
+  // at real boundaries (full snapshot / subscription), not per token.
+  const runStreamQueueRef = useRef(new Map<string, RunStreamMessage[]>());
+  const runStreamFrameRef = useRef<number | null>(null);
+  const runGapChatsRef = useRef(new Set<string>());
+  const runResyncRef = useRef(new Set<string>());
+  const subscribedChatIdRef = useRef<string | null>(null);
+
+  const subscribePayload = (chatId: string) => ({
+    chat_id: chatId, include_chat: true, branch_refs: true, capabilities: CLIENT_CAPABILITIES,
+  });
+
+  const applySubscription = (chatId: string, result: any) => {
+    if (activeChatIdRef.current !== chatId) return;
+    setProcessing(result?.status === 'running' || result?.status === 'waiting_for_user');
+    if (result?.question) setQuestionBatch(result.question);
+    const hydrated = hydrateChatPayload(result?.chat);
+    if (!hydrated) return;
+    // The subscription snapshot supersedes everything queued before it: the
+    // server orders it ahead of every later delta, and its seqs say which
+    // deltas it already contains.
+    runStreamQueueRef.current.delete(chatId);
+    runGapChatsRef.current.delete(chatId);
+    attachSeqs(hydrated.events, result.seqs);
+    const merge = (previous: Chat): Chat => {
+      if (!previous.branching || previous._summaryOnly) return hydrated;
+      // Keep the renderer's branch graph and fold the authoritative transcript
+      // into it — a genuine boundary, so a full branch sync is warranted.
+      return syncCurrentBranch({ ...hydrated, branching: previous.branching }, hydrated.events);
+    };
+    setActiveChat((previous) => previous?.id === chatId ? merge(previous) : previous);
+    setChats((previous) => previous.map((item) => item.id === chatId ? merge(item) : item));
+  };
+
+  /** One chat-open/reconnect transaction: subscription + transcript + run state. */
+  const subscribeChat = (chatId: string): Promise<void> => {
+    subscribedChatIdRef.current = chatId;
+    return vulcan.generalWS.send('runs/subscribe', subscribePayload(chatId))
+      .then((result: any) => applySubscription(chatId, result));
+  };
+
+  const requestResync = (chatId: string) => {
+    if (runResyncRef.current.has(chatId) || activeChatIdRef.current !== chatId) return;
+    if (pendingChatIdRef.current === chatId) return;
+    runResyncRef.current.add(chatId);
+    void subscribeChat(chatId).catch(() => {}).finally(() => runResyncRef.current.delete(chatId));
+  };
+
+  const flushRunStreams = () => {
+    runStreamFrameRef.current = null;
+    const queued = runStreamQueueRef.current;
+    if (!queued.size) return;
+    runStreamQueueRef.current = new Map();
+    for (const [chatId, batch] of queued) {
+      const boundaries = batch.filter((message) => message.kind !== 'delta');
+      let updatedAt: Date | null = null;
+      for (const message of boundaries) {
+        const stamp = message.kind === 'event' ? (message.payload as any).updatedAt : (message as any).updatedAt;
+        if (stamp) updatedAt = new Date(stamp);
+      }
+      const apply = (chat: Chat, messages: RunStreamMessage[], trackGaps: boolean): Chat => {
+        const result = applyRunStreamBatch(chat.events, messages);
+        if (trackGaps && result.gap) runGapChatsRef.current.add(chatId);
+        if (!result.changed) return chat;
+        const base = { ...chat, events: result.events, ...(updatedAt ? { updatedAt } : {}) };
+        return result.full && chat.branching ? syncCurrentBranch(base, result.events) : base;
+      };
+      setPendingChat((previous) => previous?.id === chatId ? apply(previous, batch, true) : previous);
+      setActiveChat((previous) => previous?.id === chatId ? apply(previous, batch, true) : previous);
+      if (boundaries.length) {
+        setChats((previous) => {
+          let changed = false;
+          const next = previous.map((chat) => {
+            if (chat.id !== chatId || chat._summaryOnly) return chat;
+            const updated = apply(chat, boundaries, false);
+            if (updated !== chat) changed = true;
+            return updated;
+          });
+          return changed ? next : previous;
+        });
+      }
+    }
+    // Updaters run during React's render; inspect gaps once that has happened.
+    window.setTimeout(() => {
+      const gaps = [...runGapChatsRef.current];
+      runGapChatsRef.current.clear();
+      for (const chatId of gaps) requestResync(chatId);
+    }, 50);
+  };
+
+  const scheduleRunFlush = () => {
+    if (runStreamFrameRef.current !== null) return;
+    runStreamFrameRef.current = 1;
+    let done = false;
+    const run = () => { if (!done) { done = true; flushRunStreams(); } };
+    // rAF paces rendering; the timer keeps a hidden window's queue bounded.
+    window.requestAnimationFrame(run);
+    window.setTimeout(run, 100);
+  };
+
+  const enqueueRunStream = (chatId: string, message: RunStreamMessage) => {
+    if (!chatId) return;
+    const queue = runStreamQueueRef.current;
+    const list = queue.get(chatId);
+    if (list) list.push(message);
+    else queue.set(chatId, [message]);
+    scheduleRunFlush();
+  };
+
   useEffect(() => {
     const removeEvents = vulcan.generalWS.onPush('push/run-events', (payload: any) => {
-      const chatId = String(payload.chat_id ?? '');
-      const events = rehydrateChatEvents(payload.events ?? [], false);
-      const updatedAt = new Date(payload.updatedAt ?? Date.now());
-      const applyEvents = (chat: Chat): Chat => {
-        const base = { ...chat, events, updatedAt };
-        return chat.branching ? syncCurrentBranch(base, events) : base;
-      };
-      setChats((previous) => previous.map((chat) => chat.id === chatId ? applyEvents(chat) : chat));
-      setPendingChat((previous) => previous?.id === chatId ? applyEvents(previous) : previous);
-      setActiveChat((previous) => previous?.id === chatId ? applyEvents(previous) : previous);
+      enqueueRunStream(String(payload.chat_id ?? ''), {
+        kind: 'full', events: rehydrateChatEvents(payload.events ?? [], false), seqs: payload.seqs ?? null,
+        updatedAt: payload.updatedAt,
+        // Delta-capable servers send only the run's tail, anchored on the
+        // last pre-run event; older servers send the whole transcript.
+        tailFrom: typeof payload.tail_from === 'number' ? payload.tail_from : null,
+        baseLastId: payload.base_last_id ?? null,
+      });
     });
     const removeEvent = vulcan.generalWS.onPush('push/run-event', (payload: any) => {
-      const chatId = String(payload.chat_id ?? '');
-      const event = rehydrateChatEvents(payload.event ? [payload.event] : [], false)[0];
-      if (!chatId || !event?.id) return;
-      const updatedAt = new Date(payload.updatedAt ?? Date.now());
-      const applyEvent = (chat: Chat): Chat => {
-        const index = chat.events.findIndex((item) => item.id === event.id);
-        const events = index >= 0
-          ? chat.events.map((item, itemIndex) => itemIndex === index ? event : item)
-          : [...chat.events, event];
-        const base = { ...chat, events, updatedAt };
-        return chat.branching ? syncCurrentBranch(base, events) : base;
-      };
-      setChats((previous) => previous.map((chat) => chat.id === chatId ? applyEvent(chat) : chat));
-      setPendingChat((previous) => previous?.id === chatId ? applyEvent(previous) : previous);
-      setActiveChat((previous) => previous?.id === chatId ? applyEvent(previous) : previous);
+      if (!payload?.event?.id) return;
+      const event = rehydrateChatEvents([payload.event], false)[0];
+      enqueueRunStream(String(payload.chat_id ?? ''), { kind: 'event', payload: { ...payload, event } });
+    });
+    const removeDelta = vulcan.generalWS.onPush('push/run-delta', (payload: any) => {
+      if (!payload?.event_id) return;
+      enqueueRunStream(String(payload.chat_id ?? ''), { kind: 'delta', payload });
     });
     const removeChatUpdate = vulcan.generalWS.onPush('push/chat-updated', (payload: any) => {
       const chatId = String(payload.chat_id ?? '');
@@ -2660,55 +2782,27 @@ Narrate at the level of intent. Say what you're doing and why; don't narrate eac
     const removeIdle = vulcan.generalWS.onPush('push/terminal-idle', (payload: any) => {
       if (payload.chat_id === activeChatIdRef.current) setAgentRunningSlot(null);
     });
+    // Reconnect has exactly one owner: this authenticated push/connected
+    // handler re-opens the active chat in one subscribe transaction.
     const removeReconnect = vulcan.generalWS.onPush('push/connected', () => {
       const chatId = activeChatIdRef.current;
       if (!chatId || pendingChatIdRef.current === chatId) return;
-      void vulcan.generalWS.send('runs/subscribe', { chat_id: chatId }).then((result: any) => {
-        if (activeChatIdRef.current !== chatId) return;
-        setProcessing(result.status === 'running' || result.status === 'waiting_for_user');
-        if (result.question) setQuestionBatch(result.question);
-        if (result.chat) {
-          const events = rehydrateChatEvents(result.chat.events ?? [], false);
-          const updatedAt = new Date(result.chat.updatedAt);
-          const mergeEvents = (chat: Chat): Chat => {
-            const base = { ...chat, events, updatedAt };
-            return chat.branching ? syncCurrentBranch(base, events) : base;
-          };
-          setActiveChat((previous) => previous?.id === chatId ? mergeEvents(previous) : previous);
-          setChats((previous) => previous.map((chat) => chat.id === chatId ? mergeEvents(chat) : chat));
-        }
-      }).catch(() => {});
+      void subscribeChat(chatId).catch(() => {});
     });
     return () => {
-      removeEvents(); removeEvent(); removeChatUpdate(); removeGenerationComplete(); removeStatus(); removeQuestion(); removePanelDelete(); removeTerminal(); removeRunning(); removeIdle(); removeReconnect();
+      removeEvents(); removeEvent(); removeDelta(); removeChatUpdate(); removeGenerationComplete(); removeStatus(); removeQuestion(); removePanelDelete(); removeTerminal(); removeRunning(); removeIdle(); removeReconnect();
     };
   }, []);
 
-  // Reconnect or switch chats without attaching run ownership to this renderer.
+  // Opening a chat by any path other than handleSelectChat (which already
+  // performed the subscribe transaction) subscribes once. Reconnects are owned
+  // by the push/connected handler above, not by this effect.
   useEffect(() => {
     const chatId = activeChat?.id;
     if (!chatId || pendingChatIdRef.current === chatId) return;
-    let cancelled = false;
-    void vulcan.generalWS.send('runs/subscribe', { chat_id: chatId }).then((result: any) => {
-      if (cancelled || activeChatIdRef.current !== chatId) return;
-      setProcessing(result.status === 'running' || result.status === 'waiting_for_user');
-      if (result.question) setQuestionBatch(result.question);
-      if (result.chat) {
-        const restoredEvents = rehydrateChatEvents(result.chat.events ?? [], false);
-        setActiveChat((previous) => {
-          if (previous?.id !== chatId) return previous;
-          const base = { ...result.chat, ...(previous.branching ? { branching: previous.branching } : {}), events: restoredEvents, createdAt: new Date(result.chat.createdAt), updatedAt: new Date(result.chat.updatedAt) } as Chat;
-          return previous.branching ? syncCurrentBranch(base, restoredEvents) : base;
-        });
-        setChats((previous) => previous.map((item) => {
-          if (item.id !== chatId) return item;
-          const base = { ...result.chat, ...(item.branching ? { branching: item.branching } : {}), events: restoredEvents, createdAt: new Date(result.chat.createdAt), updatedAt: new Date(result.chat.updatedAt) } as Chat;
-          return item.branching ? syncCurrentBranch(base, restoredEvents) : base;
-        }));
-      }
-    }).catch(() => {});
-    return () => { cancelled = true; };
-  }, [activeChat?.id, connected]);
+    if (subscribedChatIdRef.current === chatId) return;
+    void subscribeChat(chatId).catch(() => {});
+  }, [activeChat?.id]);
 
   const handleSendMessage = async (content: string, files?: File[], quotes?: MessageQuote[], references?: MessageFileReference[], contextOrder?: string[], elements?: MessageElementReference[]) => {
     if (!activeChat || processing) return;

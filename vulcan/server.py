@@ -99,6 +99,8 @@ async def _prepare_recall_models():
     try:
         lexical = await asyncio.to_thread(recall.build_lexical_bank)
         recall.start_message_indexing()
+        from vulcan import topics
+        await asyncio.to_thread(topics.prewarm)
         logger.info("Lexical recall ready: %s", lexical["path"])
     except Exception:
         logger.exception("Lexical recall preparation failed; Vulcan remains available")

@@ -27,6 +27,8 @@ from fastapi import WebSocket
 from vulcan import config as cfg
 
 PROTOCOL_VERSION = 1
+# Frames at least this large are sealed/opened in a worker thread.
+OFFLOAD_BYTES = 256 * 1024
 _CONTEXT = b"vulcan-secure-session-v1\x00"
 _IDENTITY_FILE = cfg.CONFIG_DIR / "server-identity.ed25519"
 _IDENTITY_LOCK = threading.RLock()
@@ -39,6 +41,62 @@ def _b64(data: bytes) -> str:
 
 def _unb64(value: str) -> bytes:
     return base64.b64decode(value.encode("ascii"), validate=True)
+
+
+# base64/json of one multi-megabyte string is a single C call that holds the
+# GIL throughout (60-170 ms at 30-40 MB) and so freezes the event loop even
+# from a worker thread. Large frames are processed in slices instead, with
+# byte-identical results, releasing the GIL between slices.
+_B64_ENCODE_SLICE = 3 * 256 * 1024   # multiple of 3 bytes
+_B64_DECODE_SLICE = 4 * 256 * 1024   # multiple of 4 chars
+
+
+def _b64_slices(data: bytes) -> list[str]:
+    if len(data) <= _B64_ENCODE_SLICE:
+        return [_b64(data)]
+    view = memoryview(data)
+    return [
+        base64.b64encode(view[offset:offset + _B64_ENCODE_SLICE]).decode("ascii")
+        for offset in range(0, len(data), _B64_ENCODE_SLICE)
+    ]
+
+
+def _b64_sliced(data: bytes) -> str:
+    return "".join(_b64_slices(data))
+
+
+def _unb64_sliced(value: str) -> bytes:
+    if len(value) <= _B64_DECODE_SLICE:
+        return _unb64(value)
+    if len(value) % 4:
+        raise ValueError("Invalid base64 length")
+    return b"".join(
+        base64.b64decode(value[offset:offset + _B64_DECODE_SLICE].encode("ascii"), validate=True)
+        for offset in range(0, len(value), _B64_DECODE_SLICE)
+    )
+
+
+_CIPHERTEXT_KEY = '"ciphertext":"'
+
+
+def _parse_envelope(raw: str) -> tuple[Any, int, str]:
+    """(type, sequence, ciphertext) without JSON-parsing the huge ciphertext."""
+    if len(raw) < OFFLOAD_BYTES:
+        envelope = json.loads(raw)
+        return envelope.get("type"), int(envelope["sequence"]), envelope["ciphertext"]
+    start = raw.find(_CIPHERTEXT_KEY)
+    if start < 0:
+        envelope = json.loads(raw)
+        return envelope.get("type"), int(envelope["sequence"]), envelope["ciphertext"]
+    begin = start + len(_CIPHERTEXT_KEY)
+    end = raw.find('"', begin)
+    if end < 0:
+        raise ValueError("Unterminated ciphertext")
+    ciphertext = raw[begin:end]
+    envelope = json.loads(raw[:start] + '"ciphertext":""' + raw[end + 1:])
+    if not isinstance(envelope, dict) or "ciphertext" not in envelope:
+        raise ValueError("Malformed secure envelope")
+    return envelope.get("type"), int(envelope["sequence"]), ciphertext
 
 
 def _raw_public(key: Any) -> bytes:
@@ -193,31 +251,50 @@ class SecureWebSocketSession:
         return session
 
     async def send_json(self, payload: Any) -> None:
+        plaintext = json.dumps(payload, default=str, separators=(",", ":")).encode("utf-8")
+        await self.send_plaintext(plaintext)
+
+    def _seal(self, plaintext: bytes, sequence: int) -> str:
+        ciphertext = self.send_cipher.encrypt(
+            _nonce(self.send_prefix, sequence), plaintext, _aad(sequence)
+        )
+        # Same bytes as json.dumps({...}, separators=(",", ":")): base64 needs
+        # no JSON escaping, so the envelope is assembled directly.
+        # One join: a single allocation/copy of the (possibly huge) frame.
+        return "".join([
+            '{"type":"secure","sequence":', str(int(sequence)), ',"ciphertext":"',
+            *_b64_slices(ciphertext), '"}',
+        ])
+
+    async def send_plaintext(self, plaintext: bytes) -> None:
+        """Encrypt and send one already-encoded application frame.
+
+        Sequence assignment + write stay serialized under the lock. Large
+        frames are sealed (AES-GCM + base64 + envelope) in a worker thread so
+        a multi-megabyte hydration cannot monopolize the event loop that is
+        also serving register/cancel/status for every other client.
+        """
         async with self._send_lock:
-            plaintext = json.dumps(payload, default=str, separators=(",", ":")).encode("utf-8")
             sequence = self.send_sequence
-            ciphertext = self.send_cipher.encrypt(
-                _nonce(self.send_prefix, sequence), plaintext, _aad(sequence)
-            )
-            await self.ws.send_text(json.dumps({
-                "type": "secure",
-                "sequence": sequence,
-                "ciphertext": _b64(ciphertext),
-            }, separators=(",", ":")))
+            if len(plaintext) >= OFFLOAD_BYTES:
+                frame = await asyncio.to_thread(self._seal, plaintext, sequence)
+            else:
+                frame = self._seal(plaintext, sequence)
+            await self.ws.send_text(frame)
             self.send_sequence += 1
 
-    async def receive_json(self) -> Any:
-        raw = await self.ws.receive_text()
+    def _open(self, raw: str) -> Any:
         try:
-            envelope = json.loads(raw)
-            if envelope.get("type") != "secure":
+            kind, sequence, encoded = _parse_envelope(raw)
+            if kind != "secure":
                 raise ValueError("Plaintext application frame rejected")
-            sequence = int(envelope["sequence"])
             if sequence != self.receive_sequence:
                 raise ValueError(
                     f"Unexpected secure frame sequence {sequence}; expected {self.receive_sequence}"
                 )
-            ciphertext = _unb64(envelope["ciphertext"])
+            if not isinstance(encoded, str):
+                raise TypeError("ciphertext must be a string")
+            ciphertext = _unb64_sliced(encoded)
             plaintext = self.receive_cipher.decrypt(
                 _nonce(self.receive_prefix, sequence), ciphertext, _aad(sequence)
             )
@@ -225,3 +302,20 @@ class SecureWebSocketSession:
             return json.loads(plaintext.decode("utf-8"))
         except (KeyError, TypeError, ValueError, InvalidTag, json.JSONDecodeError) as exc:
             raise ValueError(f"Invalid secure WebSocket frame: {exc}") from exc
+
+    async def receive_json(self) -> Any:
+        message, _size = await self.receive_json_sized()
+        return message
+
+    async def receive_json_sized(self) -> tuple[Any, int]:
+        """Receive one frame, returning it with its wire size.
+
+        Receiving is inherently sequential (strict sequence numbers), but the
+        decode of a large frame need not occupy the loop: other tasks keep
+        running while a worker opens it. Order is preserved because the next
+        receive only starts after this one returns.
+        """
+        raw = await self.ws.receive_text()
+        if len(raw) >= OFFLOAD_BYTES:
+            return await asyncio.to_thread(self._open, raw), len(raw)
+        return self._open(raw), len(raw)

@@ -33,6 +33,14 @@ const RECOVERY_TIMEOUT = 10000; // ms; connection recovery itself, not ordinary 
 
 type MessageHandler = (payload: any) => void;
 
+/**
+ * Protocol features this renderer understands. Sent with client/register,
+ * runs/start and runs/subscribe; servers that predate a feature ignore it.
+ *   run-delta-v1   ordered push/run-delta token deltas (instead of snapshots)
+ *   branch-refs-v1 reference-form branch topology on the wire
+ */
+export const CLIENT_CAPABILITIES = ['run-delta-v1', 'branch-refs-v1', 'relay-credit-v1'];
+
 interface PendingRequest {
   resolve: (payload: any) => void;
   reject:  (error: Error) => void;
@@ -62,6 +70,7 @@ class GeneralWSClient {
   private rejectReady!: (error: Error) => void;
   private recoveryPromise: Promise<void> | null = null;
   private recoveryGeneration = -1;
+  private _serverCapabilities = new Set<string>();
 
   // Callbacks
   onConnected?: (requiresAuth: boolean) => void;
@@ -88,6 +97,13 @@ class GeneralWSClient {
   get authenticated() { return this._authenticated; }
   get requiresAuth() { return this._requiresAuth; }
   get sessionToken() { return this._sessionToken; }
+
+  /** Features the connected server advertised in its client/register reply. */
+  hasServerCapability(name: string): boolean { return this._serverCapabilities.has(name); }
+
+  setServerCapabilities(capabilities: unknown) {
+    this._serverCapabilities = new Set(Array.isArray(capabilities) ? capabilities.map(String) : []);
+  }
 
   /** Observe usable, authenticated Vulcan connections independently of Etna. */
   onConnectionChange(handler: (connected: boolean) => void) {
@@ -154,6 +170,7 @@ class GeneralWSClient {
     this._connected = false;
     this._authenticated = false;
     this._requiresAuth = false;
+    this._serverCapabilities = new Set();
     this._setSessionToken(null);
     this.lastConnectionError = null;
     this._notifyConnectionChange();
@@ -258,6 +275,7 @@ class GeneralWSClient {
     this.lastConnectionError = null;
     this._connected = false;
     this._authenticated = false;
+    this._serverCapabilities = new Set();
     this._setSessionToken(null);
     this._notifyConnectionChange();
     if (!wasAuthenticated) {

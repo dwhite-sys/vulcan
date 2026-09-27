@@ -7,15 +7,19 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const read = (file: string) => fs.readFileSync(path.join(root, file), 'utf8');
 const ws = read('src/app/services/ws.ts');
 const app = read('src/app/App.tsx');
+const relay = read('src/app/services/clientHttpRelay.ts');
 
 assert.match(ws, /async push\(type: string, payload: any = \{\}\): Promise<void>/);
 assert.match(ws, /await this\.ws\.send\(\{ type, payload \}, priority\)/);
 assert.doesNotMatch(ws, /async push[\s\S]*?this\.pending\.set/, 'one-way stream push must not allocate an RPC pending promise');
-assert.match(app, /generalWS\.push\('client\/http-chunk'/);
-assert.match(app, /if \(data\) emitChunk\(data\)/);
-assert.match(app, /const emit = \(event: Record<string, any>\) =>[\s\S]*generalWS\.push\('client\/http-event'/, 'relay control frames are ordered one-way traffic');
-assert.match(app, /await emit\(\{ event: 'done' \}\)/, 'completion is flushed after all queued chunks');
-assert.doesNotMatch(app, /if \(data\) await emit\(\{ event: 'chunk', data \}\)/, 'provider chunks must not wait for RPC acknowledgements');
+assert.match(app, /new ClientHttpRelay\(\{\s*push: \(type, payload\) => vulcan\.generalWS\.push\(type, payload\)/);
+assert.match(app, /onPush\('push\/client-http-credit'/, 'server credits must reach the relay window');
+assert.match(relay, /this\.transport\.push\('client\/http-chunk', \{ relay_id: relayId, data, n \}\)/);
+assert.match(relay, /if \(data\) emitChunk\(data\)/);
+assert.match(relay, /const emit = \(event: Record<string, any>\) =>[\s\S]*this\.transport\.push\('client\/http-event'/, 'relay control frames are ordered one-way traffic');
+assert.match(relay, /await emit\(\{ event: 'done' \}\)/, 'completion is flushed after all queued chunks');
+assert.match(relay, /await this\.waitForCapacity\(state\);[\s\S]*reader\.read\(\)/, 'the fetch reader waits for relay capacity');
+assert.doesNotMatch(relay, /if \(data\) await emit\(\{ event: 'chunk', data \}\)/, 'provider chunks must not wait for RPC acknowledgements');
 
 console.log('Provider stream relay regression: ok');
 

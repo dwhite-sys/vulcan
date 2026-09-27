@@ -75,3 +75,24 @@ Revalidated after these changes:
 - Python suite: **200 passed, 22 subtests passed**
 
 A complete local `npm ci`/electron-builder build is still not claimed from this container; npm registry access stalled here. GitHub Actions remains the authoritative full packaging test for Linux, Windows, and macOS.
+
+## Traffic / concurrency architecture overhaul
+
+See `TRAFFIC_ARCHITECTURE.md` for the section-by-section status against the handoff.
+
+Validated in the build environment:
+
+- full server Python suite: **248 passed, 22 subtests passed** (it was 211 passed + 1 failed; the failure was the Stop-before-first-step bug, fixed here)
+- known pre-existing flake: `test_terminal_interactive.py::test_explicit_close_is_lifecycle_state_not_durable_terminal_output` depends on test order (it fails deterministically when run alone) and intermittently fails the full suite, on the unmodified baseline as well (about 1 run in 6 on both trees)
+- new suites: `test_traffic_architecture.py`, `test_persistence_architecture.py`, and `test_control_plane_e2e.py` (two real encrypted clients: register/status/Stop stay responsive during a maximum-rate generation, and the delta stream reconstructs the durable transcript)
+- renderer regressions: every `test:*` script that passed before still passes, and the three new ones (`test:run-stream`, `test:client-relay`, `test:provider-stream-relay`) pass. The nine that fail here also fail identically on the unmodified baseline.
+- `vite build` succeeds.
+
+Not exercised here: a packaged Electron app against a real provider, and a real client-POV provider under sustained load.
+
+### Field-symptom soak
+
+`vulcan/tests/soak/run.sh <tree> <port> <messages> <background-chats>` runs a real uvicorn
+server plus separate speaker/prober processes over TCP (see `TRAFFIC_ARCHITECTURE.md`).
+The original tree froze at message 4 (`runs/start` unacknowledged for 60 s). This branch ran
+30 consecutive agentic messages (to an 18.6 MB chat) with flat run times and zero errors.

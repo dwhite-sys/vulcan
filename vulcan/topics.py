@@ -39,13 +39,13 @@ def _records(chat_id: str | None = None) -> list[dict]:
 
     selection = "AND e.chat_id = ?" if chat_id is not None else ""
     parameters = ((chat_id,) if chat_id is not None else ()) + (_MAX_MESSAGES_PER_CHAT, _MAX_MESSAGES)
-    with chats._DB_LOCK, chats._database() as source:
+    with chats._reader() as source:
         canonical = {
             (row["chat_id"], row["event_id"]): row
             for row in source.execute(f"""
                 WITH recent AS (
                     SELECT e.chat_id,e.event_id,e.position,c.updated_at,
-                           json_extract(c.metadata_json, '$.title') AS title,
+                           COALESCE(json_extract(c.summary_json, '$.title'), json_extract(c.metadata_json, '$.title')) AS title,
                            ROW_NUMBER() OVER (
                                PARTITION BY e.chat_id ORDER BY e.position DESC
                            ) AS in_chat
@@ -58,8 +58,12 @@ def _records(chat_id: str | None = None) -> list[dict]:
                 )
                 SELECT r.chat_id,r.event_id,r.position,r.title,s.content,s.role
                   FROM recent AS r
+                  -- Keyed-rowid join: never filter chat_search on its UNINDEXED
+                  -- columns (a whole-corpus scan per message, under the DB lock).
+                  JOIN fts_rowids AS k
+                    ON k.chat_id = r.chat_id AND k.event_id = r.event_id
                   JOIN chat_search AS s
-                    ON s.chat_id = r.chat_id AND s.event_id = r.event_id
+                    ON s.rowid = k.key
                  WHERE r.in_chat <= ? AND s.content != ''
                  ORDER BY r.updated_at DESC,r.position DESC
                  LIMIT ?
@@ -129,6 +133,14 @@ def _choose_tags(scores, vocabulary, *, limit: int = 4) -> list[tuple[str, float
         if len(chosen) >= limit:
             break
     return chosen
+
+
+def prewarm() -> None:
+    """Import the clustering stack once at startup (about 1s of import-time
+    work) so it never lands on the first message after launch."""
+    from sklearn.cluster import HDBSCAN  # noqa: F401
+    from sklearn.decomposition import PCA  # noqa: F401
+    from sklearn.feature_extraction.text import TfidfVectorizer  # noqa: F401
 
 
 def rebuild(chat_id: str | None = None) -> dict:

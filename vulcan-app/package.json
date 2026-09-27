@@ -66,7 +66,10 @@
     "runtime:hash": "node scripts/generate-runtime-hash.mjs",
     "test:packaging": "node scripts/packaging-regression.mjs",
     "test:version": "node scripts/version-regression.mjs",
-    "test:updates": "node scripts/update-regression.mjs"
+    "test:updates": "node scripts/update-regression.mjs",
+    "test:run-stream": "node --experimental-strip-types scripts/run-stream-regression.ts",
+    "test:client-relay": "node --experimental-strip-types scripts/client-relay-backpressure-regression.ts",
+    "test:provider-stream-relay": "node --experimental-strip-types scripts/provider-stream-relay-regression.ts"
   },
   "build": {
     "appId": "com.vulcan.app",

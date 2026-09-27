@@ -13,6 +13,8 @@
 
 import type { Chat, ChatFolder } from '../types/vulcan';
 import { rehydrateChatEvents } from './transcript';
+import { compactBranchingForWire } from './branching';
+import { generalWS } from './ws';
 import type { LLMConfig, ProviderConfig } from './llm';
 import { migrateScopedNetworkValue, scopedNetworkKey } from './networkProfileScope';
 import {
@@ -240,12 +242,23 @@ export function saveDisabledEtnaSkills(disabled: Set<string>): boolean {
 
 function rehydrateChat(c: Chat): Chat {
   const rawBranching = (c as any).branching;
+  const events = rehydrateChatEvents((c as any).events, true);
+  // Reference-form nodes ({eventId}) resolve to the *same* event objects as
+  // the transcript (or to the listed off-path events), so a branch graph costs
+  // no duplicate event copies in memory. Legacy embedded nodes still work.
+  const byId = new Map<string, any>(events.map((event) => [event.id, event]));
+  if (Array.isArray(rawBranching?.offPathEvents)) {
+    for (const event of rehydrateChatEvents(rawBranching.offPathEvents, true)) {
+      if (event?.id && !byId.has(event.id)) byId.set(event.id, event);
+    }
+  }
+  const { offPathEvents: _offPathEvents, ...branchingFields } = rawBranching ?? {};
   const branching = rawBranching?.version === 1 && Array.isArray(rawBranching.branches) && Array.isArray(rawBranching.nodes)
     ? {
-        ...rawBranching,
+        ...branchingFields,
         nodes: rawBranching.nodes.map((node: any) => ({
-          ...node,
-          event: rehydrateChatEvents([node.event], true)[0],
+          parentId: node.parentId ?? null,
+          event: node.event ? rehydrateChatEvents([node.event], true)[0] : byId.get(String(node.eventId ?? '')),
         })).filter((node: any) => Boolean(node.event)),
         branches: rawBranching.branches.map((branch: any) => ({
           ...branch,
@@ -264,7 +277,7 @@ function rehydrateChat(c: Chat): Chat {
     // reconstructed heuristically; unreleased builds may simply start fresh. A
     // process restart turns an unfinished streaming/running event into interrupted
     // without discarding any content or changing its position.
-    events: rehydrateChatEvents((c as any).events, true),
+    events,
     ...(branching ? { branching } : {}),
     ...(() => {
       const rawDesigns = Array.isArray((c as any).designs)
@@ -301,16 +314,26 @@ export async function loadChats(): Promise<Chat[]> {
     .map(rehydrateChat);
 }
 
-export async function loadChat(chatId: string): Promise<Chat | null> {
-  const raw = await remoteLoadChat(chatId);
+/** Hydrate one full chat payload (chats/get or runs/subscribe). */
+export function hydrateChatPayload(raw: any): Chat | null {
   if (!raw || raw?.schemaVersion !== 2 || !Array.isArray(raw?.events)) return null;
   const hydrated = rehydrateChat(raw as Chat);
   delete (hydrated as any)._summaryOnly;
   return hydrated;
 }
 
+export async function loadChat(chatId: string): Promise<Chat | null> {
+  return hydrateChatPayload(await remoteLoadChat(chatId));
+}
+
+/** Wire form of a chat: compact branch topology when the server supports it. */
+export function chatForWire(chat: Chat): any {
+  if (!chat.branching || !generalWS.hasServerCapability('branch-refs-v1')) return chat;
+  return { ...chat, branching: compactBranchingForWire(chat.branching, chat.events) };
+}
+
 export async function saveChat(chat: Chat): Promise<void> {
-  await remoteSaveChat(chat);
+  await remoteSaveChat(chatForWire(chat));
 }
 
 export async function deleteChat(chatId: string): Promise<void> {

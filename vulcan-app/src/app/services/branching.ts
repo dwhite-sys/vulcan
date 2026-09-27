@@ -65,7 +65,27 @@ export function branchById(state: BranchingState, branchId: string | null | unde
 
 export function branchEvents(chat: Chat, branchId: string | null | undefined): ChatEvent[] {
   const state = ensureBranching(chat);
+  // chat.events *is* the live projection of the current branch. Reading it
+  // directly keeps the current branch correct while a run streams, without
+  // re-deriving topology for every token/event.
+  if (branchId && branchId === state.currentBranchId && chat.events.length) return chat.events;
   return branchEventsFromState(state, branchId);
+}
+
+/**
+ * Compact wire form of the branch graph: nodes reference events by id, and
+ * only events that are *not* on the current path are sent (once). Servers
+ * advertising `branch-refs-v1` store topology this way; this avoids sending
+ * every transcript event (and image data URLs) twice per save.
+ */
+export function compactBranchingForWire(branching: BranchingState, events: ChatEvent[]): any {
+  const onPath = new Set(events.map((event) => event.id));
+  const offPathEvents: ChatEvent[] = [];
+  const nodes = branching.nodes.map((node) => {
+    if (!onPath.has(node.event.id)) offPathEvents.push(node.event);
+    return { eventId: node.event.id, parentId: node.parentId };
+  });
+  return { ...branching, nodes, offPathEvents };
 }
 
 function words(text: string): string[] {

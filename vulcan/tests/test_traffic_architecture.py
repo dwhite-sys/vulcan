@@ -468,6 +468,13 @@ class AdmissionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ws_general._lane_for({"type": "push/run-status"}), traffic.STATE)
         self.assertEqual(ws_general._lane_for({"type": "push/client-http-cancel"}), traffic.CONTROL)
 
+    def test_launch_disables_loop_bound_deflate(self):
+        # Encrypted frames do not compress; uvicorn would deflate them on the loop.
+        from vulcan import cli
+        launch = list(cli._UVICORN_WS_ARGS)
+        self.assertEqual(launch[launch.index("--ws-per-message-deflate") + 1], "false")
+        self.assertGreaterEqual(int(launch[launch.index("--ws-max-size") + 1]), 64 * 1024 * 1024)
+
 
 class RelayFlowControlTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):

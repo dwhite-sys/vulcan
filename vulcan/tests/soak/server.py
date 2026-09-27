@@ -47,9 +47,14 @@ server.auth.server_requires_auth = lambda: False
 recall.start_message_indexing()
 import uvicorn
 # Mirror the tree's own CLI launch settings (the original tree used uvicorn's default).
-ws_max = 16 * 1024 * 1024
+ws_max, deflate = 16 * 1024 * 1024, True
 try:
     from vulcan import cli
-    if hasattr(cli, "_UVICORN_WS_ARGS"): ws_max = int(cli._UVICORN_WS_ARGS[1])
+    if hasattr(cli, "_UVICORN_WS_ARGS"):
+        launch = list(cli._UVICORN_WS_ARGS)
+        ws_max = int(launch[launch.index("--ws-max-size") + 1])
+        if "--ws-per-message-deflate" in launch:
+            deflate = launch[launch.index("--ws-per-message-deflate") + 1] == "true"
 except Exception: pass
-uvicorn.run(server.app, host="127.0.0.1", port=int(sys.argv[2]), log_level="warning", ws_max_size=ws_max)
+uvicorn.run(server.app, host="127.0.0.1", port=int(sys.argv[2]), log_level="warning", ws_max_size=ws_max,
+            ws_per_message_deflate=deflate)

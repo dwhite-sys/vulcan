@@ -167,7 +167,8 @@ assert.match(quoteSource, /data-vulcan-quote-source-id=\{rect\.quoteId\}/);
 assert.match(quoteSource, /FILTER_REJECT/);
 assert.match(quoteSource, /finalPiece\.right = Math\.max\(finalPiece\.right, mark\.right\)/);
 assert.doesNotMatch(quoteSource, /<sup className="vulcan-source-quote-number"/);
-assert.match(markdownSource, /rehypePlugins=\{sourceMarks\.length/);
+assert.match(markdownSource, /if \(sourceMarks\.length\) \{\s*return Markdown\(\{[\s\S]*?rehypePlugins: \[\[rehypeQuoteSourceMarks/,
+  'quote source marks render through the rehype pass and bypass the parse cache');
 assert.match(interfaceSource, /prefix\.querySelectorAll\('\[data-vulcan-quote-marker-id\]'\)/);
 assert.match(composerSource, /data-vulcan-quote-card-id=\{item\.id\}/);
 assert.match(interfaceSource, /<ContextConnections items=\{editComposerActive \? editingContextItems : contextItems\} \/>/);

@@ -132,4 +132,20 @@ assert.match(wsTerminal, /term\.open_slot, chat_id, kind, slot, cols=cols, rows=
 assert.match(wsTerminal, /term\.resize_slot\(chat_id, kind, slot, cols, rows\)[\s\S]*server is the sole transcript authority/i,
   'Existing PTYs must be resized before the authoritative snapshot is captured');
 
+// Replayed snapshots must not answer old device-attribute queries into the live shell.
+assert.match(widget, /replayingSnapshot \+= 1;\s*xtermRef\.current\.write\(msg\.data, \(\) =>/,
+  'Snapshot replay must be bracketed so xterm replies to replayed queries can be recognized');
+assert.match(widget, /if \(replayingSnapshot > 0 && isTerminalReport\(data\)\) return;/,
+  'xterm auto-replies produced by snapshot replay must not reach the PTY');
+{
+  const source = widget.match(/const TERMINAL_REPORT_RE = (\/.*\/);/)[1];
+  const re = eval(source);
+  for (const reply of ['\x1b[?1;2c', '\x1b[>0;276;0c', '\x1b[?1;2c\x1b[>0;276;0c', '\x1b[1;12R', '\x1b]11;rgb:0000/0000/0000\x07']) {
+    assert.ok(re.test(reply), `terminal report not recognized: ${JSON.stringify(reply)}`);
+  }
+  for (const keys of ['a', '\r', '\x1b[A', 'c', '\x1b[3~', '\x03']) {
+    assert.ok(!re.test(keys), `keystroke misclassified as a report: ${JSON.stringify(keys)}`);
+  }
+}
+
 console.log('Terminal chat isolation, server-owned replay, per-slot HOME, scoped resize, orphan cleanup, chatid@vulcan identity, and existing interactive PTY behavior verified.');

@@ -585,3 +585,27 @@ class ShellIntegrationPromptTests(unittest.TestCase):
         # \001..\002 = readline's ignore markers: the passthrough occupies zero columns.
         self.assertEqual(self._expand(rc, "PS1"), b"\x01" + idle + b"\x02" + f"{chat_id}@vulcan:/$ ".encode())
         self.assertEqual(self._expand(rc, "PS0"), busy)
+
+
+class WinsizeResyncTests(unittest.TestCase):
+    """A resize dropped by `docker exec` during startup must be re-delivered."""
+
+    def test_resize_resignals_the_docker_client_process_group(self):
+        proc = subprocess.Popen(["sleep", "30"], start_new_session=True)
+        master, slave = os.openpty()
+        os.close(slave)
+        try:
+            ts = terminal.TerminalSlot(chat_id="winsize", kind="user", slot=1, proc=proc, master_fd=master)
+            key = terminal._slot_key("winsize", "user", 1)
+            signalled = []
+            with mock.patch.dict(terminal._slots, {key: ts}), \
+                 mock.patch.object(terminal, "_WINSIZE_RESYNC_DELAYS", (0.01, 0.01)), \
+                 mock.patch.object(terminal, "_update_slot_meta"), \
+                 mock.patch.object(terminal.os, "killpg", side_effect=lambda pgid, sig: signalled.append((pgid, sig))):
+                terminal.resize_slot("winsize", "user", 1, 70, 20)
+                terminal.resize_slot("winsize", "user", 1, 72, 20)  # a drag supersedes the first resync
+                time.sleep(0.3)
+            self.assertEqual((ts.cols, ts.rows), (72, 20))
+            self.assertEqual(signalled, [(proc.pid, terminal.signal.SIGWINCH)] * 2)
+        finally:
+            proc.kill(); proc.wait(); os.close(master)

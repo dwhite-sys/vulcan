@@ -33,6 +33,7 @@ import os
 import shlex
 import pty
 import shutil
+import signal
 import struct
 import subprocess
 import termios
@@ -917,6 +918,7 @@ def _start_slot_proc(chat_id: str, kind: SlotKind, slot: int, cols: int = 80, ro
                         clear_slot_focus_if_matches(ts.chat_id, ts.kind, ts.slot)
 
     threading.Thread(target=_collect, daemon=True).start()
+    _schedule_winsize_resync(ts)
     _start_inactivity_watcher(ts)
     return ts
 
@@ -1062,6 +1064,42 @@ def close_chat_slots(chat_id: str, reason: str = 'explicit'):
         close_slot(chat_id, kind, slot, reason=reason)
 
 
+# `docker exec -it` reads its terminal size once at startup and only then
+# installs its SIGWINCH handler; a resize landing in between (the renderer
+# re-fits right after opening a terminal) is dropped. tmux, and the shell in it,
+# then keep the stale width while xterm uses the new one: typed input wraps in
+# the wrong place and redraws overwrite the next line. Re-signalling makes the
+# docker client re-read the PTY's current size, which is idempotent.
+_WINSIZE_RESYNC_DELAYS = (0.3, 1.0, 2.5)
+
+
+def _signal_winsize(ts: TerminalSlot) -> None:
+    if ts.finished:
+        return
+    try:
+        if ts.proc.poll() is None:
+            os.killpg(ts.proc.pid, signal.SIGWINCH)
+    except (ProcessLookupError, PermissionError, OSError, AttributeError):
+        try:
+            ts.proc.send_signal(signal.SIGWINCH)
+        except Exception:
+            pass
+
+
+def _schedule_winsize_resync(ts: TerminalSlot) -> None:
+    # One live resync per slot: a drag-resize reschedules instead of piling up threads.
+    token = getattr(ts, "_winsize_token", 0) + 1
+    ts._winsize_token = token
+
+    def resync():
+        for delay in _WINSIZE_RESYNC_DELAYS:
+            time.sleep(delay)
+            if getattr(ts, "_winsize_token", 0) != token:
+                return
+            _signal_winsize(ts)
+    threading.Thread(target=resync, daemon=True, name="vulcan-terminal-winsize").start()
+
+
 def resize_slot(chat_id: str, kind: SlotKind, slot: int, cols: int, rows: int):
     """Resize a slot's PTY window."""
     key = _slot_key(chat_id, kind, slot)
@@ -1073,6 +1111,7 @@ def resize_slot(chat_id: str, kind: SlotKind, slot: int, cols: int, rows: int):
         ts.rows = max(1, int(rows))
         fcntl.ioctl(ts.master_fd, termios.TIOCSWINSZ, struct.pack('HHHH', ts.rows, ts.cols, 0, 0))
         _update_slot_meta(chat_id, kind, slot, cols=ts.cols, rows=ts.rows, last_activity=ts.last_activity)
+        _schedule_winsize_resync(ts)
     except Exception:
         pass
 

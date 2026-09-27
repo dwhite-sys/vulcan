@@ -481,12 +481,10 @@ def _image_notice(payload: dict[str, Any]) -> str:
 
 
 def _provider_tool_payload(result: dict[str, Any]) -> tuple[Any, dict[str, Any] | None]:
-    """Return provider-safe tool content plus any durable image payload.
+    """Split a tool result into its JSON payload and any image it carries.
 
-    Image pixels stay in the canonical event for future prompt reconstruction, but
-    are excluded from the `tool` role itself because some providers reject image
-    data there. The caller emits the image as the same synthetic user message used
-    during the live turn.
+    view_file keeps the image data URL on the durable event so every later turn
+    reproduces the exact message the model saw live (see `_tool_message`).
     """
     payload = {"error": result["error"]} if result.get("error") else result.get("result", result)
     if isinstance(payload, dict) and payload.get("dataUrl") and payload.get("filename"):
@@ -494,6 +492,117 @@ def _provider_tool_payload(result: dict[str, Any]) -> tuple[Any, dict[str, Any] 
         clean_payload = {key: value for key, value in payload.items() if key not in ("dataUrl", "__view_file_image__")}
         return clean_payload, image_payload
     return payload, None
+
+
+def _tool_message(call_id: Any, name: Any, result: dict[str, Any]) -> dict[str, Any]:
+    """Canonical `tool` message, identical live and when history is rebuilt.
+
+    Images ride on the tool message itself (private `_images`), so the model
+    keeps seeing what the tool returned on every later turn without re-viewing,
+    and the prompt prefix stays byte-identical across turns (provider prompt
+    caches survive). `_shape_for_provider` renders `_images` for the wire.
+    """
+    payload, image_payload = _provider_tool_payload(result)
+    message: dict[str, Any] = {"role": "tool", "tool_call_id": call_id, "name": name,
+                               "content": json.dumps(payload, ensure_ascii=False, separators=(",", ":"))}
+    if image_payload is not None:
+        message["_images"] = [{"url": image_payload["dataUrl"], "notice": _image_notice(image_payload)}]
+    return message
+
+
+# How tool-result images reach the provider:
+#   "tool": inside the tool message (content parts: the JSON text, then the image).
+#   "user": text-only tool messages; one user message with the images right
+#           after the step's tool results (strict OpenAI Chat Completions only
+#           accepts images from the user role, and every tool result must follow
+#           the assistant's tool_calls contiguously).
+# A provider option `toolResultImages` pins one; otherwise ("auto") "tool" is
+# used until the provider rejects it, and the fallback is remembered per
+# endpoint+model so the chosen shape (and the prompt cache) stays stable.
+TOOL_IMAGE_MODES = ("tool", "user")
+_TOOL_IMAGE_QUIRKS: dict[str, str] | None = None
+_TOOL_IMAGE_QUIRKS_LOCK = threading.Lock()
+
+
+def _tool_image_quirks_path() -> Path:
+    return Path(cfg.CONFIG_DIR) / "provider-tool-images.json"
+
+
+def _tool_image_quirk_key(base_url: str, model: str) -> str:
+    return f"{base_url.rstrip('/')}|{model}"
+
+
+def _load_tool_image_quirks() -> dict[str, str]:
+    global _TOOL_IMAGE_QUIRKS
+    with _TOOL_IMAGE_QUIRKS_LOCK:
+        if _TOOL_IMAGE_QUIRKS is None:
+            try:
+                loaded = json.loads(_tool_image_quirks_path().read_text(encoding="utf-8"))
+                _TOOL_IMAGE_QUIRKS = {str(k): str(v) for k, v in loaded.items() if v in TOOL_IMAGE_MODES}
+            except (OSError, ValueError, AttributeError):
+                _TOOL_IMAGE_QUIRKS = {}
+        return _TOOL_IMAGE_QUIRKS
+
+
+def _remember_tool_image_mode(base_url: str, model: str, mode: str) -> None:
+    quirks = _load_tool_image_quirks()
+    with _TOOL_IMAGE_QUIRKS_LOCK:
+        quirks[_tool_image_quirk_key(base_url, model)] = mode
+        try:
+            path = _tool_image_quirks_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(quirks, indent=2), encoding="utf-8")
+            tmp.replace(path)
+        except OSError:
+            logging.getLogger(__name__).warning("could not persist tool-image mode for %s", model)
+
+
+def _tool_image_mode(provider: dict[str, Any], base_url: str, model: str) -> tuple[str, bool]:
+    """Return (mode, pinned). Unpinned modes may fall back once on rejection."""
+    configured = provider.get("toolResultImages")
+    if configured in TOOL_IMAGE_MODES:
+        return configured, True
+    return _load_tool_image_quirks().get(_tool_image_quirk_key(base_url, model), "tool"), False
+
+
+def _shape_for_provider(messages: list[dict[str, Any]], mode: str) -> tuple[list[dict[str, Any]], bool]:
+    """Render canonical messages for the wire; report whether any tool image was sent."""
+    shaped: list[dict[str, Any]] = []
+    pending_images: list[dict[str, Any]] = []
+    had_images = False
+
+    def flush_user_images() -> None:
+        if pending_images:
+            parts: list[dict[str, Any]] = []
+            for image in pending_images:
+                parts.append({"type": "text", "text": image["notice"]})
+                parts.append({"type": "image_url", "image_url": {"url": image["url"]}})
+            shaped.append({"role": "user", "content": parts})
+            pending_images.clear()
+
+    for message in messages:
+        if message.get("role") != "tool":
+            flush_user_images()
+            shaped.append(message)
+            continue
+        images = message.get("_images")
+        if not images:
+            shaped.append(message)
+            continue
+        had_images = True
+        wire = {key: value for key, value in message.items() if key != "_images"}
+        if mode == "tool":
+            wire["content"] = [{"type": "text", "text": message.get("content") or ""},
+                               *({"type": "image_url", "image_url": {"url": image["url"]}} for image in images)]
+        else:
+            pending_images.extend(images)
+        shaped.append(wire)
+    flush_user_images()
+    return shaped, had_images
+
+
+_REJECTED_REQUEST = re.compile(r"LLM error (400|415|422)\b")
 
 
 def project_history(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -535,14 +644,7 @@ def project_history(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 result = item.get("result")
                 if not result:
                     continue
-                payload, image_payload = _provider_tool_payload(result)
-                output.append({"role": "tool", "tool_call_id": item.get("callId"), "name": item.get("tool"),
-                               "content": json.dumps(payload, ensure_ascii=False, separators=(",", ":"))})
-                if image_payload is not None:
-                    output.append({"role": "user", "content": [
-                        {"type": "text", "text": _image_notice(image_payload)},
-                        {"type": "image_url", "image_url": {"url": image_payload["dataUrl"]}},
-                    ]})
+                output.append(_tool_message(item.get("callId"), item.get("tool"), result))
     return output
 
 
@@ -1503,7 +1605,9 @@ async def _provider_response(run: AgentRun, messages: list[dict[str, Any]], tool
     model = provider.get("model") or ""
     if not base_url or not model:
         raise ValueError("LLM not configured. Go to Settings → Providers to add an endpoint and API key.")
-    body: dict[str, Any] = {"model": model, "messages": messages, "stream": True,
+    image_mode, image_mode_pinned = _tool_image_mode(provider, base_url, model)
+    wire_messages, sent_tool_images = _shape_for_provider(messages, image_mode)
+    body: dict[str, Any] = {"model": model, "messages": wire_messages, "stream": True,
                             "reasoning": {"enabled": True}, "include_reasoning": True}
     if tools:
         body["tools"] = [{"type": "function", "function": {"name": tool["name"], "description": tool.get("description", ""),
@@ -1515,8 +1619,8 @@ async def _provider_response(run: AgentRun, messages: list[dict[str, Any]], tool
         headers["Authorization"] = f"Bearer {api_key}"
     parser = ProviderStreamParser(lambda event: run.stream_event(event, turn_id))
     endpoint = base_url.rstrip("/") + "/chat/completions"
-    provider_terminal = False
     finish_reason: str | None = None
+    saw_output = False
 
     def process_line(line: str) -> bool:
         """Process one SSE line and report whether the provider has terminated.
@@ -1528,12 +1632,13 @@ async def _provider_response(run: AgentRun, messages: list[dict[str, Any]], tool
         already finished. A non-null finish_reason is terminal too and lets us stop
         one event earlier when providers omit/delay `[DONE]`.
         """
-        nonlocal finish_reason
+        nonlocal finish_reason, saw_output
         if not line.startswith("data:"):
             return False
         data = line[5:].strip()
         if not data:
             return False
+        saw_output = True
         if data == "[DONE]":
             return True
         try:
@@ -1552,6 +1657,32 @@ async def _provider_response(run: AgentRun, messages: list[dict[str, Any]], tool
     # loop would stall every other client for every provider turn. The turn's
     # message list is not mutated until this response returns.
     encoded_body = await asyncio.to_thread(dumps_chunked, body)
+    try:
+        provider_terminal = await _send_provider_request(provider, endpoint, headers, encoded_body, process_line)
+    except (ValueError, RuntimeError) as error:
+        # Rejected before any output streamed: if images inside tool messages
+        # are the likely cause, switch this endpoint+model to user-role images
+        # for good (a stable shape keeps prompt caches valid) and retry once.
+        if not (sent_tool_images and image_mode == "tool" and not image_mode_pinned
+                and _REJECTED_REQUEST.search(str(error)) and not saw_output):
+            raise
+        logging.getLogger(__name__).warning(
+            "%s rejected images in tool results; using user-role images for it from now on", model)
+        _remember_tool_image_mode(base_url, model, "user")
+        body["messages"], _ = _shape_for_provider(messages, "user")
+        encoded_body = await asyncio.to_thread(dumps_chunked, body)
+        provider_terminal = await _send_provider_request(provider, endpoint, headers, encoded_body, process_line)
+    result = parser.finish()
+    result["providerTerminal"] = provider_terminal
+    result["finishReason"] = finish_reason
+    return result
+
+
+async def _send_provider_request(provider: dict[str, Any], endpoint: str, headers: dict[str, str], encoded_body: str,
+                                 process_line: Callable[[str], bool]) -> bool:
+    """Stream one completion through `process_line`; return whether it terminated."""
+    import httpx
+    provider_terminal = False
     if provider.get("networkPointOfView") == "client":
         client_id = provider.get("clientId")
         if not client_id:
@@ -1604,10 +1735,7 @@ async def _provider_response(run: AgentRun, messages: list[dict[str, Any]], tool
                 if attempt:
                     raise
                 await asyncio.sleep(0.1)
-    result = parser.finish()
-    result["providerTerminal"] = provider_terminal
-    result["finishReason"] = finish_reason
-    return result
+    return provider_terminal
 
 
 def _toolset(run: AgentRun) -> list[dict[str, Any]]:
@@ -1821,12 +1949,7 @@ async def execute_run(run: AgentRun):
             event.update({"status": "error" if result.get("error") else "complete", "result": result})
             run._publish_stream_event(event)
             run.schedule_checkpoint()
-            payload, image_payload = _provider_tool_payload(result)
-            messages.append({"role": "tool", "tool_call_id": call["id"], "name": name,
-                             "content": json.dumps(payload, ensure_ascii=False, separators=(",", ":"))})
-            if image_payload is not None:
-                messages.append({"role": "user", "content": [{"type": "text", "text": _image_notice(image_payload)},
-                                {"type": "image_url", "image_url": {"url": image_payload["dataUrl"]}}]})
+            messages.append(_tool_message(call["id"], name, result))
             if eligible and repeat_count > 4:
                 stuck_event = {"id": run.event_id("stuck"), "type": "assistant_text", "status": "complete", "timestamp": now(),
                     "runId": run.run_id, "turnId": f"{run.run_id}:stuck", "content": f"I got stuck repeatedly trying the same `{name}` call and it wasn't going anywhere, so I'm stopping here instead of continuing to loop. Feel free to try again — a fresh attempt sometimes gets past it."}

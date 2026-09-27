@@ -2657,22 +2657,97 @@ class BackgroundAgentTests(unittest.IsolatedAsyncioTestCase):
         metadata = json.loads(tool_message["content"])
         self.assertEqual(metadata["view"], "overview")
         self.assertEqual((metadata["original_width"], metadata["original_height"]), (1024, 768))
-        image_message = next(message for message in second_turn if message.get("role") == "user"
-                             and isinstance(message.get("content"), list))
-        self.assertIn("Whole-image overview", image_message["content"][0]["text"])
-        self.assertTrue(image_message["content"][1]["image_url"]["url"].startswith("data:image/png;base64,"))
+        # The image rides on the tool message itself; no synthetic user turn.
+        self.assertTrue(tool_message["_images"][0]["url"].startswith("data:image/png;base64,"))
+        self.assertIn("Whole-image overview", tool_message["_images"][0]["notice"])
+        self.assertFalse([message for message in second_turn if message.get("role") == "user"
+                          and isinstance(message.get("content"), list)])
         view_event = next(event for event in run.events if event.get("tool") == "view_file")
         self.assertTrue(view_event["result"]["result"]["dataUrl"].startswith("data:image/png;base64,"))
 
-        rebuilt = agent.project_history(run.events)
-        rebuilt_tool = next(message for message in rebuilt if message.get("role") == "tool"
-                            and message.get("name") == "view_file")
-        self.assertNotIn("dataUrl", rebuilt_tool["content"])
-        rebuilt_image = next(message for message in rebuilt if message.get("role") == "user"
-                             and isinstance(message.get("content"), list))
-        self.assertEqual(rebuilt_image["content"][0]["text"], image_message["content"][0]["text"])
-        self.assertEqual(rebuilt_image["content"][1]["image_url"]["url"],
-                         image_message["content"][1]["image_url"]["url"])
+        # A later turn rebuilds exactly what the model saw live (prompt caches hold).
+        rebuilt = json.loads(json.dumps(agent.project_history(run.events)))
+        self.assertEqual(rebuilt[:len(second_turn) - 1], second_turn[1:])
+
+        wire, had_images = agent._shape_for_provider(second_turn, "tool")
+        self.assertTrue(had_images)
+        wire_tool = next(message for message in wire if message.get("role") == "tool")
+        self.assertNotIn("_images", wire_tool)
+        self.assertEqual(wire_tool["content"][0], {"type": "text", "text": tool_message["content"]})
+        self.assertEqual(wire_tool["content"][1]["image_url"]["url"], tool_message["_images"][0]["url"])
+
+    def test_user_role_image_fallback_keeps_tool_results_contiguous(self):
+        image = {"url": "data:image/png;base64,AAAA", "notice": "[System] Whole-image overview of a.png"}
+        canonical = [
+            {"role": "user", "content": "look"},
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "a"}, {"id": "b"}]},
+            {"role": "tool", "tool_call_id": "a", "name": "view_file", "content": "{}", "_images": [image]},
+            {"role": "tool", "tool_call_id": "b", "name": "read_file", "content": "{}"},
+            {"role": "assistant", "content": "done"},
+        ]
+        wire, had_images = agent._shape_for_provider(canonical, "user")
+        self.assertTrue(had_images)
+        self.assertEqual([message["role"] for message in wire], ["user", "assistant", "tool", "tool", "user", "assistant"])
+        self.assertEqual(wire[2]["content"], "{}")
+        self.assertNotIn("_images", wire[2])
+        self.assertEqual(wire[4]["content"][0]["text"], image["notice"])
+        self.assertEqual(wire[4]["content"][1]["image_url"]["url"], image["url"])
+        self.assertIn("_images", canonical[2])  # canonical history is never mutated
+
+    async def test_rejected_tool_images_fall_back_once_and_stick_per_model(self):
+        agent._TOOL_IMAGE_QUIRKS = None
+        (Path(agent.cfg.CONFIG_DIR) / "provider-tool-images.json").unlink(missing_ok=True)
+        image = {"url": "data:image/png;base64,AAAA", "notice": "[System] overview"}
+        messages = [
+            {"role": "user", "content": "look"},
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "a", "type": "function",
+             "function": {"name": "view_file", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "a", "name": "view_file", "content": "{}", "_images": [image]},
+        ]
+        run = agent.AgentRun(chat=chat("tool-image-fallback"), options=options(
+            provider={"baseUrl": "http://strict.test/v1", "model": "strict-model"}),
+            manager=agent.RunManager(), run_id="tool-image-fallback:run")
+        bodies = []
+
+        async def send(_provider, _endpoint, _headers, encoded_body, process_line):
+            body = json.loads(encoded_body)
+            bodies.append(body)
+            if isinstance(body["messages"][2]["content"], list):
+                raise ValueError("LLM error 400: Image URLs are only allowed for messages with role 'user'")
+            process_line('data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}')
+            return True
+
+        with mock.patch.object(agent, "_send_provider_request", send):
+            first = await agent._provider_response(run, messages, [], "t:0")
+            second = await agent._provider_response(run, messages, [], "t:1")
+        self.assertEqual((first["content"], second["content"]), ("ok", "ok"))
+        self.assertEqual(len(bodies), 3)  # rejected, retried as user-role, then user-role directly
+        self.assertEqual([message["role"] for message in bodies[1]["messages"]], ["user", "assistant", "tool", "user"])
+        self.assertEqual(bodies[1]["messages"], bodies[2]["messages"])
+        self.assertTrue(all("_images" not in message for body in bodies for message in body["messages"]))
+        agent._TOOL_IMAGE_QUIRKS = None  # reload from disk: the choice survives restarts
+        self.assertEqual(agent._tool_image_mode({}, "http://strict.test/v1", "strict-model"), ("user", False))
+        self.assertEqual(agent._tool_image_mode({}, "http://strict.test/v1", "other-model"), ("tool", False))
+        self.assertEqual(agent._tool_image_mode({"toolResultImages": "tool"}, "http://strict.test/v1", "strict-model"),
+                         ("tool", True))
+
+    async def test_pinned_or_unrelated_rejections_are_not_retried(self):
+        agent._TOOL_IMAGE_QUIRKS = None
+        image = {"url": "data:image/png;base64,AAAA", "notice": "n"}
+        messages = [{"role": "tool", "tool_call_id": "a", "name": "view_file", "content": "{}", "_images": [image]}]
+        calls = []
+
+        async def send(_provider, _endpoint, _headers, _body, _process_line):
+            calls.append(1)
+            raise ValueError("LLM error 401: bad key")
+
+        run = agent.AgentRun(chat=chat("tool-image-auth"), options=options(
+            provider={"baseUrl": "http://auth.test/v1", "model": "m"}), manager=agent.RunManager(), run_id="r")
+        with mock.patch.object(agent, "_send_provider_request", send):
+            with self.assertRaises(ValueError):
+                await agent._provider_response(run, messages, [], "t")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(agent._tool_image_mode({}, "http://auth.test/v1", "m"), ("tool", False))
 
     async def test_promotion_variant_declares_inspected_schema_on_the_next_provider_turn(self):
         schema = {"name": "browser_search", "description": "Search the web", "parameters": {

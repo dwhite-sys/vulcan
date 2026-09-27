@@ -2615,7 +2615,7 @@ class BackgroundAgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(glm_view["result"]["view"], "overview")
         self.assertEqual((glm_view["result"]["rendered_width"], glm_view["result"]["rendered_height"]), (512, 341))
 
-    async def test_glm_view_file_injects_image_without_model_name_gating_or_base64_history_duplication(self):
+    async def test_glm_view_file_persists_image_for_stable_history_without_putting_base64_in_tool_role(self):
         from PIL import Image
 
         chat_id = "glm-view-run"
@@ -2662,7 +2662,17 @@ class BackgroundAgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Whole-image overview", image_message["content"][0]["text"])
         self.assertTrue(image_message["content"][1]["image_url"]["url"].startswith("data:image/png;base64,"))
         view_event = next(event for event in run.events if event.get("tool") == "view_file")
-        self.assertNotIn("dataUrl", view_event["result"]["result"])
+        self.assertTrue(view_event["result"]["result"]["dataUrl"].startswith("data:image/png;base64,"))
+
+        rebuilt = agent.project_history(run.events)
+        rebuilt_tool = next(message for message in rebuilt if message.get("role") == "tool"
+                            and message.get("name") == "view_file")
+        self.assertNotIn("dataUrl", rebuilt_tool["content"])
+        rebuilt_image = next(message for message in rebuilt if message.get("role") == "user"
+                             and isinstance(message.get("content"), list))
+        self.assertEqual(rebuilt_image["content"][0]["text"], image_message["content"][0]["text"])
+        self.assertEqual(rebuilt_image["content"][1]["image_url"]["url"],
+                         image_message["content"][1]["image_url"]["url"])
 
     async def test_promotion_variant_declares_inspected_schema_on_the_next_provider_turn(self):
         schema = {"name": "browser_search", "description": "Search the web", "parameters": {

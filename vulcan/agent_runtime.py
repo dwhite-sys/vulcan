@@ -466,6 +466,36 @@ def _user_content(event: dict[str, Any], content: str | None = None) -> Any:
     return parts
 
 
+def _image_notice(payload: dict[str, Any]) -> str:
+    if payload.get("view") == "detail":
+        region = payload.get("region", {})
+        return (f"[System] Detail view of {payload['filename']}: original image "
+                f"{payload.get('original_width')}x{payload.get('original_height')}; window "
+                f"x={region.get('x')}, y={region.get('y')}, "
+                f"{region.get('width')}x{region.get('height')} pixels.")
+    if payload.get("view") == "vector":
+        return f"[System] Vector image view of {payload['filename']}."
+    return (f"[System] Whole-image overview of {payload['filename']}: original image "
+            f"{payload.get('original_width')}x{payload.get('original_height')}; rendered "
+            f"{payload.get('rendered_width')}x{payload.get('rendered_height')} pixels.")
+
+
+def _provider_tool_payload(result: dict[str, Any]) -> tuple[Any, dict[str, Any] | None]:
+    """Return provider-safe tool content plus any durable image payload.
+
+    Image pixels stay in the canonical event for future prompt reconstruction, but
+    are excluded from the `tool` role itself because some providers reject image
+    data there. The caller emits the image as the same synthetic user message used
+    during the live turn.
+    """
+    payload = {"error": result["error"]} if result.get("error") else result.get("result", result)
+    if isinstance(payload, dict) and payload.get("dataUrl") and payload.get("filename"):
+        image_payload = dict(payload)
+        clean_payload = {key: value for key, value in payload.items() if key not in ("dataUrl", "__view_file_image__")}
+        return clean_payload, image_payload
+    return payload, None
+
+
 def project_history(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Match the React projector: completed historical reasoning never returns."""
     output: list[dict[str, Any]] = []
@@ -505,9 +535,14 @@ def project_history(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 result = item.get("result")
                 if not result:
                     continue
-                payload = {"error": result["error"]} if result.get("error") else result.get("result", result)
+                payload, image_payload = _provider_tool_payload(result)
                 output.append({"role": "tool", "tool_call_id": item.get("callId"), "name": item.get("tool"),
                                "content": json.dumps(payload, ensure_ascii=False, separators=(",", ":"))})
+                if image_payload is not None:
+                    output.append({"role": "user", "content": [
+                        {"type": "text", "text": _image_notice(image_payload)},
+                        {"type": "image_url", "image_url": {"url": image_payload["dataUrl"]}},
+                    ]})
     return output
 
 
@@ -1783,33 +1818,15 @@ async def execute_run(run: AgentRun):
                     if inspected is not None:
                         tools.append(inspected)
                         promoted_tools.add(inspected_name)
-            image_data_url = None
-            persisted_result = result
-            image_payload = result.get("result") if isinstance(result, dict) else None
-            if isinstance(image_payload, dict) and image_payload.get("dataUrl") and image_payload.get("filename"):
-                image_data_url = image_payload["dataUrl"]
-                clean_image_payload = {key: value for key, value in image_payload.items() if key != "dataUrl"}
-                persisted_result = {**result, "result": clean_image_payload}
-            event.update({"status": "error" if result.get("error") else "complete", "result": persisted_result})
+            event.update({"status": "error" if result.get("error") else "complete", "result": result})
             run._publish_stream_event(event)
             run.schedule_checkpoint()
-            payload = ({"error": persisted_result["error"]} if persisted_result.get("error")
-                       else persisted_result.get("result", persisted_result))
+            payload, image_payload = _provider_tool_payload(result)
             messages.append({"role": "tool", "tool_call_id": call["id"], "name": name,
                              "content": json.dumps(payload, ensure_ascii=False, separators=(",", ":"))})
-            if image_data_url and isinstance(payload, dict):
-                if payload.get("view") == "detail":
-                    region = payload.get("region", {})
-                    notice = (f"[System] Detail view of {payload['filename']}: original image "
-                              f"{payload.get('original_width')}x{payload.get('original_height')}; window "
-                              f"x={region.get('x')}, y={region.get('y')}, "
-                              f"{region.get('width')}x{region.get('height')} pixels.")
-                else:
-                    notice = (f"[System] Whole-image overview of {payload['filename']}: original image "
-                              f"{payload.get('original_width')}x{payload.get('original_height')}; rendered "
-                              f"{payload.get('rendered_width')}x{payload.get('rendered_height')} pixels.")
-                messages.append({"role": "user", "content": [{"type": "text", "text": notice},
-                                {"type": "image_url", "image_url": {"url": image_data_url}}]})
+            if image_payload is not None:
+                messages.append({"role": "user", "content": [{"type": "text", "text": _image_notice(image_payload)},
+                                {"type": "image_url", "image_url": {"url": image_payload["dataUrl"]}}]})
             if eligible and repeat_count > 4:
                 stuck_event = {"id": run.event_id("stuck"), "type": "assistant_text", "status": "complete", "timestamp": now(),
                     "runId": run.run_id, "turnId": f"{run.run_id}:stuck", "content": f"I got stuck repeatedly trying the same `{name}` call and it wasn't going anywhere, so I'm stopping here instead of continuing to loop. Feel free to try again — a fresh attempt sometimes gets past it."}

@@ -1,5 +1,5 @@
 import { useRef } from 'react';
-import { File, FileArchive, FileCode, FileText, Paperclip, Send, Square, X } from 'lucide-react';
+import { File as FileIcon, FileArchive, FileCode, FileText, Paperclip, Send, Square, X } from 'lucide-react';
 import { QuoteComposer, type QuoteComposerHandle } from './QuoteComposer';
 import { KitToggleMenu } from './KitToggleMenu';
 import { SkillToggleMenu, type SkillMeta } from './SkillToggleMenu';
@@ -23,7 +23,7 @@ function FileKindIcon({ kind }: { kind: FileKind }) {
     case 'text': return <FileText className="w-4 h-4 text-ash-300 shrink-0" />;
     case 'code': return <FileCode className="w-4 h-4 text-blue-400 shrink-0" />;
     case 'archive': return <FileArchive className="w-4 h-4 text-yellow-400 shrink-0" />;
-    default: return <File className="w-4 h-4 text-ash-400 shrink-0" />;
+    default: return <FileIcon className="w-4 h-4 text-ash-400 shrink-0" />;
   }
 }
 
@@ -119,7 +119,17 @@ export function MessageComposer({
     const text = event.clipboardData.getData('text/plain');
     if (text && text.length > PASTE_TEXT_THRESHOLD) {
       event.preventDefault();
-      addFiles([new File([new Blob([text], { type: 'text/plain' })], 'pasted-text.txt', { type: 'text/plain' })]);
+      const occupiedNames = new Set([
+        ...existingAttachments.map((attachment) => attachment.name),
+        ...files.map((file) => file.name),
+      ]);
+      let suffix = 1;
+      let filename = 'pasted-text.txt';
+      while (occupiedNames.has(filename)) {
+        suffix += 1;
+        filename = `pasted-text-${suffix}.txt`;
+      }
+      addFiles([new window.File([text], filename, { type: 'text/plain' })]);
     }
   };
   const handleSubmit = (event: React.FormEvent) => {

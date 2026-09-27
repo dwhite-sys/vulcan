@@ -50,6 +50,10 @@ def transcript_event_search_text(event: dict) -> str:
             if value is None:
                 continue
             try:
+                # Persist image pixels for faithful model-context reconstruction,
+                # but never feed base64 blobs into transcript FTS.
+                if isinstance(value, dict) and isinstance(value.get("result"), dict) and value["result"].get("dataUrl"):
+                    value = {**value, "result": {key: item for key, item in value["result"].items() if key != "dataUrl"}}
                 parts.append(json.dumps(value, default=str, ensure_ascii=False))
             except Exception:
                 parts.append(str(value))

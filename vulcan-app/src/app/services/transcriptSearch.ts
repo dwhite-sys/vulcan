@@ -18,6 +18,17 @@ function safeJson(value: unknown): string {
   try { return JSON.stringify(value ?? ''); } catch { return String(value ?? ''); }
 }
 
+// Tool results may carry image pixels (view_file keeps them for faithful model
+// context). Mirror the server's transcript FTS projection: never search base64.
+function searchableToolResult(result: any): unknown {
+  const inner = result?.result;
+  if (inner && typeof inner === 'object' && typeof inner.dataUrl === 'string') {
+    const { dataUrl: _pixels, ...metadata } = inner;
+    return { ...result, result: metadata };
+  }
+  return result;
+}
+
 export function transcriptEventSearchText(event: ChatEvent): string {
   switch (event.type) {
     case 'user_message':
@@ -26,7 +37,7 @@ export function transcriptEventSearchText(event: ChatEvent): string {
     case 'reasoning':
       return event.content ?? '';
     case 'tool':
-      return [event.tool, safeJson(event.arguments), safeJson(event.result)].filter(Boolean).join('\n');
+      return [event.tool, safeJson(event.arguments), safeJson(searchableToolResult(event.result))].filter(Boolean).join('\n');
     case 'presented_file':
       return [event.file?.name, event.file?.path].filter(Boolean).join('\n');
     case 'panel':

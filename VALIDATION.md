@@ -83,6 +83,7 @@ See `TRAFFIC_ARCHITECTURE.md` for the section-by-section status against the hand
 Validated in the build environment:
 
 - full server Python suite: **248 passed, 22 subtests passed** (it was 211 passed + 1 failed; the failure was the Stop-before-first-step bug, fixed here)
+- known pre-existing flake: `test_terminal_interactive.py::test_explicit_close_is_lifecycle_state_not_durable_terminal_output` depends on test order (it fails deterministically when run alone) and intermittently fails the full suite, on the unmodified baseline as well (about 1 run in 6 on both trees)
 - new suites: `test_traffic_architecture.py`, `test_persistence_architecture.py`, and `test_control_plane_e2e.py` (two real encrypted clients: register/status/Stop stay responsive during a maximum-rate generation, and the delta stream reconstructs the durable transcript)
 - renderer regressions: every `test:*` script that passed before still passes, and the three new ones (`test:run-stream`, `test:client-relay`, `test:provider-stream-relay`) pass. The nine that fail here also fail identically on the unmodified baseline.
 - `vite build` succeeds.

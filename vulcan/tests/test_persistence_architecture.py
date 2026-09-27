@@ -274,5 +274,23 @@ class SummaryTests(unittest.TestCase):
         self.assertNotIn("_summaryOnly", loaded)
 
 
+_SAVED_CONFIG: tuple = ()
+
+
+def setUpModule():
+    # config.CONFIG_DIR is fixed by whichever module imported it first; pin
+    # this module's storage to a private directory regardless of test order.
+    global _SAVED_CONFIG
+    from vulcan import config as cfg
+    _SAVED_CONFIG = (cfg.CONFIG_DIR, cfg.CHATS_DIR)
+    cfg.CONFIG_DIR = Path(tempfile.mkdtemp(prefix="vulcan-persistence-"))
+    cfg.CHATS_DIR = cfg.CONFIG_DIR / "chats"
+
+
+def tearDownModule():
+    from vulcan import config as cfg
+    cfg.CONFIG_DIR, cfg.CHATS_DIR = _SAVED_CONFIG
+
+
 if __name__ == "__main__":
     unittest.main()

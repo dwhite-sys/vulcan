@@ -142,14 +142,25 @@ class EgressScheduler:
         """
         if self._closed:
             raise ConnectionError("General WS egress closed")
-        soft = self._soft_budget(lane)
-        while soft is not None and self._bytes[lane] and self._bytes[lane] + len(plaintext) > soft:
-            self._space[lane].clear()
-            await self._space[lane].wait()
-            if self._closed:
-                raise ConnectionError("General WS egress closed")
+        # An ordered frame claims its place in the ordering *before* waiting
+        # for capacity: its content was captured now, so no live delta
+        # produced while it waits may overtake it.
+        reserved = self._reserve_ordered() if ordered else 0
+        try:
+            soft = self._soft_budget(lane)
+            while soft is not None and self._bytes[lane] and self._bytes[lane] + len(plaintext) > soft:
+                self._space[lane].clear()
+                await self._space[lane].wait()
+                if self._closed:
+                    raise ConnectionError("General WS egress closed")
+        except BaseException:
+            if reserved:
+                self._ordered_done.add(reserved)
+                self._wakeup.set()
+            raise
         future = asyncio.get_running_loop().create_future()
-        self._enqueue(lane, _Item(plaintext, future=future), ordered=ordered)
+        item = _Item(plaintext, future=future, ordered=reserved)
+        self._enqueue(lane, item, ordered=False)
         await future
 
     def post(self, plaintext: bytes, lane: int, *, ordered: bool | None = None) -> bool:
@@ -158,7 +169,7 @@ class EgressScheduler:
             return False
         if ordered is None:
             ordered = lane == STATE
-        if lane == STATE and self._bytes[STATE] + len(plaintext) > self.budgets.state_hard:
+        if lane == STATE and self._bytes[STATE] and self._bytes[STATE] + len(plaintext) > self.budgets.state_hard:
             # Authoritative state cannot be dropped, and it cannot queue
             # forever either. A subscriber this far behind is disconnected
             # and resynchronizes from a full snapshot when it reconnects.
@@ -219,11 +230,14 @@ class EgressScheduler:
             return self.budgets.stream
         return None
 
+    def _reserve_ordered(self) -> int:
+        self._ordered_seq += 1
+        self._ordered_pending.append(self._ordered_seq)
+        return self._ordered_seq
+
     def _enqueue(self, lane: int, item: _Item, *, ordered: bool) -> None:
         if ordered:
-            self._ordered_seq += 1
-            item.ordered = self._ordered_seq
-            self._ordered_pending.append(item.ordered)
+            item.ordered = self._reserve_ordered()
         self._lanes[lane].append(item)
         self._bytes[lane] += item.size
         if self._bytes[lane] > self.stats["peak_bytes"][lane]:

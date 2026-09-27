@@ -261,9 +261,28 @@ def _fts_key(connection: sqlite3.Connection, chat_id: str, event_id: str) -> int
     ).lastrowid)
 
 
-def _index_event(connection: sqlite3.Connection, chat_id: str, event: dict, *, on_current_path: bool) -> bool:
+# FTS maintenance for a multi-megabyte message costs ~a second of tokenizing.
+# That is derived data, not a durability boundary, so large events are
+# committed canonically first and (re)indexed right after, latest-wins.
+_INDEX_DEFER_CHARS = 64 * 1024
+_DEFERRED_INDEX: set[tuple[str, str]] = set()
+_DEFERRED_LOCK = threading.Lock()
+_DEFERRED_RUNNING = False
+
+
+def _index_event(connection: sqlite3.Connection, chat_id: str, event: dict, *, on_current_path: bool,
+                 defer_large: bool = True) -> bool:
     """(Re)index one canonical event; returns whether it is transcript-searchable."""
     event_id = str(event.get("id", ""))
+    if defer_large:
+        text = transcript_event_search_text(event).strip()
+        if len(text) > _INDEX_DEFER_CHARS:
+            connection.execute(
+                "INSERT OR REPLACE INTO transcript_event_meta(chat_id,event_id,timestamp) VALUES(?,?,?)",
+                (chat_id, event_id, str(event.get("timestamp", ""))),
+            )
+            _defer_index(chat_id, event_id)
+            return True
     key = _fts_key(connection, chat_id, event_id)
     connection.execute("DELETE FROM chat_search WHERE rowid = ?", (key,))
     connection.execute("DELETE FROM transcript_search WHERE rowid = ?", (key,))
@@ -287,6 +306,59 @@ def _index_event(connection: sqlite3.Connection, chat_id: str, event: dict, *, o
         )
         return True
     connection.execute("DELETE FROM transcript_event_meta WHERE chat_id = ? AND event_id = ?", (chat_id, event_id))
+    return False
+
+
+def _defer_index(chat_id: str, event_id: str) -> None:
+    global _DEFERRED_RUNNING
+    with _DEFERRED_LOCK:
+        _DEFERRED_INDEX.add((chat_id, event_id))
+        if _DEFERRED_RUNNING:
+            return
+        _DEFERRED_RUNNING = True
+    _DB_EXECUTOR.submit(_run_deferred_index)
+
+
+def _run_deferred_index() -> None:
+    """Index deferred events from their *current* canonical payload.
+
+    Reading the latest stored payload (instead of carrying one) makes these
+    jobs order-independent: an older job can never index stale content.
+    """
+    global _DEFERRED_RUNNING
+    while True:
+        with _DEFERRED_LOCK:
+            if not _DEFERRED_INDEX:
+                _DEFERRED_RUNNING = False
+                return
+            chat_id, event_id = _DEFERRED_INDEX.pop()
+        try:
+            with _DB_LOCK, _database() as connection:
+                row = connection.execute(
+                    "SELECT payload_json FROM chat_events WHERE chat_id = ? AND event_id = ?", (chat_id, event_id)
+                ).fetchone()
+                on_path = row is not None
+                if row is None:
+                    row = connection.execute(
+                        "SELECT payload_json FROM branch_events WHERE chat_id = ? AND event_id = ?", (chat_id, event_id)
+                    ).fetchone()
+                if row is None:
+                    _unindex_event(connection, chat_id, event_id)
+                else:
+                    _index_event(connection, chat_id, json.loads(row["payload_json"]),
+                                 on_current_path=on_path, defer_large=False)
+        except Exception:
+            logger.exception("Deferred search indexing failed for %s/%s", chat_id, event_id)
+
+
+def wait_for_index(timeout: float = 30.0) -> bool:
+    """Block until deferred search indexing has drained (tests/shutdown)."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with _DEFERRED_LOCK:
+            if not _DEFERRED_INDEX and not _DEFERRED_RUNNING:
+                return True
+        time.sleep(0.01)
     return False
 
 
@@ -360,7 +432,8 @@ def _reindex_chat_full(connection: sqlite3.Connection, chat_id: str) -> None:
         canonical[str(event.get("id", ""))] = event
     searchable: set[str] = set()
     for event_id, event in canonical.items():
-        if event_id and _index_event(connection, chat_id, event, on_current_path=event_id in on_path):
+        if event_id and _index_event(connection, chat_id, event, on_current_path=event_id in on_path,
+                                     defer_large=False):
             searchable.add(event_id)
     _rebuild_path_projections(connection, chat_id, branching, path_ids, searchable)
 

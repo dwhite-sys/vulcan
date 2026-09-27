@@ -1013,6 +1013,12 @@ export default function App() {
     const generation = ++chatSelectionGenerationRef.current;
     const candidate = chats.find((c) => c.id === chatId);
     if (!candidate) return;
+    // The sidebar list only receives run boundaries; hand the live transcript
+    // of the chat being left back to it so returning to it shows current text.
+    const leaving = activeChat;
+    if (leaving && leaving.id !== chatId && pendingChatIdRef.current !== leaving.id) {
+      setChats((previous) => previous.map((item) => item.id === leaving.id && !item._summaryOnly ? leaving : item));
+    }
 
     void (async () => {
       let chat = candidate;
@@ -2675,7 +2681,11 @@ Narrate at the level of intent. Say what you're doing and why; don't narrate eac
       enqueueRunStream(String(payload.chat_id ?? ''), {
         kind: 'full', events: rehydrateChatEvents(payload.events ?? [], false), seqs: payload.seqs ?? null,
         updatedAt: payload.updatedAt,
-      } as RunStreamMessage);
+        // Delta-capable servers send only the run's tail, anchored on the
+        // last pre-run event; older servers send the whole transcript.
+        tailFrom: typeof payload.tail_from === 'number' ? payload.tail_from : null,
+        baseLastId: payload.base_last_id ?? null,
+      });
     });
     const removeEvent = vulcan.generalWS.onPush('push/run-event', (payload: any) => {
       if (!payload?.event?.id) return;

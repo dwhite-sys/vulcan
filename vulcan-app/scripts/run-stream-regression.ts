@@ -86,6 +86,22 @@ const snapshot = (event: ChatEvent, seq: number): RunStreamMessage => ({
   assert.equal((result.events[0] as any).content, 'complete body!');
 }
 
+// Tail snapshots replace only the run's own events, anchored on history.
+{
+  const base = attachSeqs([...history(3), text('live', 'partial')], { live: 2 });
+  const anchored = applyRunStreamBatch(base, [
+    { kind: 'full', events: [text('live', 'final')], seqs: { live: 4 }, tailFrom: 3, baseLastId: 'h2' },
+  ]);
+  assert.deepEqual(anchored.events.map((event) => event.id), ['h0', 'h1', 'h2', 'live']);
+  assert.equal((anchored.events[3] as any).content, 'final');
+  assert.equal(anchored.gap, false);
+  const diverged = applyRunStreamBatch(base, [
+    { kind: 'full', events: [text('live', 'final')], seqs: { live: 4 }, tailFrom: 3, baseLastId: 'other' },
+  ]);
+  assert.equal(diverged.gap, true);
+  assert.equal(diverged.changed, false);
+}
+
 // Extend/set fields (reasoning details, tool call id).
 {
   const base = attachSeqs([{ ...text('tool'), type: 'tool', tool: 'vis', rawArguments: '{' } as any], { tool: 0 });

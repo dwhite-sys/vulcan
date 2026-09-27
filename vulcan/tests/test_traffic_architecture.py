@@ -182,6 +182,58 @@ class RunDeltaProtocolTests(unittest.IsolatedAsyncioTestCase):
         text = next(event for event in run.events if event["type"] == "assistant_text")
         self.assertEqual(mirror.events[text["id"]]["content"], text["content"])
 
+    async def test_background_chats_get_boundaries_but_no_token_traffic(self):
+        transport = RecordingTransport()
+        session = ws_general.GeneralWSSession(transport)
+        session.supports_run_deltas = True
+        manager = agent.RunManager()
+        foreground = agent.AgentRun(chat=base_chat("fg"), options={}, manager=manager, run_id="fg-run")
+        background = agent.AgentRun(chat=base_chat("bg"), options={}, manager=manager, run_id="bg-run")
+        manager.subscribe("fg", session)
+        manager.subscribe("bg", session)
+        session.focused_chat_id = "fg"
+        for index in range(200):
+            foreground.stream_event({"type": "text_delta", "delta": f"f{index} "}, "turn")
+            background.stream_event({"type": "text_delta", "delta": f"b{index} "}, "turn")
+            await asyncio.sleep(0.001)
+        foreground.seal_semantic()
+        background.seal_semantic()
+        await asyncio.sleep(0.05)
+        deltas = [frame for frame in transport.frames if frame["type"] == "push/run-delta"]
+        self.assertTrue(deltas)
+        self.assertTrue(all(frame["payload"]["chat_id"] == "fg" for frame in deltas))
+        sealed = [frame for frame in transport.frames
+                  if frame["type"] == "push/run-event" and frame["payload"]["chat_id"] == "bg"
+                  and frame["payload"]["event"].get("status") == "complete"]
+        self.assertEqual(sealed[-1]["payload"]["event"]["content"], background.events[-1]["content"])
+        session.cleanup()
+
+    async def test_end_of_run_snapshot_is_the_run_tail_for_delta_clients(self):
+        modern, legacy = RecordingTransport(), RecordingTransport()
+        modern_session = ws_general.GeneralWSSession(modern)
+        modern_session.supports_run_deltas = True
+        legacy_session = ws_general.GeneralWSSession(legacy)
+        manager = agent.RunManager()
+        chat = base_chat("tail")
+        chat["events"] = [{"id": f"old{index}", "type": "assistant_text", "content": "history " * 100,
+                           "timestamp": "t"} for index in range(50)] + chat["events"]
+        run = agent.AgentRun(chat=chat, options={}, manager=manager, run_id="run")
+        run.persist_base = len(chat["events"])
+        manager.subscribe("tail", modern_session)
+        manager.subscribe("tail", legacy_session)
+        run.stream_event({"type": "text_delta", "delta": "new answer"}, "turn")
+        run.finalize_streams()
+        run._publish()
+        await asyncio.sleep(0.05)
+        tail = next(frame for frame in modern.frames if frame["type"] == "push/run-events")["payload"]
+        full = next(frame for frame in legacy.frames if frame["type"] == "push/run-events")["payload"]
+        self.assertEqual(tail["tail_from"], 51)
+        self.assertEqual(tail["base_last_id"], "tail-user")
+        self.assertEqual([event["id"] for event in tail["events"]], [run.events[-1]["id"]])
+        self.assertEqual(len(full["events"]), 52)
+        modern_session.cleanup()
+        legacy_session.cleanup()
+
     async def test_quiet_provider_does_not_strand_received_tokens(self):
         transport = RecordingTransport()
         session = ws_general.GeneralWSSession(transport)
@@ -273,6 +325,37 @@ class EgressLaneTests(unittest.IsolatedAsyncioTestCase):
         await response
         await asyncio.sleep(0.02)
         self.assertEqual([frame.get("id") or frame["type"] for frame in transport.frames], ["sub", "push/run-delta"])
+        scheduler.close()
+
+    async def test_ordered_frame_waiting_for_capacity_still_precedes_later_deltas(self):
+        transport = RecordingTransport()
+        transport.gate = asyncio.Event()
+        budgets = traffic.EgressBudgets(bulk_soft=100_000)
+        scheduler = traffic.EgressScheduler(transport.send_plaintext, agent.encode_message, budgets=budgets)
+        filler = asyncio.create_task(scheduler.send(agent.encode_message({"id": "fill", "type": "x", "payload": "f" * 90_000}), traffic.BULK))
+        await asyncio.sleep(0)
+        # The subscribe snapshot must wait for BULK capacity...
+        response = asyncio.create_task(scheduler.send(
+            agent.encode_message({"id": "sub", "type": "runs/subscribe/response", "payload": "s" * 50_000}),
+            traffic.BULK, ordered=True))
+        await asyncio.sleep(0)
+        # ...while a newer delta is produced; it must not overtake the snapshot.
+        scheduler.post_stream("k", agent.encode_message({"type": "push/run-delta", "payload": {"seq": 9}}), lambda: None)
+        transport.gate.set()
+        await asyncio.gather(filler, response)
+        await asyncio.sleep(0.02)
+        order = [frame.get("id") or frame["type"] for frame in transport.frames]
+        self.assertLess(order.index("sub"), order.index("push/run-delta"))
+        scheduler.close()
+
+    async def test_single_large_authoritative_frame_is_not_treated_as_backlog(self):
+        transport = RecordingTransport()
+        reasons = []
+        scheduler = traffic.EgressScheduler(transport.send_plaintext, agent.encode_message,
+                                            budgets=traffic.EgressBudgets(state_hard=100_000),
+                                            on_overflow=reasons.append)
+        self.assertTrue(scheduler.post(b"s" * 500_000, traffic.STATE))
+        self.assertEqual(reasons, [])
         scheduler.close()
 
     async def test_lagging_stream_degrades_to_bounded_coalesced_snapshot(self):

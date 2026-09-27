@@ -132,7 +132,16 @@ export function resetSeqs(seqs: EventSeqs, snapshotSeqs: Record<string, number> 
 export type RunStreamMessage =
   | { kind: 'delta'; payload: RunDeltaPayload }
   | { kind: 'event'; payload: RunEventPayload }
-  | { kind: 'full'; events: ChatEvent[]; seqs?: Record<string, number> | null; updatedAt?: string };
+  | {
+      kind: 'full';
+      events: ChatEvent[];
+      seqs?: Record<string, number> | null;
+      updatedAt?: string;
+      /** Tail snapshot: `events` replace everything from this index onward. */
+      tailFrom?: number | null;
+      /** Id expected at `tailFrom - 1`; a mismatch means the prefix diverged. */
+      baseLastId?: string | null;
+    };
 
 /**
  * Apply queued stream messages (arrival order) to one events array.
@@ -165,7 +174,15 @@ export function applyRunStreamBatch(
   let full = false;
   for (const message of batch) {
     if (message.kind === 'full') {
-      working = message.events.slice();
+      const tailFrom = message.tailFrom;
+      if (typeof tailFrom === 'number') {
+        const anchored = tailFrom <= current.length
+          && (tailFrom === 0 || current[tailFrom - 1]?.id === message.baseLastId);
+        if (!anchored) { gap = true; continue; }
+        working = [...current.slice(0, tailFrom), ...message.events];
+      } else {
+        working = message.events.slice();
+      }
       current = working;
       positions.clear();
       resetSeqs(seqs, message.seqs);

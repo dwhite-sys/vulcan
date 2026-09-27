@@ -8,7 +8,6 @@ Runs belong to the server, never to a WebSocket connection.
 from __future__ import annotations
 
 import asyncio
-import copy
 import base64
 import html
 import hashlib
@@ -827,13 +826,19 @@ class AgentRun:
     # ── Authoritative publication ─────────────────────────────────────────
 
     def _publish(self):
-        # Full snapshots are authoritative resync/checkpoint frames, never the
-        # token-stream transport.
+        # Authoritative end-of-run reconciliation, never the token transport.
+        # Delta-capable renderers already hold the pre-run history, so they get
+        # only this run's tail (anchored on the last history event id); older
+        # renderers keep receiving the complete transcript.
         self.materialize_all()
-        self.manager.publish(self.chat["id"], "push/run-events", {
-            "chat_id": self.chat["id"], "run_id": self.run_id,
-            "events": self.events, "status": self.status, "updatedAt": self.chat.get("updatedAt"),
-            "seqs": dict(self.stream_seq),
+        base = min(self.persist_base, len(self.events))
+        common = {"chat_id": self.chat["id"], "run_id": self.run_id, "status": self.status,
+                  "updatedAt": self.chat.get("updatedAt"), "seqs": dict(self.stream_seq)}
+        self.manager.publish_variants(self.chat["id"], "push/run-events", full={
+            **common, "events": self.events,
+        }, tail={
+            **common, "events": self.events[base:], "tail_from": base,
+            "base_last_id": self.events[base - 1]["id"] if base else None,
         })
 
     def _publish_stream_event(self, event: dict[str, Any]):
@@ -1027,6 +1032,20 @@ class RunManager:
                 continue
             asyncio.create_task(session.send(message))
 
+    def publish_variants(self, chat_id: str, event_type: str, *, full: dict[str, Any], tail: dict[str, Any]) -> None:
+        """Publish a compact variant to delta-capable sessions, full to others."""
+        encoded: dict[str, bytes] = {}
+        for session in list(self.subscribers.get(chat_id, ())):
+            variant = "tail" if getattr(session, "supports_run_deltas", False) else "full"
+            message = {"type": event_type, "payload": tail if variant == "tail" else full}
+            post = getattr(session, "post", None)
+            if post is not None:
+                if variant not in encoded:
+                    encoded[variant] = encode_message(message)
+                post(message, plaintext=encoded[variant])
+                continue
+            asyncio.create_task(session.send(message))
+
     def publish_delta(self, run: "AgentRun", event_id: str, payload: dict[str, Any]) -> None:
         """Fan one ordered live delta out; lagging/legacy clients get snapshots."""
         chat_id = run.chat["id"]
@@ -1038,7 +1057,7 @@ class RunManager:
             if post_delta is not None:
                 if encoded is None:
                     encoded = encode_message(message)
-                post_delta(key, message, encoded, lambda: run.stream_snapshot_message(event_id))
+                post_delta(chat_id, key, message, encoded, lambda: run.stream_snapshot_message(event_id))
                 continue
             asyncio.create_task(session.send(message))
 

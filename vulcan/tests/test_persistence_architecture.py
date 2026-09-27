@@ -88,6 +88,24 @@ class IncrementalCheckpointTests(unittest.TestCase):
         self.assertEqual(chats.search_current_transcripts("pomegranate")["chat_ids"], [])
         self.assertEqual(chats.search_current_transcripts("persimmon")["chat_ids"], ["inc-update"])
 
+    def test_huge_event_is_durable_immediately_and_indexed_after(self):
+        chat = make_chat("inc-huge", 3)
+        chats.save_chat(chat)
+        base = len(chat["events"])
+        chat["events"].append(event("inc-huge-live", content="early draft tangerine " + "y " * 50_000))
+        chats.apply_run_checkpoint(checkpoint_for(chat, base, [base]))
+        chats.wait_for_index()
+        chat["events"][-1]["content"] = "final answer mangosteen " + "z " * 60_000
+        started = time.perf_counter()
+        chats.apply_run_checkpoint(checkpoint_for(chat, base, [base]))
+        elapsed = time.perf_counter() - started
+        # The canonical row is durable before derived FTS work runs.
+        self.assertEqual(chats.load_chat("inc-huge")["events"][-1]["content"], chat["events"][-1]["content"])
+        self.assertTrue(chats.wait_for_index())
+        self.assertEqual(chats.search_current_transcripts("mangosteen")["chat_ids"], ["inc-huge"])
+        self.assertEqual(chats.search_current_transcripts("tangerine")["chat_ids"], [])
+        self.assertLess(elapsed, 1.0)
+
     def test_checkpoint_cost_does_not_scale_with_history(self):
         timings = {}
         for size in (100, 4000):

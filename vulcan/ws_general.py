@@ -191,9 +191,11 @@ class GeneralWSSession:
         # Renderers that understand push/run-delta receive ordered deltas;
         # older renderers keep receiving coalesced event snapshots.
         self.supports_run_deltas = False
+        self.focused_chat_id: str | None = None
         self._uploads: dict[str, dict[str, Any]] = {}
         self._workspace_exports: dict[str, dict[str, Any]] = {}
         self._activity_recorded: dict[str, float] = {}
+        self._stopping: dict[str, Any] = {}
         self.admission: traffic.Admission | None = None
         self.egress = traffic.EgressScheduler(
             self._transmit, agent_runtime.encode_message, on_overflow=self._egress_overflow,
@@ -268,7 +270,12 @@ class GeneralWSSession:
             _lane_for(msg),
         )
 
-    def post_run_delta(self, key: str, msg: dict, plaintext: bytes, build) -> None:
+    def post_run_delta(self, chat_id: str, key: str, msg: dict, plaintext: bytes, build) -> None:
+        # Live token traffic only for the chat this renderer is looking at.
+        # Background chats still receive every authoritative boundary (STATE);
+        # re-opening one subscribes again and gets a consistent snapshot.
+        if self.focused_chat_id is not None and chat_id != self.focused_chat_id:
+            return
         self.egress.post_stream(key, plaintext if self.supports_run_deltas else None, build)
 
     def metrics(self) -> dict[str, Any]:
@@ -691,6 +698,7 @@ class GeneralWSSession:
         # completes. AgentRunManager then names the chat locally with the
         # deterministic user+assistant title classifier; provider inference is
         # never used for chat naming.
+        self.focused_chat_id = str(chat["id"])
         run = await agent_runtime.MANAGER.start_async(chat, options, session=self)
         # Keep the acknowledgement tiny. The renderer already owns the submitted
         # transcript; live/final pushes carry authoritative changes after dispatch.
@@ -698,10 +706,30 @@ class GeneralWSSession:
             "chat_id": chat["id"], "run_id": run.run_id, "status": run.status,
         })
 
+    def begin_cancel(self, chat_id: str) -> None:
+        """Take Stop effect immediately (called from the receive loop)."""
+        run = agent_runtime.MANAGER.runs.get(chat_id)
+        if run is not None and agent_runtime.MANAGER.cancel(chat_id):
+            self._stopping[chat_id] = run
+
     async def _runs_cancel(self, req_id: str, p: dict):
         # Stop is authoritative: acknowledge only after the cancelled run has
-        # checkpointed/finalized and released ownership of the chat.
-        stopped = await agent_runtime.MANAGER.cancel_and_wait(p["chat_id"])
+        # checkpointed/finalized and released ownership of the chat. The
+        # receive loop already requested cancellation; wait on that exact run
+        # (it may even have finished before this task was scheduled).
+        chat_id = p["chat_id"]
+        run = self._stopping.pop(chat_id, None)
+        if run is not None and run.task is not None:
+            try:
+                await asyncio.shield(run.task)
+            except asyncio.CancelledError:
+                if not run.task.cancelled():
+                    raise
+            except Exception:
+                pass
+            stopped = True
+        else:
+            stopped = await agent_runtime.MANAGER.cancel_and_wait(chat_id)
         await self.respond(req_id, "runs/cancel", {"ok": stopped})
 
     async def _runs_subscribe(self, req_id: str, p: dict):
@@ -715,6 +743,7 @@ class GeneralWSSession:
         """
         chat_id = p["chat_id"]
         self._note_capabilities(p)
+        self.focused_chat_id = str(chat_id)
         agent_runtime.MANAGER.subscribe(chat_id, self)
         include_chat = p.get("include_chat", True) is not False
         run = agent_runtime.MANAGER.runs.get(chat_id)
@@ -1479,7 +1508,7 @@ async def handle(ws: WebSocket):
                 # a (reserved control) task.
                 payload = message.get("payload")
                 if isinstance(payload, dict) and payload.get("chat_id"):
-                    agent_runtime.MANAGER.cancel(str(payload["chat_id"]))
+                    session.begin_cancel(str(payload["chat_id"]))
             name = _admission_class(msg_type)
             if not admission.submit(name, dispatcher(message, msg_type), size, msg_type):
                 logger.warning("General WS %s admission full; rejecting %s", name, msg_type)

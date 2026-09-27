@@ -303,11 +303,14 @@ def index_message(chat_id: str, event_id: str, content: str) -> bool:
     """Index one current, complete message without touching other history."""
     digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
     with chats._DB_LOCK, chats._database() as source:
+        # Address the FTS row by its keyed rowid: filtering chat_search on its
+        # UNINDEXED chat_id/event_id columns scans the entire corpus while
+        # holding the chat DB lock (and did so for every completed message).
         current = source.execute(
             "SELECT s.content, e.event_type, json_extract(e.payload_json, '$.status') AS status "
-            "FROM chat_search AS s JOIN chat_events AS e "
-            "ON e.chat_id = s.chat_id AND e.event_id = s.event_id "
-            "WHERE s.chat_id = ? AND s.event_id = ?",
+            "FROM fts_rowids AS k JOIN chat_search AS s ON s.rowid = k.key "
+            "JOIN chat_events AS e ON e.chat_id = k.chat_id AND e.event_id = k.event_id "
+            "WHERE k.chat_id = ? AND k.event_id = ?",
             (chat_id, event_id),
         ).fetchone()
     if current is None or current["content"] != content:
@@ -329,7 +332,8 @@ def index_message(chat_id: str, event_id: str, content: str) -> bool:
     # Never let that obsolete generation re-enter searchable history.
     with chats._DB_LOCK, chats._database() as source:
         current = source.execute(
-            "SELECT content FROM chat_search WHERE chat_id = ? AND event_id = ?",
+            "SELECT s.content FROM fts_rowids AS k JOIN chat_search AS s ON s.rowid = k.key "
+            "WHERE k.chat_id = ? AND k.event_id = ?",
             (chat_id, event_id),
         ).fetchone()
     if current is None or current["content"] != content:

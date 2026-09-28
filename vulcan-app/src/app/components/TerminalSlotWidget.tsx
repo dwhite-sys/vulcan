@@ -53,9 +53,10 @@ export interface TerminalSlotWidgetProps {
   kind: SlotKind;
   slot: number;
   onStatusChange?: (status: 'connected' | 'disconnected' | 'closed-inactivity') => void;
+  active?: boolean;
 }
 
-export function TerminalSlotWidget({ chatId, kind, slot, onStatusChange }: TerminalSlotWidgetProps) {
+export function TerminalSlotWidget({ chatId, kind, slot, onStatusChange, active = true }: TerminalSlotWidgetProps) {
   const containerRef   = useRef<HTMLDivElement>(null);
   const xtermRef       = useRef<XTerm | null>(null);
   const fitAddonRef    = useRef<FitAddon | null>(null);
@@ -201,6 +202,18 @@ export function TerminalSlotWidget({ chatId, kind, slot, onStatusChange }: Termi
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Switching terminal tabs must not destroy/replay the xterm instance. All open
+  // slots stay mounted; activation only makes this viewer visible and refreshes
+  // its fit/focus against the shared viewport.
+  useEffect(() => {
+    if (!active) return;
+    const timer = setTimeout(() => {
+      try { fitAddonRef.current?.fit(); } catch { /* layout may still be settling */ }
+      try { xtermRef.current?.focus(); } catch { /* no-op */ }
+    }, 0);
+    return () => clearTimeout(timer);
+  }, [active]);
 
   // ── Connect to slot PTY via WebSocket ────────────────────────────────────────
   useEffect(() => {
@@ -385,11 +398,15 @@ export function TerminalSlotWidget({ chatId, kind, slot, onStatusChange }: Termi
   return (
     <div
       ref={containerRef}
+      aria-hidden={!active}
       style={{
-        flex: 1,
+        position: 'absolute',
+        inset: 0,
         overflow: 'hidden',
         padding: '2px 4px',
         minHeight: 0,
+        visibility: active ? 'visible' : 'hidden',
+        pointerEvents: active ? 'auto' : 'none',
         background: kind === 'agent' ? AGENT_THEME.background : VSCODE_THEME.background,
       }}
     />

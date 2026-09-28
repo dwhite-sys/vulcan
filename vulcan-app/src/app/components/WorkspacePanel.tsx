@@ -332,17 +332,14 @@ export function WorkspacePanel({
     activeTerminalSlot?.kind === agentRunningSlot.kind &&
     activeTerminalSlot?.slot === agentRunningSlot.slot);
 
-  // A background PTY remains connected even when its viewer is detached.
-  // Only the selected slot has a live viewer socket; other slots retain the
-  // authoritative server-reported process status.
+  // Keep one live xterm/viewer per open PTY. Switching slots only changes which
+  // viewer is visible; it must not destroy xterm state and force a replay.
   const enrichedSlots: TerminalSlotMeta[] = terminalSlots.map((s) => ({
     ...s,
     status: (slotStatuses[`${s.kind}:${s.slot}`] === 'closed-inactivity'
         ? 'closed-inactivity'
         : s.status === 'closed-inactivity' ? 'closed-inactivity'
-        : activeTerminalSlot?.kind === s.kind && activeTerminalSlot?.slot === s.slot
-          ? slotStatuses[`${s.kind}:${s.slot}`] ?? s.status
-          : s.status) as TerminalSlotMeta['status'],
+        : slotStatuses[`${s.kind}:${s.slot}`] ?? s.status) as TerminalSlotMeta['status'],
   }));
   const enrichedActive = activeTerminalSlot
     ? enrichedSlots.find((s) => s.kind === activeTerminalSlot.kind && s.slot === activeTerminalSlot.slot) ?? activeTerminalSlot
@@ -379,20 +376,29 @@ export function WorkspacePanel({
           menuAnchorRef={terminalHandleRef}
         />
 
-        {/* Active terminal xterm */}
-        {activeTerminalSlot ? (
-          <TerminalSlotWidget
-            key={`${chatId}-${activeTerminalSlot.kind}-${activeTerminalSlot.slot}-${activeTerminalSlot.generation ?? 0}`}
-            chatId={chatId}
-            kind={activeTerminalSlot.kind}
-            slot={activeTerminalSlot.slot}
-            onStatusChange={(status) => handleSlotStatus(activeTerminalSlot.kind, activeTerminalSlot.slot, status)}
-          />
-        ) : (
-          <div className="flex-1 flex items-center justify-center text-xs" style={{ color: '#555', background: '#1e1e1e' }}>
-            No terminal open — use + to open one
-          </div>
-        )}
+        {/* Persistent terminal viewers. Tab switches only change visibility. */}
+        <div className="relative flex-1 min-h-0 overflow-hidden" style={{ background: '#1e1e1e' }}>
+          {terminalSlots
+            .filter((s) => s.status !== 'closed-inactivity')
+            .map((s) => {
+              const active = activeTerminalSlot?.kind === s.kind && activeTerminalSlot?.slot === s.slot;
+              return (
+                <TerminalSlotWidget
+                  key={`${chatId}-${s.kind}-${s.slot}-${s.generation ?? 0}`}
+                  chatId={chatId}
+                  kind={s.kind}
+                  slot={s.slot}
+                  active={active}
+                  onStatusChange={(status) => handleSlotStatus(s.kind, s.slot, status)}
+                />
+              );
+            })}
+          {!activeTerminalSlot && (
+            <div className="absolute inset-0 flex items-center justify-center text-xs" style={{ color: '#555', background: '#1e1e1e' }}>
+              No terminal open — use + to open one
+            </div>
+          )}
+        </div>
       </div>
     </div>
   ) : null;

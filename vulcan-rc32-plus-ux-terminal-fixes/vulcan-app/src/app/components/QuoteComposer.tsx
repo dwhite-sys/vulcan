@@ -4,6 +4,7 @@ import type { ComposerContextItem } from '../types/vulcan';
 import { QUOTE_COLORS, elementReferenceToken, fileReferenceToken, quoteReferenceToken } from '../services/quoteProjection';
 
 const QUOTE_DRAG_TYPE = 'application/x-vulcan-quote';
+const FORMAT_BOUNDARY = '\u200B';
 
 export interface QuoteComposerHandle {
   insertReference(item: ComposerContextItem, number: number): void;
@@ -31,7 +32,7 @@ function serializeInlineCode(contents: string): string {
 }
 
 function serializeNode(node: Node): string {
-  if (node.nodeType === Node.TEXT_NODE) return node.textContent ?? '';
+  if (node.nodeType === Node.TEXT_NODE) return (node.textContent ?? '').replaceAll(FORMAT_BOUNDARY, '');
   if (!(node instanceof HTMLElement)) return '';
   const contextId = node.dataset.contextId ?? node.dataset.quoteId;
   if (contextId) {
@@ -241,7 +242,15 @@ export const QuoteComposer = forwardRef<QuoteComposerHandle, Props>(function Quo
       range.setEnd(text, caret.startOffset);
       range.deleteContents();
       range.insertNode(replacement);
-      range.setStartAfter(replacement);
+
+      // Chromium can retain the inline formatting state when the caret is left
+      // directly on the trailing edge of <strong>/<em>/<code>/<a>. Put the
+      // caret inside a plain-text sibling instead so text typed after a
+      // Markdown shortcut is unformatted. The zero-width boundary is removed
+      // by serializeNode and never reaches the message value.
+      const boundary = document.createTextNode(FORMAT_BOUNDARY);
+      replacement.after(boundary);
+      range.setStart(boundary, boundary.data.length);
       range.collapse(true);
       activateRange(range);
       return true;

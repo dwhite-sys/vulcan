@@ -1,6 +1,7 @@
 import { useRef } from 'react';
 import { File as FileIcon, FileArchive, FileCode, FileText, Paperclip, Send, Square, X } from 'lucide-react';
 import { QuoteComposer, type QuoteComposerHandle } from './QuoteComposer';
+import { PASTE_TEXT_THRESHOLD, makePastedTextFile } from '../utils/composerPaste';
 import { KitToggleMenu } from './KitToggleMenu';
 import { SkillToggleMenu, type SkillMeta } from './SkillToggleMenu';
 import type { ComposerContextItem, Kit, MessageAttachment } from '../types/vulcan';
@@ -107,7 +108,6 @@ export function MessageComposer({
   const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
     if (event.target.files) addFiles(Array.from(event.target.files));
   };
-  const PASTE_TEXT_THRESHOLD = 500;
   const handlePaste = (event: React.ClipboardEvent) => {
     const items = Array.from(event.clipboardData.items);
     const pastedFiles = items.filter((item) => item.kind === 'file').map((item) => item.getAsFile()).filter((file): file is File => file !== null);
@@ -119,17 +119,7 @@ export function MessageComposer({
     const text = event.clipboardData.getData('text/plain');
     if (text && text.length > PASTE_TEXT_THRESHOLD) {
       event.preventDefault();
-      const occupiedNames = new Set([
-        ...existingAttachments.map((attachment) => attachment.name),
-        ...files.map((file) => file.name),
-      ]);
-      let suffix = 1;
-      let filename = 'pasted-text.txt';
-      while (occupiedNames.has(filename)) {
-        suffix += 1;
-        filename = `pasted-text-${suffix}.txt`;
-      }
-      addFiles([new window.File([text], filename, { type: 'text/plain' })]);
+      addFiles([makePastedTextFile(text, files.map((file) => file.name))]);
     }
   };
   const handleSubmit = (event: React.FormEvent) => {

@@ -48,15 +48,6 @@ const AGENT_THEME = {
   background: '#1a1e24',
 };
 
-// Replies xterm emits on its own: DA1/DA2/DA3 (`ESC[?1;2c`, `ESC[>0;276;0c`),
-// DSR / cursor position (`ESC[0n`, `ESC[12;1R`), mode reports (`ESC[?1;2$y`)
-// and OSC color/clipboard answers. Keystrokes never take these shapes whole.
-const TERMINAL_REPORT_RE = /^(?:\x1b\[[?>=]?[\d;]*(?:c|n|R|\$y)|\x1bP[\s\S]*?\x1b\\|\x1b\][\s\S]*?(?:\x07|\x1b\\))+$/;
-
-function isTerminalReport(data: string): boolean {
-  return TERMINAL_REPORT_RE.test(data);
-}
-
 export interface TerminalSlotWidgetProps {
   chatId: string;
   kind: SlotKind;
@@ -69,6 +60,8 @@ export function TerminalSlotWidget({ chatId, kind, slot, onStatusChange }: Termi
   const xtermRef       = useRef<XTerm | null>(null);
   const fitAddonRef    = useRef<FitAddon | null>(null);
   const fitTimerRef    = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const resizeInFlight = useRef(false);
+  const pendingResize  = useRef<{ cols: number; rows: number } | null>(null);
   const wsRef          = useRef<SecureWebSocket | null>(null);
   const cleanupRef     = useRef<(() => void) | null>(null);
   const serverSwitchingRef = useRef(false);
@@ -78,6 +71,33 @@ export function TerminalSlotWidget({ chatId, kind, slot, onStatusChange }: Termi
     fitTimerRef.current = setTimeout(() => {
       try { fitAddonRef.current?.fit(); } catch { /* ignore */ }
     }, 100);
+  }, []);
+
+  // Keep PTY geometry updates ordered and coalesced. ResizeObserver can emit a
+  // burst while the panel/layout is settling; sending every intermediate size
+  // independently lets a stale geometry race the final fit and desynchronize
+  // xterm from the backing PTY. Preserve only the latest pending dimensions.
+  const sendResize = useCallback(async (cols: number, rows: number) => {
+    if (resizeInFlight.current) {
+      pendingResize.current = { cols, rows };
+      return;
+    }
+
+    const socket = wsRef.current;
+    if (!socket?.connected) return;
+
+    resizeInFlight.current = true;
+    try {
+      await socket.send({ type: 'resize', cols, rows });
+    } catch { /* reconnect/open will reassert authoritative geometry */ }
+    finally {
+      resizeInFlight.current = false;
+      const next = pendingResize.current;
+      pendingResize.current = null;
+      if (next && (next.cols !== cols || next.rows !== rows)) {
+        void sendResize(next.cols, next.rows);
+      }
+    }
   }, []);
 
   // A terminal belongs to its server. Disconnect before the general connection
@@ -118,13 +138,36 @@ export function TerminalSlotWidget({ chatId, kind, slot, onStatusChange }: Termi
     term.open(containerRef.current);
     setTimeout(() => { try { fitAddon.fit(); } catch {} }, 0);
 
+    // Keep wheel input local to the terminal viewport. Without intercepting it
+    // before xterm's PTY input path, wheel gestures can be translated into
+    // cursor-key sequences by the terminal and cycle shell history instead of
+    // scrolling scrollback.
+    let wheelRemainder = 0;
+    const terminalElement = containerRef.current;
+    const handleWheel = (event: WheelEvent) => {
+      event.preventDefault();
+      event.stopPropagation();
+
+      const lineHeight = Math.max(1, term.options.fontSize * term.options.lineHeight);
+      let deltaLines: number;
+      if (event.deltaMode === WheelEvent.DOM_DELTA_LINE) deltaLines = event.deltaY;
+      else if (event.deltaMode === WheelEvent.DOM_DELTA_PAGE) deltaLines = event.deltaY * term.rows;
+      else deltaLines = event.deltaY / lineHeight;
+
+      wheelRemainder += deltaLines;
+      const wholeLines = wheelRemainder < 0 ? Math.ceil(wheelRemainder) : Math.floor(wheelRemainder);
+      if (wholeLines !== 0) {
+        term.scrollLines(wholeLines);
+        wheelRemainder -= wholeLines;
+      }
+    };
+    terminalElement.addEventListener('wheel', handleWheel, { capture: true, passive: false });
+
     xtermRef.current    = term;
     fitAddonRef.current = fitAddon;
 
     term.onResize(({ cols, rows }) => {
-      if (wsRef.current?.connected) {
-        void wsRef.current.send({ type: 'resize', cols, rows }).catch(() => {});
-      }
+      void sendResize(cols, rows);
     });
 
     // Ctrl+Shift+C — copy selection
@@ -149,6 +192,9 @@ export function TerminalSlotWidget({ chatId, kind, slot, onStatusChange }: Termi
       ro.disconnect();
       if (fitTimerRef.current) clearTimeout(fitTimerRef.current);
       cleanupRef.current?.();
+      resizeInFlight.current = false;
+      pendingResize.current = null;
+      terminalElement.removeEventListener('wheel', handleWheel, { capture: true });
       term.dispose();
       xtermRef.current    = null;
       fitAddonRef.current = null;
@@ -169,7 +215,6 @@ export function TerminalSlotWidget({ chatId, kind, slot, onStatusChange }: Termi
     let reconnectAttempts = 0;
     let terminalClosed = false;
     let pendingInput = '';
-    let replayingSnapshot = 0;
     let revivalPromise: Promise<void> | null = null;
     let authRecoveryPromise: Promise<void> | null = null;
     serverSwitchingRef.current = false;
@@ -184,7 +229,6 @@ export function TerminalSlotWidget({ chatId, kind, slot, onStatusChange }: Termi
     };
 
     const connect = async () => {
-      replayingSnapshot = 0;
       inputDisposable?.dispose();
       inputDisposable = null;
       if (cancelled) return;
@@ -216,13 +260,7 @@ export function TerminalSlotWidget({ chatId, kind, slot, onStatusChange }: Termi
         if (cancelled) { ws?.close(); return; }
         try {
           if (msg.type === 'scrollback' && xtermRef.current) {
-            // The snapshot is raw PTY output, including any device-attribute /
-            // cursor-position queries programs sent long ago. xterm answers
-            // those as it parses them; forwarding the answers would type
-            // `1;2c0;276;0c...` into the live shell, whose echo lands back in
-            // scrollback and is re-answered on every later attach.
-            replayingSnapshot += 1;
-            xtermRef.current.write(msg.data, () => { replayingSnapshot = Math.max(0, replayingSnapshot - 1); });
+            xtermRef.current.write(msg.data);
           } else if (msg.type === 'chunk' && xtermRef.current) {
             xtermRef.current.write(msg.data);
           } else if (msg.type === 'status') {
@@ -287,7 +325,6 @@ export function TerminalSlotWidget({ chatId, kind, slot, onStatusChange }: Termi
       // placing the input in chat history or tool arguments.
       if (xtermRef.current) {
         inputDisposable = xtermRef.current.onData((data) => {
-          if (replayingSnapshot > 0 && isTerminalReport(data)) return;
           if (ws?.connected) {
             void ws.send({ type: 'input', text: data }).catch(() => {
               pendingInput += data;

@@ -33,7 +33,6 @@ import os
 import shlex
 import pty
 import shutil
-import signal
 import struct
 import subprocess
 import termios
@@ -608,15 +607,10 @@ if [ -n "${{PROMPT_COMMAND-}}" ]; then
 else
   PROMPT_COMMAND="__vulcan_persist_terminal_state"
 fi
-# tmux is the durable shell transport. Wrap Vulcan's private OSC markers in
-# tmux DCS passthrough so the outer PTY collector receives the original OSC.
-# Prompt strings are backslash-decoded, so the DCS terminator's backslash is
-# doubled (a lone one would swallow the next prompt character). In PS1 the
-# whole marker sits between readline's \001/\002 ignore bytes: it prints
-# nothing, and counting its bytes as prompt width made readline wrap early
-# and redraw typed input over the prompt line.
-PS0=$'\033Ptmux;\033\033]777;vulcan-terminal;busy\007\033\\\\'"${{PS0-}}"
-PS1=$'\001\033Ptmux;\033\033]777;vulcan-terminal;idle\007\033\\\\\002'"{prompt_identity}:\w\$ "
+# Private OSC markers report shell busy/idle state. Keep them as ordinary OSC
+# sequences; do not wrap them in tmux DCS passthrough.
+PS0=$'\033]777;vulcan-terminal;busy\007'"${{PS0-}}"
+PS1=$'\033]777;vulcan-terminal;idle\007'"{prompt_identity}:\w\$ "
 export PS0 PS1
 """
     try:
@@ -775,14 +769,6 @@ def _ensure_tmux_session(
         [*base, container, "tmux", "set-option", "-g", "prefix", "None"],
         capture_output=True, text=True,
     )
-    # Vulcan's PS0/PS1 and command-completion OSC markers are private transport
-    # signals. tmux filters unknown escapes unless they are explicitly passed
-    # through, so allow our wrapped markers to reach the outer PTY collector.
-    docker.run_docker(
-        [*base, container, "tmux", "set-option", "-p", "-t", f"{name}:0.0",
-         "allow-passthrough", "on"],
-        capture_output=True, text=True,
-    )
 
 
 def _kill_slot_tmux_session(chat_id: str, kind: SlotKind, slot: int) -> None:
@@ -918,7 +904,6 @@ def _start_slot_proc(chat_id: str, kind: SlotKind, slot: int, cols: int = 80, ro
                         clear_slot_focus_if_matches(ts.chat_id, ts.kind, ts.slot)
 
     threading.Thread(target=_collect, daemon=True).start()
-    _schedule_winsize_resync(ts)
     _start_inactivity_watcher(ts)
     return ts
 
@@ -1064,42 +1049,6 @@ def close_chat_slots(chat_id: str, reason: str = 'explicit'):
         close_slot(chat_id, kind, slot, reason=reason)
 
 
-# `docker exec -it` reads its terminal size once at startup and only then
-# installs its SIGWINCH handler; a resize landing in between (the renderer
-# re-fits right after opening a terminal) is dropped. tmux, and the shell in it,
-# then keep the stale width while xterm uses the new one: typed input wraps in
-# the wrong place and redraws overwrite the next line. Re-signalling makes the
-# docker client re-read the PTY's current size, which is idempotent.
-_WINSIZE_RESYNC_DELAYS = (0.3, 1.0, 2.5)
-
-
-def _signal_winsize(ts: TerminalSlot) -> None:
-    if ts.finished:
-        return
-    try:
-        if ts.proc.poll() is None:
-            os.killpg(ts.proc.pid, signal.SIGWINCH)
-    except (ProcessLookupError, PermissionError, OSError, AttributeError):
-        try:
-            ts.proc.send_signal(signal.SIGWINCH)
-        except Exception:
-            pass
-
-
-def _schedule_winsize_resync(ts: TerminalSlot) -> None:
-    # One live resync per slot: a drag-resize reschedules instead of piling up threads.
-    token = getattr(ts, "_winsize_token", 0) + 1
-    ts._winsize_token = token
-
-    def resync():
-        for delay in _WINSIZE_RESYNC_DELAYS:
-            time.sleep(delay)
-            if getattr(ts, "_winsize_token", 0) != token:
-                return
-            _signal_winsize(ts)
-    threading.Thread(target=resync, daemon=True, name="vulcan-terminal-winsize").start()
-
-
 def resize_slot(chat_id: str, kind: SlotKind, slot: int, cols: int, rows: int):
     """Resize a slot's PTY window."""
     key = _slot_key(chat_id, kind, slot)
@@ -1111,7 +1060,6 @@ def resize_slot(chat_id: str, kind: SlotKind, slot: int, cols: int, rows: int):
         ts.rows = max(1, int(rows))
         fcntl.ioctl(ts.master_fd, termios.TIOCSWINSZ, struct.pack('HHHH', ts.rows, ts.cols, 0, 0))
         _update_slot_meta(chat_id, kind, slot, cols=ts.cols, rows=ts.rows, last_activity=ts.last_activity)
-        _schedule_winsize_resync(ts)
     except Exception:
         pass
 
@@ -1632,7 +1580,7 @@ def use_terminal_in_slot(chat_id: str, kind: SlotKind, slot: int,
     ts.idle_event.clear()
     wrapped = (
         "{\n" + cmd.rstrip('\n') + "\n}; __vulcan_command_status=$?; "
-        + f"printf '\\033Ptmux;\\033\\033]777;vulcan-command;{pid};%s\\007\\033\\\\' \"$__vulcan_command_status\"; "
+        + f"printf '\\033]777;vulcan-command;{pid};%s\\007' \"$__vulcan_command_status\"; "
         + "unset __vulcan_command_status\n"
     )
     try:

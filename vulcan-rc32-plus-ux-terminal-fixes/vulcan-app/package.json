@@ -24,6 +24,7 @@
     "test:skill-visibility": "node --experimental-strip-types --experimental-vm-modules scripts/skill-visibility-regression.ts",
     "test:server-transport": "node --experimental-strip-types --experimental-vm-modules scripts/general-ws-regression.ts",
     "test:terminals": "node scripts/terminal-regression.mjs",
+    "test:terminal-resize": "node scripts/terminal-resize-regression.mjs",
     "test:scroll": "node --experimental-strip-types scripts/transcript-scroll-regression.ts",
     "test:chat-search": "node --experimental-strip-types scripts/chat-topic-search-regression.ts",
     "test:library-dashboards": "node scripts/library-dashboard-regression.mjs",

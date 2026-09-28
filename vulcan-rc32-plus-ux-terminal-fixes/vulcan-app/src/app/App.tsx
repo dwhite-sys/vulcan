@@ -2004,23 +2004,6 @@ export default function App() {
         return parts;
       };
 
-      const imageNoticeForPayload = (payload: any): string => {
-        if (payload.view === 'detail') {
-          return `[System] Detail view of ${payload.filename}: original image ${payload.original_width}x${payload.original_height}; window x=${payload.region?.x}, y=${payload.region?.y}, ${payload.region?.width}x${payload.region?.height} pixels.`;
-        }
-        if (payload.view === 'vector') return `[System] Vector image view of ${payload.filename}.`;
-        return `[System] Whole-image overview of ${payload.filename}: original image ${payload.original_width}x${payload.original_height}; rendered ${payload.rendered_width}x${payload.rendered_height} pixels.`;
-      };
-
-      const providerToolResult = (result: any): { payload: any; imagePayload: any | null } => {
-        const payload = result?.error ? { error: result.error } : (result?.result ?? result);
-        if (payload && typeof payload === 'object' && payload.dataUrl && payload.filename) {
-          const { dataUrl: _dataUrl, __view_file_image__: _marker, ...metadata } = payload;
-          return { payload: metadata, imagePayload: payload };
-        }
-        return { payload, imagePayload: null };
-      };
-
       // Historical model context is a projection of the same ordered event log the UI
       // renders. There is no separately persisted "message history" to drift from it.
       const projectHistory = (events: ChatEvent[]): OAIMessage[] => {
@@ -2069,22 +2052,14 @@ export default function App() {
             });
             for (const tool of toolEvents) {
               if (!tool.result) continue;
-              const projected = providerToolResult(tool.result);
               out.push({
                 role: 'tool',
                 tool_call_id: tool.callId,
                 name: tool.tool,
-                content: JSON.stringify(projected.payload),
+                content: tool.result.error
+                  ? JSON.stringify({ error: tool.result.error })
+                  : JSON.stringify(tool.result.result ?? tool.result),
               });
-              if (projected.imagePayload) {
-                out.push({
-                  role: 'user',
-                  content: [
-                    { type: 'text', text: imageNoticeForPayload(projected.imagePayload) },
-                    { type: 'image_url', image_url: { url: projected.imagePayload.dataUrl } },
-                  ],
-                });
-              }
             }
           }
         }
@@ -2375,15 +2350,18 @@ Narrate at the level of intent. Say what you're doing and why; don't narrate eac
                   if (promoted && !tools.some((tool) => tool.name === promoted.name)) tools.push(promoted);
                 }
                 if (parsed.__view_file_image__) {
+                  const imageNotice = parsed.view === 'detail'
+                    ? `[System] Detail view of ${parsed.filename}: original image ${parsed.original_width}x${parsed.original_height}; window x=${parsed.region?.x}, y=${parsed.region?.y}, ${parsed.region?.width}x${parsed.region?.height} pixels.`
+                    : `[System] Whole-image overview of ${parsed.filename}: original image ${parsed.original_width}x${parsed.original_height}; rendered ${parsed.rendered_width}x${parsed.rendered_height} pixels.`;
                   syntheticImageMessage = {
                     role: 'user',
                     content: [
-                      { type: 'text', text: imageNoticeForPayload(parsed) },
+                      { type: 'text', text: imageNotice },
                       { type: 'image_url', image_url: { url: parsed.dataUrl } },
                     ],
                   };
-                  const { __view_file_image__: _marker, ...persistedImage } = parsed;
-                  toolResult = { result: persistedImage };
+                  const { dataUrl: _discarded, __view_file_image__: _marker, ...imageMetadata } = parsed;
+                  toolResult = { result: imageMetadata };
                 } else {
                   toolResult = { result: parsed };
                 }
@@ -2415,12 +2393,13 @@ Narrate at the level of intent. Say what you're doing and why; don't narrate eac
             : event);
           updateChatEvents(currentChat.id, runningEvents, committedChat || currentChat, true);
 
-          const projectedToolResult = providerToolResult(toolResult);
           oaiMessages.push({
             role: 'tool',
             tool_call_id: tc.id,
             name: toolName,
-            content: JSON.stringify(projectedToolResult.payload),
+            content: toolResult.error
+              ? JSON.stringify({ error: toolResult.error })
+              : JSON.stringify(toolResult.result ?? toolResult),
           });
           if (syntheticImageMessage) oaiMessages.push(syntheticImageMessage);
           if (loopAborted) break;

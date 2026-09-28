@@ -503,7 +503,6 @@ class TmuxTerminalPersistenceTests(unittest.TestCase):
             self.completed(0),  # new-session
             self.completed(0),  # status off
             self.completed(0),  # prefix None
-            self.completed(0),  # allow-passthrough on
         ])
 
         def run(args, **kwargs):
@@ -520,7 +519,7 @@ class TmuxTerminalPersistenceTests(unittest.TestCase):
                 shell_command="umask 000; exec /bin/bash -i",
             )
 
-        self.assertEqual(len(calls), 5)
+        self.assertEqual(len(calls), 4)
         self.assertIn("has-session", calls[0][0])
         create = calls[1][0]
         self.assertIn("new-session", create)
@@ -529,7 +528,6 @@ class TmuxTerminalPersistenceTests(unittest.TestCase):
         self.assertIn("umask 000; exec /bin/bash -i", create)
         self.assertEqual(calls[2][0][-2:], ["status", "off"])
         self.assertEqual(calls[3][0][-2:], ["prefix", "None"])
-        self.assertEqual(calls[4][0][-2:], ["allow-passthrough", "on"])
 
     def test_existing_tmux_shell_is_only_reattached_not_recreated(self):
         with mock.patch.object(terminal.docker, "terminal_exec_flags", return_value=[]), \
@@ -541,11 +539,10 @@ class TmuxTerminalPersistenceTests(unittest.TestCase):
                 revive_env=[],
                 shell_command="exec /bin/bash -i",
             )
-        self.assertEqual(run.call_count, 4)
+        self.assertEqual(run.call_count, 3)
         calls = [call.args[0] for call in run.call_args_list]
         self.assertIn("has-session", calls[0])
         self.assertFalse(any("new-session" in call for call in calls))
-        self.assertEqual(calls[-1][-2:], ["allow-passthrough", "on"])
 
     def test_explicit_terminal_retirement_kills_tmux_session(self):
         with mock.patch.object(terminal.docker, "container_running", return_value=True), \
@@ -556,56 +553,3 @@ class TmuxTerminalPersistenceTests(unittest.TestCase):
         args = run.call_args.args[0]
         self.assertIn("kill-session", args)
         self.assertEqual(args[-1], "vulcan-agent-3")
-
-
-class ShellIntegrationPromptTests(unittest.TestCase):
-    """The tmux passthrough markers must not change what readline thinks the prompt is."""
-
-    def _rc(self, chat_id: str) -> str:
-        captured = {}
-
-        def run_docker(args, **kwargs):
-            captured["rc"] = kwargs.get("input", "")
-            return subprocess.CompletedProcess(args, 0, "", "")
-
-        with mock.patch.object(terminal.docker, "run_docker", side_effect=run_docker):
-            terminal._install_slot_shell_integration(chat_id, "user", 1)
-        return captured["rc"]
-
-    def _expand(self, rc: str, variable: str) -> bytes:
-        lines = "\n".join(line for line in rc.splitlines() if line.startswith(("PS0=", "PS1=")))
-        script = f"PS0=; {lines}\ncd /\nprintf %s \"${{{variable}@P}}\""
-        return subprocess.run(["bash", "--norc", "--noprofile", "-c", script], capture_output=True, check=True).stdout
-
-    def test_prompt_markers_are_invisible_to_readline_and_do_not_eat_the_prompt(self):
-        chat_id = "0d6f5a2e-1b7c-4c0e-9a51-3f2d8e7b6c41"
-        rc = self._rc(chat_id)
-        idle = b"\x1bPtmux;\x1b\x1b]777;vulcan-terminal;idle\x07\x1b\\"
-        busy = b"\x1bPtmux;\x1b\x1b]777;vulcan-terminal;busy\x07\x1b\\"
-        # \001..\002 = readline's ignore markers: the passthrough occupies zero columns.
-        self.assertEqual(self._expand(rc, "PS1"), b"\x01" + idle + b"\x02" + f"{chat_id}@vulcan:/$ ".encode())
-        self.assertEqual(self._expand(rc, "PS0"), busy)
-
-
-class WinsizeResyncTests(unittest.TestCase):
-    """A resize dropped by `docker exec` during startup must be re-delivered."""
-
-    def test_resize_resignals_the_docker_client_process_group(self):
-        proc = subprocess.Popen(["sleep", "30"], start_new_session=True)
-        master, slave = os.openpty()
-        os.close(slave)
-        try:
-            ts = terminal.TerminalSlot(chat_id="winsize", kind="user", slot=1, proc=proc, master_fd=master)
-            key = terminal._slot_key("winsize", "user", 1)
-            signalled = []
-            with mock.patch.dict(terminal._slots, {key: ts}), \
-                 mock.patch.object(terminal, "_WINSIZE_RESYNC_DELAYS", (0.01, 0.01)), \
-                 mock.patch.object(terminal, "_update_slot_meta"), \
-                 mock.patch.object(terminal.os, "killpg", side_effect=lambda pgid, sig: signalled.append((pgid, sig))):
-                terminal.resize_slot("winsize", "user", 1, 70, 20)
-                terminal.resize_slot("winsize", "user", 1, 72, 20)  # a drag supersedes the first resync
-                time.sleep(0.3)
-            self.assertEqual((ts.cols, ts.rows), (72, 20))
-            self.assertEqual(signalled, [(proc.pid, terminal.signal.SIGWINCH)] * 2)
-        finally:
-            proc.kill(); proc.wait(); os.close(master)

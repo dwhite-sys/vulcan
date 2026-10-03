@@ -18,8 +18,7 @@ Three mechanisms, all stream to xterm:
              Agent slots: VULCAN_SESSION=agent:{slot}, read-only from xterm.
              User slots:  VULCAN_SESSION=user:{slot}, fully interactive.
              Slots are keyed by (chat_id, kind, slot_number).
-             Inactivity auto-close: if no output and no running process for
-             SLOT_INACTIVITY_SECONDS, the slot is closed and scrollback saved.
+             The independent host owns slots across backend/viewer disconnections.
 
 Isolation is provided by the per-chat Docker container.
 """
@@ -39,6 +38,8 @@ import termios
 import threading
 import time
 import uuid
+from pathlib import Path
+from vulcan import terminal_host
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 from typing import Optional, AsyncIterator, Literal
@@ -49,7 +50,6 @@ from vulcan import config as cfg
 logger = logging.getLogger("vulcan.terminal")
 
 SLOT_MAX           = 3                  # max slots per kind per chat
-SLOT_INACTIVITY_S  = 300               # seconds of silence before auto-close
 SlotKind = Literal['agent', 'user']
 
 # Invisible OSC markers injected into interactive bash sessions. They let the
@@ -90,6 +90,8 @@ class TerminalSlot:
     slot:         int               # 1-3
     proc:         object            # Popen
     master_fd:    int
+    host_key:     str | None = None
+    legacy_hook_pending: bool = False
     output:       list              = field(default_factory=list)  # chunks for SSE
     finished:     bool             = False
     last_activity: float           = field(default_factory=time.time)
@@ -366,6 +368,9 @@ def _load_slot_meta(chat_id: str) -> dict:
 def get_slot_scrollback(chat_id: str, kind: SlotKind, slot: int) -> str | None:
     """Return saved scrollback for a slot, checking memory then disk."""
     key = _slot_key(chat_id, kind, slot)
+    ts = _slots.get(key)
+    if ts and ts.host_key and not ts.finished:
+        return terminal_host.call('snapshot', ts.host_key)['data']
     with _scrollback_lock:
         if key in _scrollbacks:
             cleaned = _strip_lifecycle_notices(_scrollbacks[key])
@@ -387,6 +392,9 @@ def get_slot_scrollback(chat_id: str, kind: SlotKind, slot: int) -> str | None:
 
 
 def save_slot_scrollback(chat_id: str, kind: SlotKind, slot: int, scrollback: str):
+    ts = _slots.get(_slot_key(chat_id, kind, slot))
+    if ts and ts.host_key:
+        return
     """Save serialized xterm scrollback for a slot."""
     key = _slot_key(chat_id, kind, slot)
     with _scrollback_lock:
@@ -490,6 +498,7 @@ def slot_state(chat_id: str, kind: SlotKind, slot: int) -> dict | None:
         return {
             "slot": slot,
             "running": ts.is_busy,
+            "integration": "ready" if ts.shell_integration else "degraded",
             "pid": command.pid if command is not None else ts.last_command_pid,
         }
 
@@ -499,6 +508,8 @@ def wait_for_slot_idle(chat_id: str, kind: SlotKind, slot: int, timeout: float) 
     with _slots_lock:
         ts = _slots.get(_slot_key(chat_id, kind, slot))
     if ts is None or ts.finished:
+        return False
+    if ts.legacy_hook_pending or (ts.host_key and not ts.shell_integration):
         return False
     if not ts.is_busy:
         return True
@@ -564,7 +575,7 @@ def _read_slot_revival_state(chat_id: str, kind: SlotKind, slot: int) -> tuple[s
         capture_output=True,
     )
     values: list[str] = []
-    controlled = {"HOME", "PWD", "OLDPWD", "SHLVL", "_", "TERM", "COLORTERM",
+    controlled = {"VSCODE_SHELL_INTEGRATION", "VSCODE_NONCE", "HOME", "PWD", "OLDPWD", "SHLVL", "_", "TERM", "COLORTERM",
                   "VULCAN_SESSION", "VULCAN_CHAT_ID", "VULCAN_NODE"}
     if env_result.returncode == 0:
         raw = env_result.stdout if isinstance(env_result.stdout, bytes) else str(env_result.stdout).encode()
@@ -607,10 +618,16 @@ if [ -n "${{PROMPT_COMMAND-}}" ]; then
 else
   PROMPT_COMMAND="__vulcan_persist_terminal_state"
 fi
-# Private OSC markers report shell busy/idle state. Keep them as ordinary OSC
-# sequences; do not wrap them in tmux DCS passthrough.
-PS0=$'\033]777;vulcan-terminal;busy\007'"${{PS0-}}"
-PS1=$'\033]777;vulcan-terminal;idle\007'"{prompt_identity}:\w\$ "
+# tmux requires DCS passthrough; readline requires invisible prompt delimiters.
+__vulcan_marker() {{
+  if [ -n "${{TMUX-}}" ]; then
+    printf '\033Ptmux;\033\033]777;%s\007\033\\' "$1"
+  else
+    printf '\033]777;%s\007' "$1"
+  fi
+}}
+PS0='$(__vulcan_marker "vulcan-terminal;busy")'
+PS1='\[$(__vulcan_marker "vulcan-terminal;idle")\]'"{prompt_identity}:\w\$ "
 export PS0 PS1
 """
     try:
@@ -673,6 +690,8 @@ def _strip_activity_markers(ts: TerminalSlot, chunk: str) -> str:
                 ts.last_activity = time.time()
                 continue
 
+            ts.shell_integration = True
+            ts.legacy_hook_pending = False
             if marker == _ACTIVITY_BUSY_MARKER:
                 ts.prompt_busy = True
                 ts.idle_event.clear()
@@ -715,6 +734,8 @@ def _strip_activity_markers(ts: TerminalSlot, chunk: str) -> str:
 
 def _persist_slot_output(ts: TerminalSlot):
     """Merge one finished PTY session into durable server-owned scrollback exactly once."""
+    if ts.host_key:
+        return
     if ts.persisted:
         return
     key = _slot_key(ts.chat_id, ts.kind, ts.slot)
@@ -766,6 +787,10 @@ def _ensure_tmux_session(
         capture_output=True, text=True,
     )
     docker.run_docker(
+        [*base, container, "tmux", "set-option", "-t", name, "allow-passthrough", "on"],
+        capture_output=True, text=True,
+    )
+    docker.run_docker(
         [*base, container, "tmux", "set-option", "-g", "prefix", "None"],
         capture_output=True, text=True,
     )
@@ -787,6 +812,143 @@ def _kill_slot_tmux_session(chat_id: str, kind: SlotKind, slot: int) -> None:
 
 
 def _start_slot_proc(chat_id: str, kind: SlotKind, slot: int, cols: int = 80, rows: int = 24) -> TerminalSlot:
+    # Existing tmux shells remain attached until explicitly replaced.
+    present = docker.run_docker(['exec', docker.container_name(chat_id), 'tmux',
+                                 'has-session', '-t', _tmux_session_name(kind, slot)], capture_output=True)
+    if present.returncode == 0:
+        ts = _start_legacy_slot_proc(chat_id, kind, slot, cols, rows)
+        ts.legacy_hook_pending = True
+        ts.shell_integration = False
+        def repair_legacy():
+            while not ts.finished and ts.legacy_hook_pending:
+                pane = docker.run_docker(['exec', docker.container_name(chat_id), 'tmux', 'display-message', '-p', '-t', _tmux_session_name(kind, slot), '#{pane_current_command}'], capture_output=True, text=True)
+                screen = docker.run_docker(['exec', docker.container_name(chat_id), 'tmux', 'capture-pane', '-p', '-t', _tmux_session_name(kind, slot)], capture_output=True, text=True)
+                last = screen.stdout.rstrip().split('\n')[-1] if screen.returncode == 0 else ''
+                # Do not inject into a running command or a partially typed line.
+                if pane.stdout.strip() == 'bash' and re.fullmatch(re.escape(f'{chat_id}@vulcan:') + r'.*[$#]', last):
+                    safe_chat = ''.join(c if c.isalnum() or c in '-_' else '_' for c in chat_id)
+                    rc = f'/tmp/vulcan-{safe_chat}-{kind}-{slot}.bashrc'
+                    docker.run_docker(['exec', docker.container_name(chat_id), 'tmux', 'send-keys', '-t', _tmux_session_name(kind, slot), '-l', f'source {shlex.quote(rc)}'], capture_output=True)
+                    docker.run_docker(['exec', docker.container_name(chat_id), 'tmux', 'send-keys', '-t', _tmux_session_name(kind, slot), 'Enter'], capture_output=True)
+                    # Readiness is confirmed by a real marker, never by this screen check.
+                    return
+                time.sleep(1)
+        threading.Thread(target=repair_legacy, daemon=True).start()
+        return ts
+    if not docker.prepare_terminal_identity(chat_id, kind, slot):
+        raise RuntimeError('Could not prepare terminal HOME')
+    nonce = uuid.uuid4().hex
+    rc_path = f'/tmp/vulcan-host-{kind}-{slot}.bashrc'
+    upstream = Path(__file__).with_name('terminal_host').joinpath('vendor/shellIntegration-bash.sh').read_text()
+    prelude = "[ -r ~/.bashrc ] && . ~/.bashrc\n" + 'PS1=' + shlex.quote(f'{chat_id}@vulcan:\\w\\$ ') + '\n'
+    prelude += r"""
+printf '%s %s\n' "$BASHPID" "$VULCAN_HOST_TOKEN" > /tmp/vulcan-host-SLOT.pid
+__vulcan_persist() {
+  printf '%s\n' "$PWD" > "$HOME/.vulcan-cwd.tmp" && mv "$HOME/.vulcan-cwd.tmp" "$HOME/.vulcan-cwd"
+  env -0 > "$HOME/.vulcan-env.tmp" && mv "$HOME/.vulcan-env.tmp" "$HOME/.vulcan-env"
+  history -a >/dev/null 2>&1 || true
+  if declare -F __vsc_escape_value >/dev/null; then
+    printf '\e]633;EnvSingleStart;1;%s\a' "$__vsc_nonce"
+    local key
+    while IFS= read -r key; do
+      printf '\e]633;EnvSingleEntry;%s;%s;%s\a' "$key" "$(__vsc_escape_value "${!key}")" "$__vsc_nonce"
+    done < <(compgen -e)
+    printf '\e]633;EnvSingleEnd;%s;\a' "$__vsc_nonce"
+  fi
+}
+PROMPT_COMMAND="__vulcan_persist;${PROMPT_COMMAND-}"
+"""
+    docker.run_docker(['exec', '-i', docker.container_name(chat_id), 'bash', '-c', f'cat > {rc_path}'],
+                      input=prelude.replace('SLOT', f'{kind}-{slot}') + upstream, text=True, capture_output=True, check=True)
+    cwd, env = _read_slot_revival_state(chat_id, kind, slot)
+    recovered = terminal_host.call('restoreInfo', f'{chat_id}:{kind}:{slot}')
+    if recovered.get('cwd'):
+        result = docker.run_docker(['exec', docker.container_name(chat_id), 'test', '-d', recovered['cwd']], capture_output=True)
+        if result.returncode == 0: cwd = recovered['cwd']
+    controlled = {'HOME', 'PWD', 'OLDPWD', 'SHLVL', '_', 'TERM', 'COLORTERM', 'VSCODE_NONCE', 'VSCODE_SHELL_INTEGRATION', 'VULCAN_SESSION', 'VULCAN_HOST_TOKEN'}
+    recovered_env = {key: value for key, value in recovered.get('environment', {}).items()
+                     if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', key) and key not in controlled}
+    if recovered_env: env = [f'{key}={value}' for key, value in recovered_env.items()]
+    launch = {'file': shutil.which('docker') or 'docker', 'args': [
+        'exec', '-it', *docker.terminal_exec_flags(chat_id, kind, slot),
+        *sum((['-e', item] for item in env), []), '-w', cwd or docker.workspace_path(chat_id),
+        '-e', 'TERM=xterm-256color', '-e', 'COLORTERM=truecolor',
+        '-e', f'VSCODE_NONCE={nonce}', '-e', f'VULCAN_HOST_TOKEN={nonce}', '-e', 'VSCODE_SHELL_ENV_REPORTING=PATH,HOME',
+        '-e', f'VULCAN_SESSION={chat_id}:{kind}:{slot}', docker.container_name(chat_id),
+        '/bin/bash', '--noprofile', '--rcfile', rc_path, '-i'],
+        'env': {key: value for key, value in os.environ.items() if key in {'PATH', 'HOME', 'LANG', 'LC_ALL', 'DOCKER_HOST', 'DOCKER_CONTEXT'}}, 'hostCwd': str(cfg.CONFIG_DIR),
+        'cwd': cwd or docker.workspace_path(chat_id), 'nonce': nonce, 'cols': max(2, cols), 'rows': max(1, rows)}
+    retire_script = r"""
+read -r shell_pid shell_token < "$1" || exit 0
+[ "$shell_token" = "$2" ] || exit 0
+case "$shell_pid" in ''|*[!0-9]*) exit 1;; esac
+[ -r "/proc/$shell_pid/environ" ] || exit 0
+tr '\000' '\n' < "/proc/$shell_pid/environ" | grep -Fxq "VULCAN_HOST_TOKEN=$2" || exit 0
+kill -HUP "$shell_pid" 2>/dev/null || true
+"""
+    launch['retire'] = {'file': launch['file'], 'args': ['exec', '--user', '0:0', docker.container_name(chat_id),
+                         '/bin/bash', '-c', retire_script, 'vulcan-retire', f'/tmp/vulcan-host-{kind}-{slot}.pid']}
+    host_key = f'{chat_id}:{kind}:{slot}'
+    snapshot = terminal_host.call('open', host_key, launch=launch,
+                                  legacy=get_slot_scrollback(chat_id, kind, slot) or '')
+    proc = terminal_host.RemoteProcess(host_key)
+    ts = TerminalSlot(chat_id=chat_id, kind=kind, slot=slot, proc=proc, master_fd=-1,
+                      host_key=host_key, cols=snapshot['cols'], rows=snapshot['rows'],
+                      generation=snapshot['generation'], shell_integration=snapshot['integration'] == 'ready')
+    for record in snapshot.get('commands', []):
+        cp = _commands.get(record['id']) or CommandProcess(pid=record['id'], cmd=record['command'], chat_id=chat_id, slot_key=_slot_key(chat_id, kind, slot))
+        cp.output[:] = [record['output']]
+        cp.finished = record['state'] in ('completed', 'interrupted')
+        cp.exit_code = record.get('exitCode')
+        if record['state'] == 'interrupted': cp.detach_reason = 'Interrupted by host loss; command was not rerun.'
+        with _proc_lock:
+            _commands[cp.pid] = cp
+            _processes[cp.pid] = {'kind': 'command', 'chat_id': chat_id, 'cp': cp}
+        ts.last_command_pid = cp.pid
+        if not cp.finished:
+            ts.active_command = cp
+            ts.has_running = True
+    def collect():
+        while not ts.finished:
+            try:
+                state = terminal_host.call('state', host_key)
+                ts.prompt_busy = state['busy'] or state['integration'] != 'ready'
+                ts.shell_integration = state['integration'] == 'ready'
+                if state['busy']: ts.idle_event.clear()
+                else: ts.idle_event.set()
+                if ts.active_command:
+                    command = next((c for c in state['commands'] if c['id'] == ts.active_command.pid), None)
+                    if command:
+                        cp = ts.active_command
+                        if not cp.detached: cp.output[:] = [command['output']]
+                        if command['state'] in ('completed', 'interrupted'):
+                            cp.exit_code = command.get('exitCode')
+                            cp.finished = True
+                            ts.active_command = None
+                            ts.has_running = False
+                if state['finished']:
+                    proc.finished = ts.finished = True
+                    ts.close_reason = 'process-exit'
+                    break
+            except RuntimeError as error:
+                if 'Unknown terminal session' in str(error):
+                    ts.finished = proc.finished = True
+                    ts.close_reason = 'process-exit'
+                    if ts.active_command:
+                        ts.active_command.finished = True
+                        ts.active_command.exit_code = None
+                        ts.active_command.detach_reason = 'Interrupted by terminal host loss; command was not rerun.'
+                    break
+                ts.shell_integration = False
+            except Exception:
+                # A backend connection failure is not evidence of shell completion.
+                ts.shell_integration = False
+            time.sleep(.05)
+    threading.Thread(target=collect, daemon=True).start()
+    return ts
+
+
+def _start_legacy_slot_proc(chat_id: str, kind: SlotKind, slot: int, cols: int = 80, rows: int = 24) -> TerminalSlot:
     """Spawn a new PTY bash session for a slot."""
     master_fd, slave_fd = pty.openpty()
     try:
@@ -909,17 +1071,8 @@ def _start_slot_proc(chat_id: str, kind: SlotKind, slot: int, cols: int = 80, ro
 
 
 def _start_inactivity_watcher(ts: TerminalSlot):
-    """Background thread that auto-closes a slot after inactivity."""
-    def _watch():
-        while not ts.finished:
-            time.sleep(10)
-            if ts.finished:
-                break
-            idle = time.time() - ts.last_activity
-            if not ts.is_busy and idle > SLOT_INACTIVITY_S:
-                close_slot(ts.chat_id, ts.kind, ts.slot, reason='inactivity')
-                break
-    threading.Thread(target=_watch, daemon=True).start()
+    """Open terminals remain alive until an explicit terminal/container close."""
+    return
 
 
 def _start_logical_slot_locked(chat_id: str, kind: SlotKind, slot: int, *, cols: int, rows: int) -> TerminalSlot:
@@ -987,6 +1140,10 @@ def _close_slot_locked(chat_id: str, kind: SlotKind, slot: int, reason: str = 'e
         if not ts:
             entry = _persisted_slot_entry(chat_id, kind, slot)
             if reason == 'explicit' and entry.get("open"):
+                try:
+                    terminal_host.call('close', f'{chat_id}:{kind}:{slot}')
+                except RuntimeError:
+                    pass
                 _kill_slot_tmux_session(chat_id, kind, slot)
                 with _scrollback_lock:
                     _scrollbacks.pop(key, None)
@@ -997,6 +1154,8 @@ def _close_slot_locked(chat_id: str, kind: SlotKind, slot: int, reason: str = 'e
         if ts.finished:
             recoverable_reasons = _AGENT_RECOVERABLE_REASONS if kind == 'agent' else _LIFECYCLE_REOPEN_REASONS
             if reason == 'explicit' and ts.close_reason in recoverable_reasons:
+                if ts.host_key:
+                    terminal_host.call('close', ts.host_key)
                 _kill_slot_tmux_session(chat_id, kind, slot)
                 ts.close_reason = 'explicit'
                 with _scrollback_lock:
@@ -1010,11 +1169,17 @@ def _close_slot_locked(chat_id: str, kind: SlotKind, slot: int, reason: str = 'e
         # The persistent shell lives in tmux inside the chat container.  Intentional
         # lifecycle closes retire that shell; an unplanned docker-exec attachment
         # death never reaches this path and therefore leaves the session intact.
-        _kill_slot_tmux_session(chat_id, kind, slot)
+        if not ts.host_key:
+            _kill_slot_tmux_session(chat_id, kind, slot)
         try:
-            ts.proc.kill()
+            if ts.host_key:
+                terminal_host.call('close', ts.host_key, retain=reason != 'explicit')
+                ts.proc.finished = True
+            else:
+                ts.proc.kill()
+                ts.proc.wait(timeout=2)
         except Exception:
-            pass
+            logger.warning('Could not retire terminal %s', ts.slot_id, exc_info=True)
         _close_slot_fd(ts)
         # Lifecycle state is reported out-of-band through close_reason/slot status.
         # Do not append Vulcan-generated closure notices to PTY output: scrollback
@@ -1058,13 +1223,16 @@ def resize_slot(chat_id: str, kind: SlotKind, slot: int, cols: int, rows: int):
     try:
         ts.cols = max(1, int(cols))
         ts.rows = max(1, int(rows))
-        fcntl.ioctl(ts.master_fd, termios.TIOCSWINSZ, struct.pack('HHHH', ts.rows, ts.cols, 0, 0))
+        if ts.host_key:
+            terminal_host.call('resize', ts.host_key, cols=ts.cols, rows=ts.rows)
+        else:
+            fcntl.ioctl(ts.master_fd, termios.TIOCSWINSZ, struct.pack('HHHH', ts.rows, ts.cols, 0, 0))
         _update_slot_meta(chat_id, kind, slot, cols=ts.cols, rows=ts.rows, last_activity=ts.last_activity)
     except Exception:
         pass
 
 
-_LIFECYCLE_REOPEN_REASONS = {"inactivity", "container-stopped"}
+_LIFECYCLE_REOPEN_REASONS = {"inactivity", "container-stopped", "process-exit"}
 _AGENT_RECOVERABLE_REASONS = _LIFECYCLE_REOPEN_REASONS | {"process-exit"}
 
 
@@ -1102,7 +1270,7 @@ def ensure_live_slot(
             ts.finished = True
             _close_slot_fd(ts)
             _persist_slot_output(ts)
-            recoverable = kind == "agent"
+            recoverable = True
             _update_slot_meta(
                 chat_id, kind, slot, open=recoverable, parked=recoverable,
                 close_reason="process-exit", cols=ts.cols, rows=ts.rows,
@@ -1140,7 +1308,7 @@ def ensure_live_slot(
             )
         elif reason in _LIFECYCLE_REOPEN_REASONS:
             revived.resume_notice = (
-                f"Terminal {slot} resumed after inactivity. Its persisted scrollback, "
+                f"Terminal {slot} resumed after its container restarted. Its persisted scrollback, "
                 "working directory, and exported environment were restored."
             )
         elif reason == "persisted":
@@ -1176,7 +1344,10 @@ def send_slot_input(chat_id: str, kind: SlotKind, slot: int, text: str) -> bool:
     if not ts or ts.finished:
         return False
     try:
-        os.write(ts.master_fd, text.encode('utf-8', errors='replace'))
+        if ts.host_key:
+            terminal_host.call('input', ts.host_key, text=text)
+        else:
+            os.write(ts.master_fd, text.encode('utf-8', errors='replace'))
         ts.last_activity = time.time()
         return True
     except OSError:
@@ -1280,17 +1451,21 @@ def read_slot_output(chat_id: str, kind: SlotKind, slot: int, lines: int = 50) -
     """Return recent logical scrollback across live, parked, and server-restarted slots."""
     key = _slot_key(chat_id, kind, slot)
     ts = _slots.get(key)
+    if ts and ts.host_key:
+        state = terminal_host.call('snapshot', ts.host_key)
+        return '\n'.join(state['text'].split('\n')[-lines:])
     persisted = get_slot_scrollback(chat_id, kind, slot) or ""
     if not ts:
-        split = _strip_lifecycle_notices(persisted).split('\n')
-        return '\n'.join(split[-lines:])
+        if not persisted: return ''
+        rendered = terminal_host.call('convertLegacy', data=_strip_lifecycle_notices(persisted))
+        return '\n'.join(rendered['text'].split('\n')[-lines:])
     # A finished session has already been merged into persisted scrollback.  A
     # live replacement shell has only its new output there, so concatenate the
     # durable history with the live tail to make lifecycle reopening invisible.
     live = "" if ts.finished or ts.persisted else "".join(ts.output)
     full = _strip_lifecycle_notices(persisted + live)
-    split = full.split('\n')
-    return '\n'.join(split[-lines:])
+    rendered = terminal_host.call('convertLegacy', data=full, cols=getattr(ts, 'cols', 80), rows=getattr(ts, 'rows', 24))
+    return '\n'.join(rendered['text'].split('\n')[-lines:])
 
 
 def mirror_to_slot(chat_id: str, kind: SlotKind, slot: int, text: str):
@@ -1558,7 +1733,11 @@ def use_terminal_in_slot(chat_id: str, kind: SlotKind, slot: int,
         raise RuntimeError(f"Terminal {slot} is not open. Open or select a live terminal first.")
     if not docker.container_running(chat_id):
         raise RuntimeError(f"Container for chat {chat_id} is not running.")
-    if ts.has_running or ts.active_command is not None:
+    if ts.legacy_hook_pending:
+        raise RuntimeError("Legacy terminal integration is waiting for an untouched shell prompt. Use direct input or explicitly replace this terminal.")
+    if ts.host_key and not ts.shell_integration:
+        raise RuntimeError("Shell integration unavailable: command completion cannot be detected. Use direct terminal input or repair the shell integration.")
+    if ts.is_busy or ts.active_command is not None:
         raise RuntimeError(
             f"Terminal {slot} already has a foreground process. Use send_input, "
             "type directly into its terminal, or open another terminal."
@@ -1580,19 +1759,25 @@ def use_terminal_in_slot(chat_id: str, kind: SlotKind, slot: int,
     ts.idle_event.clear()
     wrapped = (
         "{\n" + cmd.rstrip('\n') + "\n}; __vulcan_command_status=$?; "
-        + f"printf '\\033]777;vulcan-command;{pid};%s\\007' \"$__vulcan_command_status\"; "
+        + 'if [ -n "${TMUX-}" ]; then '
+        + f"printf '\\033Ptmux;\\033\\033]777;vulcan-command;{pid};%s\\007\\033\\\\' \"$__vulcan_command_status\"; "
+        + 'else '
+        + f"printf '\\033]777;vulcan-command;{pid};%s\\007' \"$__vulcan_command_status\"; fi; "
         + "unset __vulcan_command_status\n"
     )
     try:
-        os.write(ts.master_fd, wrapped.encode('utf-8', errors='replace'))
+        if ts.host_key:
+            terminal_host.call('execute', ts.host_key, id=pid, command=cmd)
+        else:
+            os.write(ts.master_fd, wrapped.encode('utf-8', errors='replace'))
         ts.last_activity = time.time()
-    except OSError as error:
+    except (OSError, RuntimeError) as error:
         ts.active_command = None
         ts.has_running = False
         ts.capture_active = False
         cp.finished = True
         cp.exit_code = 1
-        raise RuntimeError(f"Terminal {slot} is no longer connected") from error
+        raise RuntimeError(str(error) if isinstance(error, RuntimeError) else f"Terminal {slot} is no longer connected") from error
 
     def _watch_timeout():
         deadline = time.monotonic() + max(timeout, 1)

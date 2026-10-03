@@ -1015,6 +1015,10 @@ linux_converge() {
 
   progress_task_start services service "Starting Vulcan service"
   say "Starting Vulcan services"
+  local terminal_service_scope=user
+  if [[ -n "$GUEST" || "$SERVER_ONLY" -eq 1 ]]; then terminal_service_scope=system; fi
+  "$RUNTIME/bin/python" -m vulcan.terminal_runtime install --service "$terminal_service_scope" \
+    || fail "Could not prepare persistent terminal runtime"
   ensure_vulcan_service_linux
   progress_task_finish services service done "Vulcan service running"
 

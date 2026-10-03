@@ -1,3 +1,4 @@
+import { measureTerminal } from '../terminalDimensions';
 /**
  * TerminalSlotWidget
  *
@@ -8,7 +9,6 @@
 
 import { useEffect, useRef, useCallback } from 'react';
 import { Terminal as XTerm } from '@xterm/xterm';
-import { FitAddon } from '@xterm/addon-fit';
 import { WebLinksAddon } from '@xterm/addon-web-links';
 import '@xterm/xterm/css/xterm.css';
 
@@ -59,18 +59,33 @@ export interface TerminalSlotWidgetProps {
 export function TerminalSlotWidget({ chatId, kind, slot, onStatusChange, active = true }: TerminalSlotWidgetProps) {
   const containerRef   = useRef<HTMLDivElement>(null);
   const xtermRef       = useRef<XTerm | null>(null);
-  const fitAddonRef    = useRef<FitAddon | null>(null);
   const fitTimerRef    = useRef<ReturnType<typeof setTimeout> | null>(null);
   const resizeInFlight = useRef(false);
   const pendingResize  = useRef<{ cols: number; rows: number } | null>(null);
   const wsRef          = useRef<SecureWebSocket | null>(null);
   const cleanupRef     = useRef<(() => void) | null>(null);
   const serverSwitchingRef = useRef(false);
+  const activeRef = useRef(active);
+  activeRef.current = active;
+  const replayingRef = useRef(false);
+  const hostReportsRef = useRef(true);
+  const streamRef = useRef({ generation: '', sequence: 0 });
+  const resizeRequestRef = useRef<(cols: number, rows: number) => void>(() => {});
+  const measure = useCallback(() => {
+    const container = containerRef.current;
+    if (!activeRef.current || replayingRef.current || !container || container.clientWidth < 2 || container.clientHeight < 2) return;
+    try {
+      const dims = xtermRef.current ? measureTerminal(xtermRef.current) : undefined;
+      if (!dims || dims.cols < 2 || dims.rows < 1) return;
+      if (wsRef.current?.connected) resizeRequestRef.current(dims.cols, dims.rows);
+      else xtermRef.current?.resize(dims.cols, dims.rows);
+    } catch { /* next layout will retry */ }
+  }, []);
 
   const debouncedFit = useCallback(() => {
     if (fitTimerRef.current) clearTimeout(fitTimerRef.current);
     fitTimerRef.current = setTimeout(() => {
-      try { fitAddonRef.current?.fit(); } catch { /* ignore */ }
+      measure();
     }, 100);
   }, []);
 
@@ -79,6 +94,7 @@ export function TerminalSlotWidget({ chatId, kind, slot, onStatusChange, active 
   // independently lets a stale geometry race the final fit and desynchronize
   // xterm from the backing PTY. Preserve only the latest pending dimensions.
   const sendResize = useCallback(async (cols: number, rows: number) => {
+    if (!activeRef.current || replayingRef.current || cols < 2 || rows < 1) return;
     if (resizeInFlight.current) {
       pendingResize.current = { cols, rows };
       return;
@@ -100,6 +116,8 @@ export function TerminalSlotWidget({ chatId, kind, slot, onStatusChange, active 
       }
     }
   }, []);
+
+  resizeRequestRef.current = (cols, rows) => { void sendResize(cols, rows); };
 
   // A terminal belongs to its server. Disconnect before the general connection
   // changes, and never write old-server scrollback into the new server.
@@ -127,17 +145,31 @@ export function TerminalSlotWidget({ chatId, kind, slot, onStatusChange, active 
       cursorBlink:  true,
       cursorStyle:  'block',
       scrollback:   5000,
-      convertEol:   true,
+      convertEol:   false,
+      allowProposedApi: true,
       // Both user and agent terminals accept direct user input.
       disableStdin: false,
     });
 
-    const fitAddon      = new FitAddon();
     const webLinksAddon = new WebLinksAddon();
-    term.loadAddon(fitAddon);
     term.loadAddon(webLinksAddon);
     term.open(containerRef.current);
-    setTimeout(() => { try { fitAddon.fit(); } catch {} }, 0);
+    // The authoritative headless emulator answers device queries once, even when
+    // no viewer is attached. A viewer must never send a second answer to Bash.
+    for (const final of ['c', 'n', 't']) {
+      term.parser.registerCsiHandler({ final }, () => hostReportsRef.current || replayingRef.current);
+      term.parser.registerCsiHandler({ prefix: '?', final }, () => hostReportsRef.current || replayingRef.current);
+      term.parser.registerCsiHandler({ prefix: '>', final }, () => hostReportsRef.current || replayingRef.current);
+    }
+    for (const id of [4, 10, 11, 12]) term.parser.registerOscHandler(id, value => value.endsWith('?') && (hostReportsRef.current || replayingRef.current));
+    const refreshFont = () => {
+      // xterm's measured cells must be refreshed when a deferred font replaces
+      // the fallback font; measuring against cached cells reproduces early wrap.
+      (term as any)._core?._charSizeService?.measure();
+      requestAnimationFrame(measure);
+    };
+    document.fonts.addEventListener('loadingdone', refreshFont);
+    void document.fonts.ready.then(refreshFont);
 
     // Keep wheel input local to the terminal viewport. Without intercepting it
     // before xterm's PTY input path, wheel gestures can be translated into
@@ -165,11 +197,8 @@ export function TerminalSlotWidget({ chatId, kind, slot, onStatusChange, active 
     terminalElement.addEventListener('wheel', handleWheel, { capture: true, passive: false });
 
     xtermRef.current    = term;
-    fitAddonRef.current = fitAddon;
 
-    term.onResize(({ cols, rows }) => {
-      void sendResize(cols, rows);
-    });
+    // Geometry is applied only at its ordered stream barrier from the host.
 
     // Ctrl+Shift+C — copy selection
     term.attachCustomKeyEventHandler((e: KeyboardEvent) => {
@@ -191,6 +220,7 @@ export function TerminalSlotWidget({ chatId, kind, slot, onStatusChange, active 
 
     return () => {
       ro.disconnect();
+      document.fonts.removeEventListener('loadingdone', refreshFont);
       if (fitTimerRef.current) clearTimeout(fitTimerRef.current);
       cleanupRef.current?.();
       resizeInFlight.current = false;
@@ -198,7 +228,6 @@ export function TerminalSlotWidget({ chatId, kind, slot, onStatusChange, active 
       terminalElement.removeEventListener('wheel', handleWheel, { capture: true });
       term.dispose();
       xtermRef.current    = null;
-      fitAddonRef.current = null;
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -209,7 +238,7 @@ export function TerminalSlotWidget({ chatId, kind, slot, onStatusChange, active 
   useEffect(() => {
     if (!active) return;
     const timer = setTimeout(() => {
-      try { fitAddonRef.current?.fit(); } catch { /* layout may still be settling */ }
+      measure();
       try { xtermRef.current?.focus(); } catch { /* no-op */ }
     }, 0);
     return () => clearTimeout(timer);
@@ -228,6 +257,7 @@ export function TerminalSlotWidget({ chatId, kind, slot, onStatusChange, active 
     let reconnectAttempts = 0;
     let terminalClosed = false;
     let pendingInput = '';
+    let renderQueue = Promise.resolve();
     let revivalPromise: Promise<void> | null = null;
     let authRecoveryPromise: Promise<void> | null = null;
     serverSwitchingRef.current = false;
@@ -248,7 +278,8 @@ export function TerminalSlotWidget({ chatId, kind, slot, onStatusChange, active 
       // Fit before attaching. The open handshake carries this geometry so a new
       // PTY is born at the visible size and an existing PTY is resized before
       // the server replays its authoritative snapshot.
-      try { fitAddonRef.current?.fit(); } catch { /* container may be between layouts */ }
+      await document.fonts.ready;
+      measure();
       // Server snapshots are authoritative. reset() drops all prior xterm state,
       // including the current prompt line that clear() intentionally preserves.
       xtermRef.current?.reset();
@@ -273,9 +304,28 @@ export function TerminalSlotWidget({ chatId, kind, slot, onStatusChange, active 
         if (cancelled) { ws?.close(); return; }
         try {
           if (msg.type === 'scrollback' && xtermRef.current) {
-            xtermRef.current.write(msg.data);
+            const terminal = xtermRef.current;
+            streamRef.current = { generation: msg.generation || '', sequence: msg.sequence || 0 };
+            renderQueue = renderQueue.then(async () => {
+              if (cancelled) return;
+              replayingRef.current = true;
+              hostReportsRef.current = !msg.legacy;
+              await new Promise<void>(resolve => terminal.write('', resolve));
+              terminal.reset();
+              if (msg.cols >= 2 && msg.rows >= 1) terminal.resize(msg.cols, msg.rows);
+              await new Promise<void>(resolve => terminal.write(msg.data || '', resolve));
+              replayingRef.current = false;
+              requestAnimationFrame(measure);
+            });
           } else if (msg.type === 'chunk' && xtermRef.current) {
-            xtermRef.current.write(msg.data);
+            if (msg.generation && (msg.generation !== streamRef.current.generation || msg.sequence <= streamRef.current.sequence)) return;
+            if (msg.generation) streamRef.current.sequence = msg.sequence;
+            const terminal = xtermRef.current;
+            renderQueue = renderQueue.then(async () => {
+              if (cancelled) return;
+              if (msg.cols >= 2 && msg.rows >= 1) terminal.resize(msg.cols, msg.rows);
+              else await new Promise<void>(resolve => terminal.write(msg.data || '', resolve));
+            });
           } else if (msg.type === 'status') {
             if (msg.connected) {
               reconnectAttempts = 0;
@@ -338,6 +388,7 @@ export function TerminalSlotWidget({ chatId, kind, slot, onStatusChange, active 
       // placing the input in chat history or tool arguments.
       if (xtermRef.current) {
         inputDisposable = xtermRef.current.onData((data) => {
+          if (replayingRef.current) return;
           if (ws?.connected) {
             void ws.send({ type: 'input', text: data }).catch(() => {
               pendingInput += data;

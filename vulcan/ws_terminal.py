@@ -54,6 +54,7 @@ import logging
 
 from fastapi import WebSocket, WebSocketDisconnect
 
+from vulcan import terminal_host
 from vulcan import terminal as term
 from vulcan import docker
 from vulcan import auth
@@ -108,7 +109,8 @@ async def handle(ws: WebSocket, chat_id: str, kind: str, slot: int):
             # in TerminalManager-style ensure_live_slot(). It always enters the same
             # chat/container workspace and serializes with agent recovery/explicit close.
             ts = await asyncio.to_thread(
-                term.ensure_live_slot, chat_id, kind, slot, cols=cols, rows=rows, create=True
+                term.ensure_live_slot, chat_id, kind, slot, create=True,
+                **({"cols": cols, "rows": rows} if before is None else {})
             )
             if ts is None:
                 raise RuntimeError(f"Could not open terminal {slot}")
@@ -120,18 +122,27 @@ async def handle(ws: WebSocket, chat_id: str, kind: str, slot: int):
 
         # The server is the sole transcript authority. Send one coherent snapshot:
         # durable history from prior PTY sessions + the current PTY session exactly once.
-        current_chunks = list(ts.output) if ts is not None else []
-        sent_chunks = len(current_chunks)
-        snapshot = (term.get_slot_scrollback(chat_id, kind, slot) or "") + "".join(current_chunks)
-        if snapshot:
-            await send({"type": "scrollback", "data": snapshot})
+        host_sequence = 0
+        host_generation = ts.generation
+        if ts.host_key:
+            snapshot = await asyncio.to_thread(terminal_host.call, 'snapshot', ts.host_key)
+            host_sequence = snapshot['sequence']
+            host_generation = snapshot['generation']
+            await send({'type': 'scrollback', **{field: snapshot[field] for field in ('data', 'cols', 'rows', 'sequence', 'generation')}})
+            sent_chunks = 0
+        else:
+            current_chunks = list(ts.output)
+            sent_chunks = len(current_chunks)
+            snapshot = (term.get_slot_scrollback(chat_id, kind, slot) or '') + ''.join(current_chunks)
+            if snapshot:
+                await send({'type': 'scrollback', 'data': snapshot, 'cols': ts.cols, 'rows': ts.rows, 'legacy': True})
 
         await send({"type": "status", "connected": True})
 
         # ── Stream PTY output ─────────────────────────────────────────────────
 
         async def stream_output():
-            nonlocal sent_chunks, ts
+            nonlocal sent_chunks, ts, host_sequence, host_generation
             generation = ts.generation
             while True:
                 current = term._slots.get(key)
@@ -144,6 +155,32 @@ async def handle(ws: WebSocket, chat_id: str, kind: str, slot: int):
                     await send({"type": "status", "connected": True, "resumed": True})
                 if ts is None:
                     break
+                if ts.host_key:
+                    try:
+                        state = await asyncio.to_thread(terminal_host.call, 'poll', ts.host_key,
+                                                         sequence=host_sequence, generation=host_generation)
+                    except RuntimeError as error:
+                        if 'Unknown terminal session' in str(error):
+                            revived = await asyncio.to_thread(term.ensure_live_slot, chat_id, kind, slot)
+                            if revived is not None:
+                                ts = revived
+                                continue
+                            break
+                        await send({'type': 'status', 'connected': False, 'reason': 'terminal-host-unavailable'})
+                        await asyncio.sleep(.2)
+                        continue
+                    if 'snapshot' in state:
+                        snapshot = state['snapshot']
+                        host_sequence = snapshot['sequence']
+                        host_generation = snapshot['generation']
+                        await send({'type': 'scrollback', **{field: snapshot[field] for field in ('data', 'cols', 'rows', 'sequence', 'generation')}})
+                    else:
+                        for event in state['events']:
+                            await send({'type': 'chunk', 'generation': host_generation, **event})
+                        host_sequence = state['sequence']
+                    if not ts.finished:
+                        await asyncio.sleep(.02)
+                        continue
                 new_chunks = ts.output[sent_chunks:]
                 for chunk in new_chunks:
                     await send({"type": "chunk", "data": chunk})
@@ -173,17 +210,17 @@ async def handle(ws: WebSocket, chat_id: str, kind: str, slot: int):
                 mtype = msg.get("type")
 
                 if mtype == "input":
-                    if term.send_slot_input(chat_id, kind, slot, msg.get("text", "")):
+                    if await asyncio.to_thread(term.send_slot_input, chat_id, kind, slot, msg.get("text", "")):
                         container_lifecycle.record_activity(chat_id, "terminal-input")
 
                 elif mtype == "resize":
                     cols = int(msg.get("cols", 80))
                     rows = int(msg.get("rows", 24))
-                    term.resize_slot(chat_id, kind, slot, cols, rows)
+                    await asyncio.to_thread(term.resize_slot, chat_id, kind, slot, cols, rows)
 
                 elif mtype == "close":
                     stream_task.cancel()
-                    term.close_slot(chat_id, kind, slot)
+                    await asyncio.to_thread(term.close_slot, chat_id, kind, slot)
                     await send({"type": "closed", "reason": "explicit"})
                     break
 

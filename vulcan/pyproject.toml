@@ -47,4 +47,4 @@ packages = ["vulcan"]
 package-dir = { vulcan = "." }
 
 [tool.setuptools.package-data]
-vulcan = ["agent_assets/*.json", "agent_assets/**/*.json", "agent_assets/**/*.md", "agent_assets/**/*.txt", "agent_assets/**/*.py", "agent_assets/**/*.sh"]
+vulcan = ["terminal_host/*.mjs", "terminal_host/*.json", "terminal_host/*.md", "terminal_host/vendor/*", "agent_assets/*.json", "agent_assets/**/*.json", "agent_assets/**/*.md", "agent_assets/**/*.txt", "agent_assets/**/*.py", "agent_assets/**/*.sh"]

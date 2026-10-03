@@ -59,6 +59,23 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Install and validate independent terminal host
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          npm ci --prefix ../vulcan/terminal_host
+          npm test --prefix ../vulcan/terminal_host
+          python -m unittest vulcan.tests.test_terminal_runtime
+          python ../vulcan/tests/terminal_host_docker_behavior.py
+          python ../vulcan/tests/terminal_legacy_docker_behavior.py
+        env:
+          PYTHONPATH: ..
+
+      - name: Validate terminal widget against Docker
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          npx playwright install --with-deps chromium
+          npm run test:terminal-resize
+
       - name: Build packaged desktop artifact
         run: npm run electron:build
 
@@ -212,6 +229,8 @@ jobs:
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
+          # Terminal replacement delivery is reviewable before publication.
+          draft: ${{ github.ref_name == 'v1.0.0rc38' }}
           generate_release_notes: true
           body_path: release-body.md
           fail_on_unmatched_files: true

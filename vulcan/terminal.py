@@ -1220,16 +1220,20 @@ def resize_slot(chat_id: str, kind: SlotKind, slot: int, cols: int, rows: int):
     ts = _slots.get(key)
     if not ts or ts.finished:
         return
-    try:
-        ts.cols = max(1, int(cols))
-        ts.rows = max(1, int(rows))
-        if ts.host_key:
-            terminal_host.call('resize', ts.host_key, cols=ts.cols, rows=ts.rows)
-        else:
-            fcntl.ioctl(ts.master_fd, termios.TIOCSWINSZ, struct.pack('HHHH', ts.rows, ts.cols, 0, 0))
-        _update_slot_meta(chat_id, kind, slot, cols=ts.cols, rows=ts.rows, last_activity=ts.last_activity)
-    except Exception:
-        pass
+    cols, rows = int(cols), int(rows)
+    # Hidden/malformed geometry cannot overwrite the last working dimensions.
+    if cols < 2 or rows < 1:
+        return
+    with ts.fd_lock:
+        try:
+            if ts.host_key:
+                terminal_host.call('resize', ts.host_key, cols=cols, rows=rows)
+            else:
+                fcntl.ioctl(ts.master_fd, termios.TIOCSWINSZ, struct.pack('HHHH', rows, cols, 0, 0))
+            ts.cols, ts.rows = cols, rows
+            _update_slot_meta(chat_id, kind, slot, cols=cols, rows=rows, last_activity=ts.last_activity)
+        except Exception:
+            logger.warning('Terminal resize failed; retaining prior dimensions for %s', ts.slot_id, exc_info=True)
 
 
 _LIFECYCLE_REOPEN_REASONS = {"inactivity", "container-stopped", "process-exit"}

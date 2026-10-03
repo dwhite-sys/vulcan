@@ -31,6 +31,10 @@ try:
             time.sleep(.02)
         raise AssertionError('Terminal did not reach expected state')
     wait(lambda: ts.shell_integration)
+    term.resize_slot('acceptance', 'user', 1, 0, 0)
+    assert (ts.cols, ts.rows) == (80, 24)
+    unchanged = terminal_host.call('state', ts.host_key)
+    assert (unchanged['cols'], unchanged['rows']) == (80, 24)
     results = []
     for cols, rows in [(30, 12), (160, 40), (55, 19), (80, 24)]:
         term.resize_slot('acceptance', 'user', 1, cols, rows)

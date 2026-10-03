@@ -1,0 +1,17 @@
+{
+  "name": "vulcan-terminal-host",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node test/session.test.mjs"
+  },
+  "dependencies": {
+    "node-pty": "1.1.0",
+    "@xterm/headless": "6.0.0",
+    "@xterm/addon-serialize": "0.14.0"
+  }
+}

@@ -294,6 +294,7 @@ async function checkPackagedRuntime({ app, net }) {
     hash: hashCurrent,
     runtime: platform.runtime,
     service: serverReady,
+    terminal: server?.terminalHost?.ok === true && server?.terminalHost?.protocol === 1,
     etna: etnaReady,
     docker: platform.docker,
     workspace: platform.workspace,

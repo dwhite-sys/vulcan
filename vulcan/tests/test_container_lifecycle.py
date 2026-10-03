@@ -159,6 +159,16 @@ class ContainerLifecycleTests(unittest.TestCase):
         stop.assert_not_called()
         self.assertEqual(result["protected"], ["terminal-container"])
 
+    def test_persisted_open_terminal_protects_container_before_backend_reattaches(self):
+        self.mock_running(["terminal-container"])
+        lifecycle.record_activity("terminal-container", "old", at=1_000)
+        slot = {"kind": "user", "slot": 1, "finished": True, "logical_open": True}
+        with mock.patch.object(lifecycle.terminal, "list_slots", return_value=[slot]), \
+             mock.patch.object(docker, "stop_container") as stop:
+            result = lifecycle.reap_idle_containers(now=5_000)
+        stop.assert_not_called()
+        self.assertEqual(result["protected"], ["terminal-container"])
+
     def test_container_owned_listener_protects_dashboard_services(self):
         self.mock_running(["dashboard-container"])
         lifecycle.record_activity("dashboard-container", "old", at=1_000)

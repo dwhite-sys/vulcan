@@ -8,7 +8,7 @@ const appRoot = path.resolve(here, '..');
 const serverRoot = path.resolve(appRoot, '..', 'vulcan');
 const output = path.resolve(appRoot, 'build', 'server-payload.sha256');
 
-const ignoredNames = new Set(['__pycache__', '.pytest_cache', '.mypy_cache']);
+const ignoredNames = new Set(['__pycache__', '.pytest_cache', '.mypy_cache', 'node_modules', 'test', 'build', 'dist']);
 function ignored(rel, name) {
   const parts = rel.split(path.sep);
   return ignoredNames.has(name)

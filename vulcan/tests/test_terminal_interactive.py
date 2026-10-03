@@ -36,11 +36,22 @@ class InteractiveTerminalTests(unittest.TestCase):
             terminal, "_install_slot_shell_integration", return_value=str(self.rcfile)
         ))
         self.patches.enter_context(mock.patch.object(terminal.docker, "container_running", return_value=True))
+        self.patches.enter_context(mock.patch.object(terminal.docker, "ensure_container_running", return_value=True))
+        self.patches.enter_context(mock.patch.object(terminal, "_read_slot_revival_state", return_value=(None, [])))
         self.patches.enter_context(mock.patch.object(terminal.docker, "prepare_workspace_identity", return_value=True))
         self.patches.enter_context(mock.patch.object(terminal.docker, "prepare_terminal_identity", return_value=True))
         self.patches.enter_context(mock.patch.object(terminal.docker, "terminal_exec_flags", return_value=[]))
         self.patches.enter_context(mock.patch.object(terminal, "_ensure_tmux_session"))
         self.patches.enter_context(mock.patch.object(terminal, "_kill_slot_tmux_session"))
+        # Retain legacy migration-path PTY coverage; the new host has Docker acceptance tests.
+        self.patches.enter_context(mock.patch.object(terminal, "_start_slot_proc", terminal._start_legacy_slot_proc))
+        self.patches.enter_context(mock.patch.object(terminal, "_clear_slot_revival_state"))
+        # Fixture output contains no terminal formatting; host conversion itself
+        # is exercised by the independent emulator and Docker acceptance tests.
+        def legacy_host_call(method, key='', **params):
+            if method == 'convertLegacy': return {'text': params['data']}
+            raise RuntimeError('Unknown terminal session')
+        self.patches.enter_context(mock.patch.object(terminal.terminal_host, 'call', side_effect=legacy_host_call))
         original_popen = subprocess.Popen
 
         def start_real_local_shell(_docker_arguments, **kwargs):
@@ -365,9 +376,9 @@ class InteractiveTerminalTests(unittest.TestCase):
 
     def test_use_terminal_revives_container_lifecycle_closed_slot_and_runs_command(self):
         terminal.close_slot(self.chat_id, "agent", self.slot, reason="container-stopped")
-        running = mock.Mock(side_effect=[False, True, True])
+        running = mock.Mock(return_value=True)
         with mock.patch.object(terminal.docker, "container_running", running), \
-             mock.patch.object(terminal.docker, "start_container", return_value=True) as start:
+             mock.patch.object(terminal.docker, "ensure_container_running", return_value=True) as start:
             pid = terminal.use_terminal_in_slot(self.chat_id, "agent", self.slot, "printf container-revived", 5)
             self.ts = terminal._slots[(self.chat_id, "agent", self.slot)]
             process = terminal.get_command(pid)
@@ -404,7 +415,7 @@ class InteractiveTerminalTests(unittest.TestCase):
         self.assertIn("explicit-output", "".join(process.output))
         terminal.close_slot(self.chat_id, "agent", self.slot, reason="explicit")
         scrollback = terminal.get_slot_scrollback(self.chat_id, "agent", self.slot)
-        self.assertIn("explicit-output", scrollback)
+        self.assertEqual(scrollback, "")
         self.assertNotIn("[Terminal closed]", scrollback)
 
     def test_user_can_reopen_same_numbered_inactivity_closed_slot(self):
@@ -502,6 +513,7 @@ class TmuxTerminalPersistenceTests(unittest.TestCase):
             self.completed(1),  # has-session: absent
             self.completed(0),  # new-session
             self.completed(0),  # status off
+            self.completed(0),  # allow-passthrough on
             self.completed(0),  # prefix None
         ])
 
@@ -519,7 +531,7 @@ class TmuxTerminalPersistenceTests(unittest.TestCase):
                 shell_command="umask 000; exec /bin/bash -i",
             )
 
-        self.assertEqual(len(calls), 4)
+        self.assertEqual(len(calls), 5)
         self.assertIn("has-session", calls[0][0])
         create = calls[1][0]
         self.assertIn("new-session", create)
@@ -527,7 +539,8 @@ class TmuxTerminalPersistenceTests(unittest.TestCase):
         self.assertIn("FOO=bar", create)
         self.assertIn("umask 000; exec /bin/bash -i", create)
         self.assertEqual(calls[2][0][-2:], ["status", "off"])
-        self.assertEqual(calls[3][0][-2:], ["prefix", "None"])
+        self.assertEqual(calls[3][0][-2:], ["allow-passthrough", "on"])
+        self.assertEqual(calls[4][0][-2:], ["prefix", "None"])
 
     def test_existing_tmux_shell_is_only_reattached_not_recreated(self):
         with mock.patch.object(terminal.docker, "terminal_exec_flags", return_value=[]), \
@@ -539,7 +552,7 @@ class TmuxTerminalPersistenceTests(unittest.TestCase):
                 revive_env=[],
                 shell_command="exec /bin/bash -i",
             )
-        self.assertEqual(run.call_count, 3)
+        self.assertEqual(run.call_count, 4)
         calls = [call.args[0] for call in run.call_args_list]
         self.assertIn("has-session", calls[0])
         self.assertFalse(any("new-session" in call for call in calls))

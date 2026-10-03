@@ -248,6 +248,7 @@ def meta():
         "protocolVersion": VULCAN_PROTOCOL_VERSION,
         "buildId": os.environ.get("VULCAN_BUILD_ID", "development"),
         "payloadHash": os.environ.get("VULCAN_PAYLOAD_HASH", ""),
+        "terminalHost": term.terminal_host.runtime_health(),
         "capabilities": VULCAN_CAPABILITIES,
     }
 

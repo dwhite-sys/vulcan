@@ -30,7 +30,7 @@ Observed locally on Linux:
 - Actual `TerminalSlotWidget` in Chromium against a Docker PTY: narrow/wide geometry, long input/editing over wrap boundaries, inner Docker `stty` agreement, rapid layout changes, delayed font loading, hidden zero-size retention, reopen/reconnect, no page errors.
 - Python tools against Docker: dimensions, rendered output, command status, manual busy detection, interruption, same-shell backend reconnect, environment/cwd, host kill with accurate interrupted status and no rerun, and container stop/restart revival.
 - Real legacy tmux migration: original shell PID/exported environment preserved, completion markers restored, explicit close retires the session.
-- 46 existing real PTY/container-lifecycle tests; four provisioning tests covering checksum rejection, archive containment, atomic installation and independent service ownership.
+- 47 real PTY/container-lifecycle tests, including persisted logical slots before backend reattachment; four provisioning tests covering checksum rejection, archive containment, atomic installation and independent service ownership.
 - Actual private Node download/checksum/dependency build and health in a temporary installation.
 - Isolated transient systemd user service: backend connection exit preserves the host/shell; clean service stop saves current history.
 - rc38 Linux AppImage build; existing packaging/authenticated transport/password/update regressions.

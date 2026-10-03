@@ -164,7 +164,8 @@ def inspect_container(chat_id: str, *, now: float | None = None) -> dict[str, An
         if open_client_count:
             reasons.append("open-chat")
 
-        slots = [slot for slot in terminal.list_slots(chat_id) if not slot.get("finished")]
+        slots = [slot for slot in terminal.list_slots(chat_id)
+                 if not slot.get("finished") or slot.get("logical_open")]
         if configuration["protect_open_terminals"] and slots:
             reasons.append("open-terminal")
 

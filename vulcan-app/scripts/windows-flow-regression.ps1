@@ -25,6 +25,7 @@ function wsl.exe {
     $arguments = @($args)
     ConvertTo-Json -InputObject $arguments -Compress | Add-Content $callLog
     $global:LASTEXITCODE = 0
+    if (($arguments -contains 'wslpath' -or $arguments -contains 'bash' -or $arguments -contains 'systemctl') -and $arguments -notcontains '--exec') { throw 'Linux commands must bypass WSL shell path interpretation' }
     if ($arguments[0] -eq '--status' -and $testCase -in @('reboot-required', 'elevation-cancelled')) {
         $global:LASTEXITCODE = 1
     } elseif ($arguments[0] -eq '--list') {

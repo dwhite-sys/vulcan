@@ -181,6 +181,9 @@ function Get-EtnaInitializationVerb([string]$HelpText) {
 }
 
 function Invoke-EtnaModule([string]$Verb) {
+    # Windows PowerShell treats native stderr as an error record. Preserve it
+    # in the repair log instead of catching it before the exit code is read.
+    $ErrorActionPreference = "Continue"
     foreach ($python in @("python", "py")) {
         $cmd = Get-Command $python -ErrorAction SilentlyContinue | Select-Object -First 1
         if (-not $cmd) { continue }
@@ -190,7 +193,7 @@ function Invoke-EtnaModule([string]$Verb) {
             if ($LASTEXITCODE -ne 0) { continue }
             $actualVerb = if ($Verb -eq "init") { Get-EtnaInitializationVerb $helpText } else { $Verb }
             # Native stdout must not become part of the function's return value.
-            & $cmd.Source @prefix $actualVerb | Out-Host
+            & $cmd.Source @prefix $actualVerb 2>&1 | Out-Host
             return [int]$LASTEXITCODE
         } catch { }
     }
@@ -203,7 +206,7 @@ function Invoke-EtnaModule([string]$Verb) {
         if ($LASTEXITCODE -ne 0) { return [int]$LASTEXITCODE }
         $actualVerb = Get-EtnaInitializationVerb $helpText
     }
-    & $etna $actualVerb | Out-Host
+    & $etna $actualVerb 2>&1 | Out-Host
     return [int]$LASTEXITCODE
 }
 
@@ -461,7 +464,7 @@ systemctl enable docker.service >/dev/null 2>&1 || true
 # script so bash receives its exact contents, including arrays and heredocs.
 $bootstrapBytes = [Text.Encoding]::UTF8.GetBytes($bootstrap.Replace("`r`n", "`n"))
 $bootstrapBase64 = [Convert]::ToBase64String($bootstrapBytes)
-$bootstrapOutput = Invoke-Wsl -Capture -Arguments @("-d", $DistroName, "-u", "root", "--", "bash", "-lc", "set -o pipefail; echo $bootstrapBase64 | base64 --decode | bash -e")
+$bootstrapOutput = Invoke-Wsl -Capture -Arguments @("-d", $DistroName, "-u", "root", "--exec", "bash", "-lc", "set -o pipefail; echo $bootstrapBase64 | base64 --decode | bash -e")
 if ($bootstrapOutput) { Write-Host $bootstrapOutput }
 
 # Apply boot configuration changes without killing terminals on routine repairs.
@@ -469,12 +472,12 @@ if ($bootstrapOutput -match 'VULCAN_WSL_RESTART_REQUIRED=1') {
     Invoke-Wsl -Arguments @("--terminate", $DistroName)
     Start-Sleep -Milliseconds 500
 }
-Invoke-Wsl -Arguments @("-d", $DistroName, "-u", "root", "--", "bash", "-lc", "test `$(cat /proc/1/comm) = systemd || { echo WSL_systemd_is_unavailable_update_WSL_and_restart_Vulcan; exit 1; }")
+Invoke-Wsl -Arguments @("-d", $DistroName, "-u", "root", "--exec", "bash", "-lc", "test `$(cat /proc/1/comm) = systemd || { echo WSL_systemd_is_unavailable_update_WSL_and_restart_Vulcan; exit 1; }")
 
 # Convert the packaged Windows resource directory to its mounted WSL path.  The
 # converger immediately installs into the Linux filesystem; it never runs Vulcan
 # from /mnt/c.
-$guestResources = (& wsl.exe -d $DistroName -u vulcan -- wslpath -a $ResourcesDir | Out-String).Trim()
+$guestResources = (& wsl.exe -d $DistroName -u vulcan --exec wslpath -a $ResourcesDir | Out-String).Trim()
 if ($LASTEXITCODE -ne 0) { Fail "Could not map packaged resources into WSL2 (exit $LASTEXITCODE)" }
 if (-not $guestResources) { Fail "Could not map packaged resources into WSL2" }
 $serverSource = "$guestResources/vulcan-server"
@@ -483,7 +486,7 @@ $hashFile = "$guestResources/server-payload.sha256"
 
 Write-Step "Repairing Vulcan Linux runtime inside WSL2"
 $guestArgs = @(
-    "-d", $DistroName, "-u", "vulcan", "--",
+    "-d", $DistroName, "-u", "vulcan", "--exec",
     "bash", $guestScript,
     "--guest", "windows-wsl",
     "--server-source", $serverSource,
@@ -495,7 +498,7 @@ $guestArgs = @(
 if ($LASTEXITCODE -ne 0) { Fail "Vulcan Linux runtime repair failed inside WSL2 (exit $LASTEXITCODE). See the repair log for details." }
 
 # Wake systemd-managed services and verify Windows localhost forwarding.
-Invoke-Wsl -Arguments @("-d", $DistroName, "-u", "root", "--", "systemctl", "start", "docker.service", "vulcan-terminal-host.service", "vulcan.service")
+Invoke-Wsl -Arguments @("-d", $DistroName, "-u", "root", "--exec", "systemctl", "start", "docker.service", "vulcan-terminal-host.service", "vulcan.service")
 $ready = $false
 for ($i = 0; $i -lt 60; $i++) {
     try {

@@ -1,0 +1,2 @@
+# Shell payloads built on Windows execute in Linux/WSL and require LF.
+*.sh text eol=lf

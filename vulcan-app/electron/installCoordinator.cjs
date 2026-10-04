@@ -221,10 +221,10 @@ async function probePlatformInstallation(app) {
   if (process.platform === 'win32') {
     const wslBase = ['-d', 'Vulcan', '-u', 'vulcan', '--', 'bash', '-lc'];
     const [integrationHealthy, runtimeHealthy, dockerHealthy, workspaceHealthy] = await Promise.all([
-      probeCommand('wsl.exe', ['-d', 'Vulcan', '-u', 'vulcan', '--', 'true']),
-      probeCommand('wsl.exe', [...wslBase, '$HOME/.vulcan/runtime/bin/vulcan --help >/dev/null 2>&1']),
-      probeCommand('wsl.exe', [...wslBase, 'docker info >/dev/null 2>&1']),
-      probeCommand('wsl.exe', [...wslBase, `$HOME/.vulcan/runtime/bin/python -c '${workspaceProbe}'`]),
+      probeCommand('wsl.exe', ['-d', 'Vulcan', '-u', 'vulcan', '--', 'true'], 15000),
+      probeCommand('wsl.exe', [...wslBase, '$HOME/.vulcan/runtime/bin/vulcan --help >/dev/null 2>&1'], 15000),
+      probeCommand('wsl.exe', [...wslBase, 'docker info >/dev/null 2>&1'], 15000),
+      probeCommand('wsl.exe', [...wslBase, `$HOME/.vulcan/runtime/bin/python -c '${workspaceProbe}'`], 15000),
     ]);
     return {
       runtime: runtimeHealthy,
@@ -488,7 +488,15 @@ async function ensurePackagedRuntime({ app, dialog, shell, onProgress }) {
   }
 
   if (execution.code !== 0 || result?.ok === false) {
-    const details = result?.message || execution.stderr.trim() || execution.stdout.trim() || `Installer exited with code ${execution.code}`;
+    let details = result?.message || execution.error?.message || execution.stderr.trim() || execution.stdout.trim() || `Installer exited with code ${execution.code}`;
+    if (process.platform === 'win32') {
+      try {
+        const logPath = path.join(app.getPath('userData'), 'repair.log');
+        fs.mkdirSync(path.dirname(logPath), { recursive: true });
+        fs.writeFileSync(logPath, `${new Date().toISOString()}\nExit: ${execution.code}\n${execution.stdout}\n${execution.stderr}`, 'utf8');
+        details += `\n\nRepair log: ${logPath}`;
+      } catch { /* Reporting the original failure must still work on a read-only disk. */ }
+    }
     return { ok: false, message: details };
   }
 

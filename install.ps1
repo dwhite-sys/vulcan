@@ -30,18 +30,30 @@ function Emit-Result([hashtable]$Value) {
     }
 }
 function Fail([string]$Message, [int]$Code = 1) {
-    Write-Error "Vulcan install failed: $Message"
     Emit-Result @{ ok = $false; message = $Message }
+    Write-Error "Vulcan install failed: $Message" -ErrorAction Continue
     exit $Code
 }
-function Invoke-Wsl([string[]]$Arguments, [switch]$AllowFailure) {
-    & wsl.exe @Arguments
-    $code = $LASTEXITCODE
-    if (-not $AllowFailure -and $code -ne 0) {
-        throw "wsl.exe $($Arguments -join ' ') failed with exit code $code"
+function Invoke-Wsl([string[]]$Arguments) {
+    # Preserve WSL's own error code/message instead of displaying unrelated pip warnings.
+    $savedPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $output = @(& wsl.exe @Arguments 2>&1)
+        $code = $LASTEXITCODE
+    } finally { $ErrorActionPreference = $savedPreference }
+    $detail = (($output | ForEach-Object { ([string]$_).Replace([string][char]0, "") }) -join "`n").Trim()
+    if ($code -ne 0) {
+        Fail "WSL operation failed (exit $code): wsl.exe $($Arguments -join ' ')`n$detail`nCheck WSL with wsl --status and wsl --list --verbose."
     }
-    return $code
+    if ($detail) { Write-Host $detail }
 }
+
+# Turn unexpected PowerShell exceptions into the same machine-readable result.
+trap {
+    Fail $_.Exception.Message
+}
+
 function Test-WslAvailable {
     try {
         & wsl.exe --status *> $null
@@ -293,22 +305,26 @@ if (-not (Test-WslAvailable)) {
         "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ('"' + $self + '"'), "-ElevatedWslBootstrap"
     )
     $proc = Start-Process -FilePath "powershell.exe" -ArgumentList ($args -join ' ') -Verb RunAs -Wait -PassThru
-    if ($proc.ExitCode -ne 0) { Fail "Windows could not enable WSL2" }
+    if ($proc.ExitCode -eq 3010) {
+        Emit-Result @{ ok = $true; rebootRequired = $true; message = "Restart Windows, then open Vulcan to finish WSL2 setup." }
+        exit 20
+    }
+    if ($proc.ExitCode -ne 0) { Fail "Windows could not enable WSL2 (exit $($proc.ExitCode))" }
     if (-not (Test-WslAvailable)) {
         Emit-Result @{ ok = $true; rebootRequired = $true; message = "Windows enabled WSL2 and requires a reboot before Vulcan can continue." }
         exit 20
     }
 }
 
-# Do not silently move a user onto a preview WSL build. Use the installed stable WSL.
-try { & wsl.exe --set-default-version 2 *> $null } catch { }
+# Report WSL status without changing the default for the user's other distros.
+Invoke-Wsl -Arguments @("--status")
 
 
 $distros = @()
-try { $distros = @(& wsl.exe --list --quiet | ForEach-Object { $_.Trim([char]0).Trim() } | Where-Object { $_ }) } catch { }
+try { $distros = @(& wsl.exe --list --quiet | ForEach-Object { ([string]$_).Replace([string][char]0, "").Trim() } | Where-Object { $_ }) } catch { }
 if ($distros -notcontains $DistroName) {
     Write-Step "Creating Vulcan-owned Ubuntu 24.04 WSL2 distro"
-    $arch = $env:PROCESSOR_ARCHITECTURE
+    $arch = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
     if ($arch -eq "ARM64") {
         $file = "ubuntu-noble-wsl-arm64-wsl.rootfs.tar.gz"
     } else {
@@ -319,20 +335,21 @@ if ($distros -notcontains $DistroName) {
     $sums = Join-Path $CacheRoot "SHA256SUMS"
     $ProgressPreference = 'SilentlyContinue'
     Invoke-WebRequest -UseBasicParsing -Uri "$base/SHA256SUMS" -OutFile $sums
-    if (-not (Test-Path $rootfs)) {
-        Invoke-WebRequest -UseBasicParsing -Uri "$base/$file" -OutFile $rootfs
-    }
     $expectedLine = Get-Content $sums | Where-Object { $_ -match [regex]::Escape($file) } | Select-Object -First 1
     if (-not $expectedLine) { Fail "Ubuntu did not publish a checksum for $file" }
     $expected = ($expectedLine -split '\s+')[0].ToLowerInvariant()
+    if ((-not (Test-Path $rootfs)) -or (Get-FileHash -Algorithm SHA256 $rootfs).Hash.ToLowerInvariant() -ne $expected) {
+        $partial = "$rootfs.download"
+        Invoke-WebRequest -UseBasicParsing -Uri "$base/$file" -OutFile $partial
+        Move-Item -Force $partial $rootfs
+    }
     $actual = (Get-FileHash -Algorithm SHA256 $rootfs).Hash.ToLowerInvariant()
     if ($actual -ne $expected) {
         Remove-Item -Force $rootfs
         Fail "Ubuntu WSL rootfs checksum mismatch"
     }
     New-Item -ItemType Directory -Force -Path $WslRoot | Out-Null
-    & wsl.exe --import $DistroName $WslRoot $rootfs --version 2
-    if ($LASTEXITCODE -ne 0) { Fail "Could not import the Vulcan WSL2 distro" }
+    Invoke-Wsl -Arguments @("--import", $DistroName, $WslRoot, $rootfs, "--version", "2")
 }
 
 Write-Step "Repairing WSL2 base state"
@@ -364,14 +381,16 @@ default=vulcan
 EOF
 systemctl enable docker.service >/dev/null 2>&1 || true
 '@
-& wsl.exe -d $DistroName -u root -- bash -lc $bootstrap
-if ($LASTEXITCODE -ne 0) { Fail "Could not configure the Vulcan WSL2 distro" }
+# Windows PowerShell 5.1 strips embedded quotes in native arguments. Encode the
+# script so bash receives its exact contents, including arrays and heredocs.
+$bootstrapBytes = [Text.Encoding]::UTF8.GetBytes($bootstrap.Replace("`r`n", "`n"))
+$bootstrapBase64 = [Convert]::ToBase64String($bootstrapBytes)
+Invoke-Wsl -Arguments @("-d", $DistroName, "-u", "root", "--", "bash", "-lc", "echo $bootstrapBase64 | base64 --decode | bash -e")
 
 # Make sure wsl.conf/systemd changes are active, then wake the dedicated distro.
 & wsl.exe --terminate $DistroName *> $null
 Start-Sleep -Milliseconds 500
-& wsl.exe -d $DistroName -u root -- true
-if ($LASTEXITCODE -ne 0) { Fail "Vulcan WSL2 distro would not start" }
+Invoke-Wsl -Arguments @("-d", $DistroName, "-u", "root", "--", "true")
 
 if (-not $ResourcesDir) {
     $candidate = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -401,7 +420,7 @@ $guestArgs = @(
     "--json"
 )
 & wsl.exe @guestArgs
-if ($LASTEXITCODE -ne 0) { Fail "Vulcan Linux runtime repair failed inside WSL2" }
+if ($LASTEXITCODE -ne 0) { Fail "Vulcan Linux runtime repair failed inside WSL2 (exit $LASTEXITCODE). See the repair log for details." }
 
 # Wake systemd-managed services and verify Windows localhost forwarding.
 & wsl.exe -d $DistroName -u root -- systemctl start docker.service vulcan.service *> $null

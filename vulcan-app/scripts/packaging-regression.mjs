@@ -223,7 +223,7 @@ assert.match(ps1, /Start-Process/);
 assert.match(ps1, /function Ensure-HostEtna/);
 assert.match(ps1, /visible host Chrome/);
 assert.match(ps1, /\$DistroName = "Vulcan"/);
-assert.match(ps1, /--import \$DistroName/);
+assert.match(ps1, /"--import", \$DistroName/);
 assert.match(ps1, /systemd=true/);
 assert.match(ps1, /docker\.io/);
 assert.match(ps1, /-d", \$DistroName/);

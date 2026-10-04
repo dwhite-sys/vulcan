@@ -51,6 +51,14 @@ jobs:
       - name: Packaging preflight
         run: node scripts/packaging-regression.mjs
 
+      - name: Windows repair regression
+        run: node scripts/windows-repair-regression.mjs
+
+      - name: Windows installer regression
+        if: matrix.os == 'windows-latest'
+        shell: powershell
+        run: ./scripts/windows-installer-regression.ps1
+
       - name: Validate headless source bootstrap
         if: matrix.os == 'ubuntu-latest'
         shell: bash

@@ -71,3 +71,39 @@ npm run electron:build
 Run the AppImage from Downloads. It should copy itself to `~/.local/share/vulcan/app/Vulcan.AppImage`, create a launcher and autostart entry, repair the backend, relaunch from the stable copy, and appear in the desktop application launcher. Closing the window hides it to the tray; tray **Exit** terminates only the desktop process, not the supervised backend service.
 
 `VULCAN_SKIP_REPAIR=1` skips packaged repair for development/debugging only.
+
+## Windows troubleshooting and smoke test
+
+Vulcan targets Windows 11 with WSL2 and hardware virtualization enabled. Repair
+operates on its named `Vulcan` distro without changing your default WSL version.
+If Windows asks for a restart while enabling WSL, restart and reopen Vulcan.
+
+A Python Scripts-directory PATH warning is not evidence that WSL import failed.
+The repair dialog reports WSL's native exit code and error text. Failed repairs also
+save full installer output in `repair.log` in the desktop app's user-data directory
+(the dialog gives its actual location). Include that file and these PowerShell
+results in bug reports:
+
+```powershell
+wsl --version
+wsl --status
+wsl --list --verbose
+```
+
+For WSL error `0x80370102`, check firmware virtualization and the Virtual Machine
+Platform Windows feature, then restart. For kernel/update errors, follow Microsoft's
+[WSL troubleshooting guide](https://learn.microsoft.com/windows/wsl/troubleshooting).
+Do not unregister an existing Vulcan distro to troubleshoot: it contains local data.
+
+Before releasing a Windows installer, test on a current Windows 11 machine:
+
+1. Install from a path and user profile containing spaces; allow WSL elevation if requested.
+2. After any requested restart, reopen Vulcan and confirm the backend and Docker become healthy.
+3. Create a chat and workspace, run a terminal command, and use native Etna browser tools.
+4. Exit and reopen after `wsl --terminate Vulcan`; confirm cold startup works.
+5. Run repair again; confirm existing chats/workspaces survive and other WSL distros are untouched.
+6. Check tray close/Exit, login startup, and the update installer handoff.
+
+CI tests PowerShell 5.1 parsing and simulated WSL failures on Windows. The repair
+coordinator tests error selection, log retention, reboot handling, and resource paths
+with spaces. These tests do not replace a real WSL2 installation smoke test.

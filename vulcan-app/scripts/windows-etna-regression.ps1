@@ -63,6 +63,9 @@ try {
         }
     }
     $script:testPython = $false
+    # The simulated failing native command must not become the test runner's
+    # exit status after all assertions pass.
+    $global:LASTEXITCODE = 0
     function Start-Sleep { param($Milliseconds) }
     $script:checks = 0
     function Test-EtnaHealth { $script:checks++; return $script:checks -ge 3 }

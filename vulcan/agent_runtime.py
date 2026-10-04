@@ -1850,8 +1850,13 @@ async def _wait_result(pid: str, timeout: float) -> dict[str, Any]:
         process = command or wait
         if process and (process.finished or process.detached):
             output = "".join(command.output).strip() if command else f"Waited {wait.seconds}s."
-            return {"output": output, "exit_code": getattr(process, "exit_code", 0), "detached": process.detached,
-                    "detach_reason": getattr(process, "detach_reason", "")}
+            result = {"output": output, "exit_code": getattr(process, "exit_code", 0), "detached": process.detached,
+                      "detach_reason": getattr(process, "detach_reason", "")}
+            if wait:
+                result.update(wake_reason=wait.wake_reason, webhook_method=wait.webhook_method,
+                              webhook_path=wait.webhook_path,
+                              elapsed_seconds=round(time.monotonic() - wait.started_monotonic, 3))
+            return result
         await asyncio.sleep(0.05)
     raise TimeoutError(f"Terminal result timed out after {timeout}s")
 
@@ -2496,7 +2501,9 @@ async def execute_tool(run: AgentRun, name: str, arguments: dict[str, Any], turn
             if resume_notice:
                 result["notice"] = resume_notice
             return {"result": result}
-        result = {"output": output, "exit_code": command.exit_code or 0}
+        result = {"output": output, "exit_code": command.exit_code}
+        if command.exit_code is None:
+            result.update(interrupted=True, note=command.detach_reason or "The backing shell exited without a command completion status.")
         if resume_notice:
             result["notice"] = resume_notice
         return {"result": result}
@@ -2580,7 +2587,7 @@ async def execute_tool(run: AgentRun, name: str, arguments: dict[str, Any], turn
         if webhook_url:
             return {"result": {
                 "ok": True,
-                "waited": seconds,
+                "waited": result["elapsed_seconds"],
                 "wake_reason": result.get("wake_reason") or "timeout",
                 **({"webhook_method": result.get("webhook_method"), "webhook_path": result.get("webhook_path")}
                    if result.get("wake_reason") == "webhook" else {}),

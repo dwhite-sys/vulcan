@@ -21,6 +21,7 @@ try:
     docker.container_name = lambda chat: container
     docker.workspace_path = lambda chat: '/workspace'
     docker.prepare_terminal_identity = lambda *args: True
+    docker.prepare_workspace_identity = lambda *args: True
     docker.terminal_exec_flags = lambda *args: []
     ts = term._start_slot_proc('acceptance', 'user', 1, cols=80, rows=24)
     term._slots[('acceptance', 'user', 1)] = ts
@@ -109,7 +110,41 @@ try:
     cp = wait(lambda: term.get_command(pid) if term.get_command(pid).finished else None)
     assert 'kept' in ''.join(cp.output) and '/tmp' in ''.join(cp.output)
     assert 'Unicode: café 世界' in term.read_slot_output('acceptance', 'user', 1, lines=5000)
-    print(json.dumps({'docker_geometry': results, 'manual_busy_interrupt': 'passed', 'backend_reconnect_same_shell': 'passed', 'persistent_environment_cwd': 'passed', 'rendered_tool_output': 'passed', 'host_loss_revive_without_rerun': 'passed', 'container_stop_restart_history_cwd_env': 'passed'}))
+    # Execute immediately after shell death: recovery must wait for integration,
+    # retain the real exit code, and permit subsequent ordinary tool commands.
+    subprocess.run(['docker', 'exec', container, 'bash', '-c', "printf '\\nsleep .3\\n' >> /root/.bashrc"], check=True)
+    pid = term.use_terminal_in_slot('acceptance', 'user', 1, 'printf "EXIT42_LATEST_HISTORY\\n"; exit 42')
+    cp = wait(lambda: term.get_command(pid) if term.get_command(pid).finished else None)
+    assert cp.exit_code == 42, cp.exit_code
+    for count in range(20):
+        pid = term.use_terminal_in_slot('acceptance', 'user', 1, f'printf "SEQUENTIAL_{count}\\n"; false' if count % 2 else f'printf "SEQUENTIAL_{count}\\n"')
+        cp = wait(lambda: term.get_command(pid) if term.get_command(pid).finished else None)
+        assert cp.exit_code == count % 2, (count, cp.exit_code)
+        assert f'SEQUENTIAL_{count}' in ''.join(cp.output)
+    assert 'EXIT42_LATEST_HISTORY' in term.read_slot_output('acceptance', 'user', 1, lines=5000)
+    # Foreground process close must not stop a different terminal's job.
+    second = term._start_slot_proc('acceptance', 'user', 2)
+    term._slots[('acceptance', 'user', 2)] = second
+    third = term._start_slot_proc('acceptance', 'user', 3)
+    term._slots[('acceptance', 'user', 3)] = third
+    first_pid = term.use_terminal_in_slot('acceptance', 'user', 2, 'printf "FOREGROUND_READY\\n"; sleep 300')
+    sibling_pid = term.use_terminal_in_slot('acceptance', 'user', 3, 'sleep 300')
+    wait(lambda: 'FOREGROUND_READY' in ''.join(term.get_command(first_pid).output))
+    shell_pid = subprocess.check_output(['docker', 'exec', container, 'bash', '-c', 'read -r pid token < /tmp/vulcan-host-user-2.pid; printf "%s" "$pid"'], text=True).strip()
+    def foreground_child():
+        pid = subprocess.check_output(['docker', 'exec', container, 'bash', '-c', f'IFS= read -r status < /proc/{shell_pid}/stat; read -r state parent group session tty foreground rest <<< "${{status##*) }}"; printf "%s" "$foreground"'], text=True).strip()
+        return pid if pid.isdigit() and int(pid) > 1 and pid != shell_pid else None
+    child_pid = wait(foreground_child)
+    def child_running():
+        probe = subprocess.run(['docker', 'exec', container, 'bash', '-c', f'IFS= read -r status < /proc/{child_pid}/stat || exit 1; read -r state rest <<< "${{status##*) }}"; [ "$state" != Z ]'], capture_output=True)
+        return probe.returncode == 0
+    assert child_running()
+    term.close_slot('acceptance', 'user', 2)
+    wait(lambda: not child_running())
+    assert not third.finished and not term.get_command(sibling_pid).finished
+    term.send_slot_input('acceptance', 'user', 3, '\x03')
+    wait(lambda: term.get_command(sibling_pid).finished)
+    print(json.dumps({'docker_geometry': results, 'manual_busy_interrupt': 'passed', 'backend_reconnect_same_shell': 'passed', 'persistent_environment_cwd': 'passed', 'rendered_tool_output': 'passed', 'host_loss_revive_without_rerun': 'passed', 'container_stop_restart_history_cwd_env': 'passed', 'exit_status_immediate_recovery_sequential_commands': 'passed', 'close_foreground_sibling_isolation': 'passed'}))
 finally:
     try:
         health = terminal_host.call('health')

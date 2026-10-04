@@ -70,7 +70,12 @@ export class Session {
       this.proc.onExit(event => this.enqueue(async () => {
         this.finished = true;
         this.exitCode = event.exitCode;
-        if (this.pending) { this.pending.state = 'interrupted'; this.pending.output = this.commandText(); this.pending = undefined; }
+        if (this.pending) {
+          this.pending.state = this.closed || event.signal ? 'interrupted' : 'completed';
+          if (!this.closed && !event.signal) this.pending.exitCode = event.exitCode;
+          this.pending.output = this.commandText(); this.pending = undefined;
+          this.startMarker?.dispose();
+        }
         this.busy = false;
       }));
     });
@@ -159,7 +164,7 @@ export class Session {
       return { events: this.events.filter(event => event.sequence > sequence), sequence: this.sequence, busy: this.busy, integration: this.integration, finished: this.finished };
     });
   }
-  async close() { await this.ready; return this.enqueue(() => { if (!this.finished) this.proc.kill(); this.finished = true; this.busy = false; if (this.pending) { this.pending.output = this.commandText(); this.pending.state = 'interrupted'; this.pending = undefined; } }); }
+  async close() { await this.ready; return this.enqueue(() => { this.closed = true; if (!this.finished) this.proc.kill(); this.finished = true; this.busy = false; if (this.pending) { this.pending.output = this.commandText(); this.pending.state = 'interrupted'; this.pending = undefined; } }); }
 }
 
 /** Legacy data is parsed in an isolated emulator with no input callbacks. */

@@ -46,9 +46,13 @@ async function dispatchSession(message) {
   }
   if (method === 'open') {
     if (!session || session.finished) {
-      let restored;
-      try { restored = JSON.parse(await fs.readFile(checkpointPath(key), 'utf8')); }
-      catch (error) { if (error.code !== 'ENOENT') throw error; }
+      // A shell that just exited still has newer in-memory state than its
+      // periodic checkpoint. Preserve final output/status during fast revival.
+      let restored = session ? await session.snapshot(true) : undefined;
+      if (!restored) {
+        try { restored = JSON.parse(await fs.readFile(checkpointPath(key), 'utf8')); }
+        catch (error) { if (error.code !== 'ENOENT') throw error; }
+      }
       if (!restored && params.legacy) {
         await fs.writeFile(checkpointPath(key) + '.legacy-backup', params.legacy, { mode: 0o600, flag: 'wx' }).catch(error => { if (error.code !== 'EEXIST') throw error; });
         restored = await convertLegacy(params.legacy, params.launch.cols, params.launch.rows);

@@ -127,3 +127,15 @@ test('full-screen Vim survives resizing and returns to the integrated shell', as
     await until(async () => (await session.state()).commands[1]?.state === 'completed');
   } finally { await session.close(); }
 });
+
+
+test('exiting the shell preserves its command exit status', async () => {
+  const session = create();
+  try {
+    await until(async () => (await session.state()).integration === 'ready');
+    await session.execute('exit-status', 'exit 42');
+    const state = await until(async () => { const value = await session.state(); return value.finished && value; });
+    assert.equal(state.commands[0].exitCode, 42);
+    assert.equal(state.commands[0].state, 'completed');
+  } finally { await session.close(); }
+});

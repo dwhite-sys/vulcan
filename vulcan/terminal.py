@@ -884,9 +884,29 @@ read -r shell_pid shell_token < "$1" || exit 0
 case "$shell_pid" in ''|*[!0-9]*) exit 1;; esac
 [ -r "/proc/$shell_pid/environ" ] || exit 0
 tr '\000' '\n' < "/proc/$shell_pid/environ" | grep -Fxq "VULCAN_HOST_TOKEN=$2" || exit 0
+# Stop only the verified shell's foreground process group, then the shell.
+# HUP to Bash alone can leave a foreground server alive while Bash waits.
+IFS= read -r status < "/proc/$shell_pid/stat" || exit 0
+read -r state parent group session tty foreground rest <<< "${status##*) }"
+foreground_owned() {
+  case "$foreground" in ''|*[!0-9]*|0|1) return 1;; esac
+  [ "$foreground" != "$group" ] || return 1
+  IFS= read -r status < "/proc/$foreground/stat" || return 1
+  read -r state parent fg_group fg_session rest <<< "${status##*) }"
+  [ "$fg_group" = "$foreground" ] && [ "$fg_session" = "$session" ]
+}
+if foreground_owned; then kill -TERM -- "-$foreground" 2>/dev/null || true; fi
 kill -HUP "$shell_pid" 2>/dev/null || true
+for attempt in {1..20}; do
+  [ -e "/proc/$shell_pid/stat" ] || break
+  sleep .05
+done
+if foreground_owned; then kill -KILL -- "-$foreground" 2>/dev/null || true; fi
+if [ -r "/proc/$shell_pid/environ" ] && tr '\000' '\n' < "/proc/$shell_pid/environ" | grep -Fxq "VULCAN_HOST_TOKEN=$2"; then
+  kill -KILL "$shell_pid" 2>/dev/null || true
+fi
 """
-    launch['retire'] = {'file': launch['file'], 'args': ['exec', '--user', '0:0', docker.container_name(chat_id),
+    launch['retire'] = {'file': launch['file'], 'args': ['exec', *docker.terminal_exec_flags(chat_id, kind, slot), docker.container_name(chat_id),
                          '/bin/bash', '-c', retire_script, 'vulcan-retire', f'/tmp/vulcan-host-{kind}-{slot}.pid']}
     host_key = f'{chat_id}:{kind}:{slot}'
     snapshot = terminal_host.call('open', host_key, launch=launch,
@@ -928,12 +948,12 @@ kill -HUP "$shell_pid" 2>/dev/null || true
                             ts.has_running = False
                 if state['finished']:
                     proc.finished = ts.finished = True
-                    ts.close_reason = 'process-exit'
+                    ts.close_reason = ts.close_reason or 'process-exit'
                     break
             except RuntimeError as error:
                 if 'Unknown terminal session' in str(error):
                     ts.finished = proc.finished = True
-                    ts.close_reason = 'process-exit'
+                    ts.close_reason = ts.close_reason or 'process-exit'
                     if ts.active_command:
                         ts.active_command.finished = True
                         ts.active_command.exit_code = None
@@ -1164,8 +1184,8 @@ def _close_slot_locked(chat_id: str, kind: SlotKind, slot: int, reason: str = 'e
                 _update_slot_meta(chat_id, kind, slot, open=False, parked=False, close_reason='explicit', scrollback='')
                 clear_slot_focus_if_matches(chat_id, kind, slot)
             return
+        previous_close_reason = ts.close_reason
         ts.close_reason = reason
-        ts.finished = True
         # The persistent shell lives in tmux inside the chat container.  Intentional
         # lifecycle closes retire that shell; an unplanned docker-exec attachment
         # death never reaches this path and therefore leaves the session intact.
@@ -1176,10 +1196,22 @@ def _close_slot_locked(chat_id: str, kind: SlotKind, slot: int, reason: str = 'e
                 terminal_host.call('close', ts.host_key, retain=reason != 'explicit')
                 ts.proc.finished = True
             else:
+                ts.finished = True
                 ts.proc.kill()
                 ts.proc.wait(timeout=2)
-        except Exception:
+        except Exception as error:
             logger.warning('Could not retire terminal %s', ts.slot_id, exc_info=True)
+            if ts.host_key:
+                ts.finished = ts.proc.finished
+                ts.close_reason = previous_close_reason
+                raise RuntimeError('Could not close the terminal process; the terminal remains open for retry.') from error
+        ts.finished = True
+        if ts.active_command and not ts.active_command.finished:
+            ts.active_command.finished = True
+            ts.active_command.exit_code = None
+            ts.active_command.detach_reason = f'Terminal closed ({reason}); command was interrupted.'
+            ts.active_command = None
+            ts.has_running = False
         _close_slot_fd(ts)
         # Lifecycle state is reported out-of-band through close_reason/slot status.
         # Do not append Vulcan-generated closure notices to PTY output: scrollback
@@ -1740,7 +1772,18 @@ def use_terminal_in_slot(chat_id: str, kind: SlotKind, slot: int,
     if ts.legacy_hook_pending:
         raise RuntimeError("Legacy terminal integration is waiting for an untouched shell prompt. Use direct input or explicitly replace this terminal.")
     if ts.host_key and not ts.shell_integration:
-        raise RuntimeError("Shell integration unavailable: command completion cannot be detected. Use direct terminal input or repair the shell integration.")
+        # A freshly revived shell is pending, not degraded. Wait for its real
+        # integration marker; never infer readiness from prompt text or output.
+        deadline = time.monotonic() + 10
+        while True:
+            state = terminal_host.call('state', ts.host_key)
+            ts.shell_integration = state['integration'] == 'ready'
+            ts.prompt_busy = state['busy'] or not ts.shell_integration
+            if ts.shell_integration:
+                break
+            if state['finished'] or state['integration'] != 'pending' or time.monotonic() >= deadline:
+                raise RuntimeError("Shell integration unavailable: command completion cannot be detected. Use direct terminal input or repair the shell integration.")
+            time.sleep(.02)
     if ts.is_busy or ts.active_command is not None:
         raise RuntimeError(
             f"Terminal {slot} already has a foreground process. Use send_input, "
@@ -1846,6 +1889,7 @@ class WaitProcess:
     webhook_method: str | None = None
     webhook_path: str | None = None
     started_at:   float = field(default_factory=time.time)
+    started_monotonic: float = field(default_factory=time.monotonic)
 
 
 _waits: dict[str, WaitProcess] = {}

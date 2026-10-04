@@ -79,8 +79,9 @@ jobs:
         run: |
           npm ci --prefix ../vulcan/terminal_host
           npm test --prefix ../vulcan/terminal_host
-          python -m unittest vulcan.tests.test_terminal_runtime vulcan.tests.test_windows_bootstrap
+          python -m unittest vulcan.tests.test_terminal_runtime vulcan.tests.test_windows_bootstrap vulcan.tests.test_terminal_edge_results
           python ../vulcan/tests/terminal_host_docker_behavior.py
+          python ../vulcan/tests/terminal_edge_docker_behavior.py
           python ../vulcan/tests/terminal_legacy_docker_behavior.py
         env:
           PYTHONPATH: ..

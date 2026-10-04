@@ -13,6 +13,7 @@ $env:WSL_UTF8 = "1"
 $OutputEncoding = New-Object Text.UTF8Encoding($false)
 try { [Console]::OutputEncoding = $OutputEncoding } catch { }
 $DistroName = "Vulcan"
+$EtnaPackage = "etna-mcp>=1.0.0b41"
 $LocalRoot = Join-Path $env:LOCALAPPDATA "Vulcan"
 $WslRoot = Join-Path $LocalRoot "wsl"
 $CacheRoot = Join-Path $LocalRoot "cache"
@@ -48,7 +49,7 @@ function Invoke-Wsl([string[]]$Arguments, [switch]$Capture) {
     } finally { $ErrorActionPreference = $savedPreference }
     $detail = (($output | ForEach-Object { ([string]$_).Replace([string][char]0, "") }) -join "`n").Trim()
     if ($code -ne 0) {
-        $commandText = $Arguments -join ' '
+        $commandText = ($Arguments -join ' ') -replace 'echo [A-Za-z0-9+/=]{80,}', 'echo [encoded bootstrap]'
         if ($commandText.Length -gt 240) { $commandText = $commandText.Substring(0, 240) + "..." }
         Fail "WSL operation failed (exit $code): wsl.exe $commandText`n$detail`nCheck WSL with wsl --status and wsl --list --verbose."
     }
@@ -172,24 +173,38 @@ function Get-HostEtnaCommand {
     return $null
 }
 
+function Get-EtnaInitializationVerb([string]$HelpText) {
+    $plain = [regex]::Replace($HelpText, '\x1b\[[0-?]*[ -/]*[@-~]', '')
+    if ($plain -match '\binit\b') { return "init" }
+    # Older Etna initializes its runtime with a bare install command.
+    return "install"
+}
+
 function Invoke-EtnaModule([string]$Verb) {
     foreach ($python in @("python", "py")) {
         $cmd = Get-Command $python -ErrorAction SilentlyContinue | Select-Object -First 1
         if (-not $cmd) { continue }
         try {
-            if ($python -eq "py") { & $cmd.Source -3 -m etna --help *> $null }
-            else { & $cmd.Source -m etna --help *> $null }
+            $prefix = if ($python -eq "py") { @("-3", "-m", "etna") } else { @("-m", "etna") }
+            $helpText = (& $cmd.Source @prefix --help | Out-String)
             if ($LASTEXITCODE -ne 0) { continue }
-            if ($python -eq "py") { & $cmd.Source -3 -m etna $Verb }
-            else { & $cmd.Source -m etna $Verb }
-            return $LASTEXITCODE
+            $actualVerb = if ($Verb -eq "init") { Get-EtnaInitializationVerb $helpText } else { $Verb }
+            # Native stdout must not become part of the function's return value.
+            & $cmd.Source @prefix $actualVerb | Out-Host
+            return [int]$LASTEXITCODE
         } catch { }
     }
 
     $etna = Get-HostEtnaCommand
     if (-not $etna) { return 127 }
-    & $etna $Verb
-    return $LASTEXITCODE
+    $actualVerb = $Verb
+    if ($Verb -eq "init") {
+        $helpText = (& $etna --help | Out-String)
+        if ($LASTEXITCODE -ne 0) { return [int]$LASTEXITCODE }
+        $actualVerb = Get-EtnaInitializationVerb $helpText
+    }
+    & $etna $actualVerb | Out-Host
+    return [int]$LASTEXITCODE
 }
 
 function Install-EtnaIfAbsent {
@@ -202,8 +217,8 @@ function Install-EtnaIfAbsent {
             else { & $cmd.Source -m pip --version *> $null }
             if ($LASTEXITCODE -ne 0) { continue }
             Write-Step "Installing Etna with pip"
-            if ($python -eq "py") { & $cmd.Source -3 -m pip install --user etna-mcp }
-            else { & $cmd.Source -m pip install --user etna-mcp }
+            if ($python -eq "py") { & $cmd.Source -3 -m pip install --user $EtnaPackage | Out-Host }
+            else { & $cmd.Source -m pip install --user $EtnaPackage | Out-Host }
             if ($LASTEXITCODE -eq 0) { return $true }
         } catch { }
         break
@@ -213,7 +228,7 @@ function Install-EtnaIfAbsent {
     if ($pipx) {
         Write-Step "Installing Etna with pipx"
         try {
-            & $pipx.Source install etna-mcp
+            & $pipx.Source install $EtnaPackage | Out-Host
             if ($LASTEXITCODE -eq 0) { return $true }
         } catch { }
     }
@@ -231,7 +246,7 @@ function Install-EtnaIfAbsent {
             Remove-Item Env:UV_TOOL_DIR -ErrorAction SilentlyContinue
             Remove-Item Env:UV_TOOL_BIN_DIR -ErrorAction SilentlyContinue
             $installer = Invoke-RestMethod -UseBasicParsing -Uri "https://astral.sh/uv/install.ps1"
-            Invoke-Expression $installer
+            Invoke-Expression $installer | Out-Host
         } catch {
             Write-Warning "Etna uv bootstrap failed: $($_.Exception.Message)"
             return $false
@@ -256,7 +271,7 @@ function Install-EtnaIfAbsent {
         Remove-Item Env:UV_PYTHON_INSTALL_DIR -ErrorAction SilentlyContinue
         Remove-Item Env:UV_TOOL_DIR -ErrorAction SilentlyContinue
         Remove-Item Env:UV_TOOL_BIN_DIR -ErrorAction SilentlyContinue
-        & $uv.Source tool install --python 3.12 etna-mcp
+        & $uv.Source tool install --python 3.12 $EtnaPackage | Out-Host
         if ($LASTEXITCODE -ne 0) { return $false }
         $toolBin = (& $uv.Source tool dir --bin | Out-String).Trim()
         if ($LASTEXITCODE -ne 0 -or -not $toolBin) { return $false }
@@ -393,11 +408,13 @@ Write-Step "Repairing WSL2 base state"
 $bootstrap = @'
 set -e
 export DEBIAN_FRONTEND=noninteractive
+# A Windows/Docker Desktop client on inherited PATH is not a native Engine.
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 need_pkgs=()
 command -v sudo >/dev/null 2>&1 || need_pkgs+=(sudo)
 command -v curl >/dev/null 2>&1 || need_pkgs+=(curl)
 [ -r /etc/ssl/certs/ca-certificates.crt ] || need_pkgs+=(ca-certificates)
-command -v docker >/dev/null 2>&1 || need_pkgs+=(docker.io)
+dpkg-query -W -f='${Status}' docker.io 2>/dev/null | grep -q 'install ok installed' || need_pkgs+=(docker.io)
 if ! command -v make >/dev/null 2>&1 || ! command -v g++ >/dev/null 2>&1; then
   need_pkgs+=(build-essential)
 fi
@@ -408,6 +425,7 @@ if [ "${#need_pkgs[@]}" -gt 0 ]; then
   apt-get update -qq
   apt-get install -y -qq "${need_pkgs[@]}" >/dev/null
 fi
+getent group docker >/dev/null || groupadd --system docker
 if ! id vulcan >/dev/null 2>&1; then useradd -m -s /bin/bash vulcan; fi
 usermod -aG docker vulcan
 cat >/etc/sudoers.d/vulcan <<'EOF'

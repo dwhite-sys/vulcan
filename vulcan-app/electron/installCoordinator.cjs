@@ -219,12 +219,12 @@ async function probePlatformInstallation(app) {
   }
 
   if (process.platform === 'win32') {
-    const wslBase = ['-d', 'Vulcan', '-u', 'vulcan', '--', 'bash', '-lc'];
+    const wslBase = ['-d', 'Vulcan', '-u', 'vulcan', '--exec'];
     const [integrationHealthy, runtimeHealthy, dockerHealthy, workspaceHealthy] = await Promise.all([
-      probeCommand('wsl.exe', ['-d', 'Vulcan', '-u', 'vulcan', '--', 'true'], 15000),
-      probeCommand('wsl.exe', [...wslBase, '$HOME/.vulcan/runtime/bin/vulcan --help >/dev/null 2>&1'], 15000),
-      probeCommand('wsl.exe', [...wslBase, 'docker info >/dev/null 2>&1'], 15000),
-      probeCommand('wsl.exe', [...wslBase, `$HOME/.vulcan/runtime/bin/python -c '${workspaceProbe}'`], 15000),
+      probeCommand('wsl.exe', [...wslBase, 'true'], 15000),
+      probeCommand('wsl.exe', [...wslBase, '/home/vulcan/.vulcan/runtime/bin/vulcan', '--help'], 15000),
+      probeCommand('wsl.exe', [...wslBase, 'docker', 'info'], 15000),
+      probeCommand('wsl.exe', [...wslBase, '/home/vulcan/.vulcan/runtime/bin/python', '-c', workspaceProbe], 15000),
     ]);
     return {
       runtime: runtimeHealthy,
@@ -273,12 +273,14 @@ async function checkPackagedRuntime({ app, net }) {
     ? readSha256(path.join(os.homedir(), '.vulcan', 'payload', 'server-payload.sha256'))
     : null;
 
-  // Run cheap, side-effect-free health probes in parallel. A matching hash is
-  // necessary but never sufficient: the installed system must actually work.
+  // WSL command probes wake a stopped distro. Wait for them before taking an
+  // HTTP snapshot so cold startup does not automatically trigger repair.
+  const platformProbe = probePlatformInstallation(app);
+  if (process.platform === 'win32') await platformProbe;
   const [server, etna, platform] = await Promise.all([
     probeJson(net, 'http://127.0.0.1:8468/meta'),
     probeJson(net, 'http://127.0.0.1:8467/health'),
-    probePlatformInstallation(app),
+    platformProbe,
   ]);
 
   const serverReady = server?.ok === true;

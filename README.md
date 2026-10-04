@@ -104,6 +104,11 @@ Before releasing a Windows installer, test on a current Windows 11 machine:
 5. Run repair again; confirm existing chats/workspaces survive and other WSL distros are untouched.
 6. Check tray close/Exit, login startup, and the update installer handoff.
 
-CI tests PowerShell 5.1 parsing and simulated WSL failures on Windows. The repair
+The desktop app holds a WSL session while running (including in the tray), because
+systemd services alone do not keep WSL alive. Routine repair preserves other
+`wsl.conf` settings and does not terminate the distro unless boot settings change.
+That preserves terminal sessions through ordinary repairs and updates.
+
+CI tests PowerShell 5.1 parsing and simulated install/repair flows on Windows. The repair
 coordinator tests error selection, log retention, reboot handling, and resource paths
 with spaces. These tests do not replace a real WSL2 installation smoke test.

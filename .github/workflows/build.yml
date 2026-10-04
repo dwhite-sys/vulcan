@@ -52,12 +52,19 @@ jobs:
         run: node scripts/packaging-regression.mjs
 
       - name: Windows repair regression
-        run: node scripts/windows-repair-regression.mjs
+        run: |
+          node scripts/windows-repair-regression.mjs
+          node scripts/windows-preflight-regression.mjs
+          node scripts/windows-update-regression.mjs
+          node scripts/wsl-session-regression.mjs
 
       - name: Windows installer regression
         if: matrix.os == 'windows-latest'
         shell: powershell
-        run: ./scripts/windows-installer-regression.ps1
+        run: |
+          ./scripts/windows-installer-regression.ps1
+          ./scripts/windows-flow-regression.ps1
+          ./scripts/windows-etna-regression.ps1
 
       - name: Validate headless source bootstrap
         if: matrix.os == 'ubuntu-latest'
@@ -72,7 +79,7 @@ jobs:
         run: |
           npm ci --prefix ../vulcan/terminal_host
           npm test --prefix ../vulcan/terminal_host
-          python -m unittest vulcan.tests.test_terminal_runtime
+          python -m unittest vulcan.tests.test_terminal_runtime vulcan.tests.test_windows_bootstrap
           python ../vulcan/tests/terminal_host_docker_behavior.py
           python ../vulcan/tests/terminal_legacy_docker_behavior.py
         env:

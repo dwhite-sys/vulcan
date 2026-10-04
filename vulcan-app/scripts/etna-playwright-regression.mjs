@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 
 const app = readFileSync(new URL('../src/app/App.tsx', import.meta.url), 'utf8');
 const adapter = readFileSync(new URL('../src/app/services/etnaOfficialKits.ts', import.meta.url), 'utf8');
-const docker = readFileSync(new URL('../../vulcan/vulcan/docker.py', import.meta.url), 'utf8');
+const docker = readFileSync(new URL('../../vulcan/docker.py', import.meta.url), 'utf8');
 
 assert.match(adapter, /kitName === PLAYWRIGHT_KIT_NAME && toolName === PLAYWRIGHT_SCREENSHOT_TOOL/,
   'Screenshot interception must be scoped to the official Playwright kit and browser_screenshot tool');

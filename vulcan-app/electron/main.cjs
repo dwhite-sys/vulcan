@@ -7,6 +7,9 @@ const { createSemanticToolCacheStore, registerSemanticToolCacheIpc } = require('
 const { checkPackagedRuntime, ensurePackagedRuntime } = require('./installCoordinator.cjs');
 const { createSetupWindow } = require('./setupWindow.cjs');
 const { createUpdater } = require('./updateManager.cjs');
+const { createWslSession } = require('./wslSession.cjs');
+const wslSession = process.platform === 'win32' ? createWslSession() : null;
+app.on('will-quit', () => wslSession?.stop());
 
 const isDev = process.env.NODE_ENV === 'development';
 
@@ -460,6 +463,7 @@ function createWindow() {
 // recent writes — including config and chats — are silently lost. This handler,
 // plus handling termination signals, makes persistence reliable.
 async function flushAndQuit() {
+  wslSession?.stop();
   try {
     const ses = require('electron').session.defaultSession;
     await ses.flushStorageData();
@@ -645,6 +649,8 @@ app.whenReady().then(async () => {
     await setupController.complete();
     setupController = null;
   }
+
+  if (app.isPackaged && process.env.VULCAN_SKIP_REPAIR !== '1') wslSession?.start();
 
   const passwordStore = createSecurePasswordStore({
     safeStorage,

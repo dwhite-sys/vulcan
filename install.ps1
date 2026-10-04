@@ -8,6 +8,10 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+# Match Microsoft's WSL diagnostics: avoid UTF-16/NUL and code-page corruption.
+$env:WSL_UTF8 = "1"
+$OutputEncoding = New-Object Text.UTF8Encoding($false)
+try { [Console]::OutputEncoding = $OutputEncoding } catch { }
 $DistroName = "Vulcan"
 $LocalRoot = Join-Path $env:LOCALAPPDATA "Vulcan"
 $WslRoot = Join-Path $LocalRoot "wsl"
@@ -26,7 +30,7 @@ function Write-Step([string]$Message) { Write-Host "Vulcan: $Message" }
 function Emit-Result([hashtable]$Value) {
     if ($Json) {
         $payload = $Value | ConvertTo-Json -Compress -Depth 6
-        Write-Output "VULCAN_RESULT=$payload"
+        Write-Host "VULCAN_RESULT=$payload"
     }
 }
 function Fail([string]$Message, [int]$Code = 1) {
@@ -34,7 +38,7 @@ function Fail([string]$Message, [int]$Code = 1) {
     Write-Error "Vulcan install failed: $Message" -ErrorAction Continue
     exit $Code
 }
-function Invoke-Wsl([string[]]$Arguments) {
+function Invoke-Wsl([string[]]$Arguments, [switch]$Capture) {
     # Preserve WSL's own error code/message instead of displaying unrelated pip warnings.
     $savedPreference = $ErrorActionPreference
     try {
@@ -44,8 +48,11 @@ function Invoke-Wsl([string[]]$Arguments) {
     } finally { $ErrorActionPreference = $savedPreference }
     $detail = (($output | ForEach-Object { ([string]$_).Replace([string][char]0, "") }) -join "`n").Trim()
     if ($code -ne 0) {
-        Fail "WSL operation failed (exit $code): wsl.exe $($Arguments -join ' ')`n$detail`nCheck WSL with wsl --status and wsl --list --verbose."
+        $commandText = $Arguments -join ' '
+        if ($commandText.Length -gt 240) { $commandText = $commandText.Substring(0, 240) + "..." }
+        Fail "WSL operation failed (exit $code): wsl.exe $commandText`n$detail`nCheck WSL with wsl --status and wsl --list --verbose."
     }
+    if ($Capture) { return $detail }
     if ($detail) { Write-Host $detail }
 }
 
@@ -145,11 +152,23 @@ function Test-EtnaHealth {
     catch { return $false }
 }
 
+function Wait-EtnaHealth {
+    for ($attempt = 0; $attempt -lt 60; $attempt++) {
+        if (Test-EtnaHealth) { return $true }
+        Start-Sleep -Milliseconds 250
+    }
+    return $false
+}
+
 function Get-HostEtnaCommand {
+    if ($script:HostEtnaCommand -and (Test-Path $script:HostEtnaCommand -PathType Leaf)) { return $script:HostEtnaCommand }
     $cmd = Get-Command etna -All -ErrorAction SilentlyContinue |
         Where-Object { $_.Source -and -not $_.Source.StartsWith($BinRoot, [StringComparison]::OrdinalIgnoreCase) } |
         Select-Object -First 1
     if ($cmd) { return $cmd.Source }
+    # uv's user tool directory may not be on the current process PATH yet.
+    $candidate = Join-Path $HOME ".local\bin\etna.exe"
+    if (Test-Path $candidate -PathType Leaf) { return $candidate }
     return $null
 }
 
@@ -221,8 +240,11 @@ function Install-EtnaIfAbsent {
             $env:UV_TOOL_DIR = $savedToolDir
             $env:UV_TOOL_BIN_DIR = $savedToolBinDir
         }
+        $uv = Get-Command uv -All -ErrorAction SilentlyContinue |
+            Where-Object { $_.Source -and -not $_.Source.StartsWith($BinRoot, [StringComparison]::OrdinalIgnoreCase) } |
+            Select-Object -First 1
         $candidate = Join-Path $HOME ".local\bin\uv.exe"
-        if (Test-Path $candidate) { $uv = Get-Item $candidate }
+        if (-not $uv -and (Test-Path $candidate)) { $uv = Get-Command $candidate -ErrorAction SilentlyContinue }
     }
 
     if (-not $uv) { return $false }
@@ -234,8 +256,12 @@ function Install-EtnaIfAbsent {
         Remove-Item Env:UV_PYTHON_INSTALL_DIR -ErrorAction SilentlyContinue
         Remove-Item Env:UV_TOOL_DIR -ErrorAction SilentlyContinue
         Remove-Item Env:UV_TOOL_BIN_DIR -ErrorAction SilentlyContinue
-        & $uv.Source tool install etna-mcp
-        return $LASTEXITCODE -eq 0
+        & $uv.Source tool install --python 3.12 etna-mcp
+        if ($LASTEXITCODE -ne 0) { return $false }
+        $toolBin = (& $uv.Source tool dir --bin | Out-String).Trim()
+        if ($LASTEXITCODE -ne 0 -or -not $toolBin) { return $false }
+        $script:HostEtnaCommand = Join-Path $toolBin "etna.exe"
+        return Test-Path $script:HostEtnaCommand -PathType Leaf
     } catch { return $false }
     finally {
         $env:UV_PYTHON_INSTALL_DIR = $savedPythonDir
@@ -267,7 +293,7 @@ function Ensure-HostEtna {
 
     if ($existing) {
         try { $null = Invoke-EtnaModule "start" } catch { }
-        if (Test-EtnaHealth) {
+        if (Wait-EtnaHealth) {
             Write-Step "Etna ready"
             return
         }
@@ -277,7 +303,7 @@ function Ensure-HostEtna {
     try { $initCode = Invoke-EtnaModule "init" }
     catch { Write-Warning "Etna init failed: $($_.Exception.Message)" }
 
-    if ($initCode -eq 0 -and (Test-EtnaHealth)) {
+    if ($initCode -eq 0 -and (Wait-EtnaHealth)) {
         Write-Step "Etna ready"
         return
     }
@@ -294,6 +320,14 @@ if ($ElevatedWslBootstrap) {
     & wsl.exe --install --no-distribution
     exit $LASTEXITCODE
 }
+
+if (-not $ResourcesDir) {
+    $candidate = Split-Path -Parent $MyInvocation.MyCommand.Path
+    if (Test-Path (Join-Path $candidate "vulcan-server")) { $ResourcesDir = $candidate }
+}
+if (-not $ResourcesDir) { Fail "Packaged Vulcan resources directory was not provided" }
+if (-not (Test-Path (Join-Path $ResourcesDir "vulcan-server"))) { Fail "Packaged Vulcan server payload is missing" }
+if (-not (Test-Path (Join-Path $ResourcesDir "install.sh"))) { Fail "Packaged Linux converger is missing" }
 
 Ensure-HostEtna
 
@@ -335,7 +369,8 @@ if ($distros -notcontains $DistroName) {
     $sums = Join-Path $CacheRoot "SHA256SUMS"
     $ProgressPreference = 'SilentlyContinue'
     Invoke-WebRequest -UseBasicParsing -Uri "$base/SHA256SUMS" -OutFile $sums
-    $expectedLine = Get-Content $sums | Where-Object { $_ -match [regex]::Escape($file) } | Select-Object -First 1
+    $checksumPattern = '^[0-9a-fA-F]{64}\s+\*?' + [regex]::Escape($file) + '$'
+    $expectedLine = Get-Content $sums | Where-Object { $_ -match $checksumPattern } | Select-Object -First 1
     if (-not $expectedLine) { Fail "Ubuntu did not publish a checksum for $file" }
     $expected = ($expectedLine -split '\s+')[0].ToLowerInvariant()
     if ((-not (Test-Path $rootfs)) -or (Get-FileHash -Algorithm SHA256 $rootfs).Hash.ToLowerInvariant() -ne $expected) {
@@ -363,6 +398,12 @@ command -v sudo >/dev/null 2>&1 || need_pkgs+=(sudo)
 command -v curl >/dev/null 2>&1 || need_pkgs+=(curl)
 [ -r /etc/ssl/certs/ca-certificates.crt ] || need_pkgs+=(ca-certificates)
 command -v docker >/dev/null 2>&1 || need_pkgs+=(docker.io)
+if ! command -v make >/dev/null 2>&1 || ! command -v g++ >/dev/null 2>&1; then
+  need_pkgs+=(build-essential)
+fi
+command -v python3 >/dev/null 2>&1 || need_pkgs+=(python3)
+[ -x /usr/lib/systemd/systemd ] || need_pkgs+=(systemd)
+dpkg-query -W -f='${Status}' systemd-sysv 2>/dev/null | grep -q 'install ok installed' || need_pkgs+=(systemd-sysv)
 if [ "${#need_pkgs[@]}" -gt 0 ]; then
   apt-get update -qq
   apt-get install -y -qq "${need_pkgs[@]}" >/dev/null
@@ -370,40 +411,53 @@ fi
 if ! id vulcan >/dev/null 2>&1; then useradd -m -s /bin/bash vulcan; fi
 usermod -aG docker vulcan
 cat >/etc/sudoers.d/vulcan <<'EOF'
-vulcan ALL=(ALL) NOPASSWD: /usr/bin/systemctl, /usr/bin/tee
+vulcan ALL=(root) NOPASSWD: /usr/bin/systemctl
+vulcan ALL=(root) NOPASSWD: /usr/bin/install -m 0644 /tmp/* /etc/systemd/system/vulcan.service
+vulcan ALL=(root) NOPASSWD: /usr/bin/install -m 0644 /tmp/* /etc/systemd/system/vulcan-terminal-host.service
 EOF
 chmod 0440 /etc/sudoers.d/vulcan
-cat >/etc/wsl.conf <<'EOF'
-[boot]
-systemd=true
-[user]
-default=vulcan
-EOF
+visudo -cf /etc/sudoers.d/vulcan >/dev/null
+# Preserve existing distro settings and restart only when boot/user settings change.
+python3 - <<'PYCONFIG'
+import configparser
+from pathlib import Path
+path = Path('/etc/wsl.conf')
+config = configparser.ConfigParser(interpolation=None)
+config.optionxform = str
+config.read(path)
+changed = False
+for section, key, value in [('boot', 'systemd', 'true'), ('user', 'default', 'vulcan')]:
+    if not config.has_section(section):
+        config.add_section(section)
+    if config.get(section, key, fallback=None) != value:
+        config.set(section, key, value)
+        changed = True
+if changed:
+    with path.open('w') as output:
+        config.write(output)
+    print('VULCAN_WSL_RESTART_REQUIRED=1')
+PYCONFIG
 systemctl enable docker.service >/dev/null 2>&1 || true
 '@
 # Windows PowerShell 5.1 strips embedded quotes in native arguments. Encode the
 # script so bash receives its exact contents, including arrays and heredocs.
 $bootstrapBytes = [Text.Encoding]::UTF8.GetBytes($bootstrap.Replace("`r`n", "`n"))
 $bootstrapBase64 = [Convert]::ToBase64String($bootstrapBytes)
-Invoke-Wsl -Arguments @("-d", $DistroName, "-u", "root", "--", "bash", "-lc", "echo $bootstrapBase64 | base64 --decode | bash -e")
+$bootstrapOutput = Invoke-Wsl -Capture -Arguments @("-d", $DistroName, "-u", "root", "--", "bash", "-lc", "set -o pipefail; echo $bootstrapBase64 | base64 --decode | bash -e")
+if ($bootstrapOutput) { Write-Host $bootstrapOutput }
 
-# Make sure wsl.conf/systemd changes are active, then wake the dedicated distro.
-& wsl.exe --terminate $DistroName *> $null
-Start-Sleep -Milliseconds 500
-Invoke-Wsl -Arguments @("-d", $DistroName, "-u", "root", "--", "true")
-
-if (-not $ResourcesDir) {
-    $candidate = Split-Path -Parent $MyInvocation.MyCommand.Path
-    if (Test-Path (Join-Path $candidate "vulcan-server")) { $ResourcesDir = $candidate }
+# Apply boot configuration changes without killing terminals on routine repairs.
+if ($bootstrapOutput -match 'VULCAN_WSL_RESTART_REQUIRED=1') {
+    Invoke-Wsl -Arguments @("--terminate", $DistroName)
+    Start-Sleep -Milliseconds 500
 }
-if (-not $ResourcesDir) { Fail "Packaged Vulcan resources directory was not provided" }
-if (-not (Test-Path (Join-Path $ResourcesDir "vulcan-server"))) { Fail "Packaged Vulcan server payload is missing" }
-if (-not (Test-Path (Join-Path $ResourcesDir "install.sh"))) { Fail "Packaged Linux converger is missing" }
+Invoke-Wsl -Arguments @("-d", $DistroName, "-u", "root", "--", "bash", "-lc", "test `$(cat /proc/1/comm) = systemd || { echo WSL_systemd_is_unavailable_update_WSL_and_restart_Vulcan; exit 1; }")
 
 # Convert the packaged Windows resource directory to its mounted WSL path.  The
 # converger immediately installs into the Linux filesystem; it never runs Vulcan
 # from /mnt/c.
-$guestResources = (& wsl.exe -d $DistroName -u vulcan -- wslpath -a $ResourcesDir).Trim()
+$guestResources = (& wsl.exe -d $DistroName -u vulcan -- wslpath -a $ResourcesDir | Out-String).Trim()
+if ($LASTEXITCODE -ne 0) { Fail "Could not map packaged resources into WSL2 (exit $LASTEXITCODE)" }
 if (-not $guestResources) { Fail "Could not map packaged resources into WSL2" }
 $serverSource = "$guestResources/vulcan-server"
 $guestScript = "$guestResources/install.sh"
@@ -423,16 +477,17 @@ $guestArgs = @(
 if ($LASTEXITCODE -ne 0) { Fail "Vulcan Linux runtime repair failed inside WSL2 (exit $LASTEXITCODE). See the repair log for details." }
 
 # Wake systemd-managed services and verify Windows localhost forwarding.
-& wsl.exe -d $DistroName -u root -- systemctl start docker.service vulcan.service *> $null
+Invoke-Wsl -Arguments @("-d", $DistroName, "-u", "root", "--", "systemctl", "start", "docker.service", "vulcan-terminal-host.service", "vulcan.service")
 $ready = $false
 for ($i = 0; $i -lt 60; $i++) {
     try {
         $r = Invoke-WebRequest -UseBasicParsing -TimeoutSec 1 -Uri "http://127.0.0.1:8468/meta"
-        if ($r.StatusCode -eq 200) { $ready = $true; break }
+        $meta = $r.Content | ConvertFrom-Json
+        if ($r.StatusCode -eq 200 -and $meta.ok -eq $true -and $meta.terminalHost.ok -eq $true -and $meta.terminalHost.protocol -eq 1) { $ready = $true; break }
     } catch { }
     Start-Sleep -Milliseconds 250
 }
-if (-not $ready) { Fail "Vulcan server did not become reachable through WSL2 localhost forwarding" }
+if (-not $ready) { Fail "Vulcan server and terminal host did not become healthy through WSL2 localhost forwarding. Check repair.log, Windows port 8468 conflicts, and WSL localhostForwarding settings." }
 
 Emit-Result @{ ok = $true; rebootRequired = $false }
 exit 0

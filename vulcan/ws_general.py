@@ -1039,8 +1039,6 @@ class GeneralWSSession:
                 "finished": wp.finished, "exit_code": 0,
                 "detached": wp.detached, "detach_reason": wp.detach_reason,
                 "wake_reason": wp.wake_reason,
-                "webhook_method": wp.webhook_method,
-                "webhook_path": wp.webhook_path,
             })
         else:
             await self.error(req_id, f"Unknown pid: {pid}")
@@ -1056,7 +1054,9 @@ class GeneralWSSession:
 
     async def _terminal_wait(self, req_id: str, p: dict):
         try:
-            pid = term.start_wait(p["chat_id"], float(p.get("seconds", 5)), p.get("webhook_url"))
+            if "webhook_url" in p:
+                raise ValueError("Webhook waits were removed. Use seconds and an optional terminal slot.")
+            pid = term.start_wait(p["chat_id"], float(p.get("seconds", 5)))
             await self.respond(req_id, "terminal/wait", {"pid": pid})
         except ValueError as error:
             await self.error(req_id, str(error))

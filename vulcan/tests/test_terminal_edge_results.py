@@ -1,5 +1,6 @@
 """Agent-visible lifecycle/result contracts, using real registered waits."""
 import asyncio
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -10,25 +11,37 @@ class EdgeResults(unittest.IsolatedAsyncioTestCase):
     def run_handle(self):
         return agent.AgentRun(chat=chat('terminal-edges'), options=options(settings={'cliWorkspaceEnabled': True, 'panelsEnabled': True}), manager=agent.RunManager(), run_id='edge-results')
 
-    async def test_webhook_reports_real_wake_reason_and_elapsed_time(self):
-        run = self.run_handle()
-        task = asyncio.create_task(agent.execute_tool(run, 'wait', {'seconds': 10, 'webhook_url': '/webhook/edge-results'}, 'turn', 'event'))
-        for _ in range(100):
-            if term._wait_webhooks.get('/webhook/edge-results'): break
-            await asyncio.sleep(.005)
-        self.assertEqual(term.trigger_webhook('/webhook/edge-results', 'POST'), 1)
-        result = (await asyncio.wait_for(task, .5))['result']
-        self.assertEqual(result['wake_reason'], 'webhook')
-        self.assertEqual(result['webhook_method'], 'POST')
-        self.assertEqual(result['webhook_path'], '/webhook/edge-results')
-        self.assertLess(result['waited'], .5)
-        self.assertFalse(term._wait_webhooks.get('/webhook/edge-results'))
+    async def test_removed_webhook_fails_without_starting_a_wait(self):
+        with patch.object(term, 'start_wait') as start:
+            result = await agent.execute_tool(self.run_handle(), 'wait', {'seconds': 10, 'webhook_url': '/webhook/old'}, 'turn', 'event')
+        self.assertIn('removed', result['error'])
+        start.assert_not_called()
 
-    async def test_timeout_reports_timeout_and_actual_elapsed(self):
-        result = (await agent.execute_tool(self.run_handle(), 'wait', {'seconds': .06, 'webhook_url': '/webhook/timeout-results'}, 'turn', 'event'))['result']
-        self.assertEqual(result['wake_reason'], 'timeout')
-        self.assertGreaterEqual(result['waited'], .06)
-        self.assertLess(result['waited'], .5)
+    async def test_timed_wait_really_waits(self):
+        started = time.monotonic()
+        result = (await agent.execute_tool(self.run_handle(), 'wait', {'seconds': .06}, 'turn', 'event'))['result']
+        self.assertEqual(result['waited'], .06)
+        self.assertGreaterEqual(time.monotonic() - started, .06)
+        self.assertLess(time.monotonic() - started, 2)
+
+    async def test_timed_wait_detach(self):
+        pid = term.start_wait('wait-detach', 10)
+        self.assertTrue(term.detach_wait(pid, 'cancelled'))
+        result = await agent._wait_result(pid, 1)
+        self.assertTrue(result['detached'])
+        self.assertEqual(result['detach_reason'], 'cancelled')
+
+    async def test_http_callback_route_removed_and_old_wait_rejected(self):
+        try:
+            from fastapi.testclient import TestClient
+        except ImportError:
+            self.skipTest('HTTP integration requires the backend server dependencies')
+        from vulcan import server
+        client = TestClient(server.app)
+        with patch.object(server.auth, 'server_requires_auth', return_value=False):
+            self.assertEqual(client.post('/webhook/old').status_code, 404)
+            response = client.post('/terminal/wait', json={'chat_id': 'old', 'seconds': .01, 'webhook_url': '/webhook/old'})
+            self.assertIn('removed', response.json()['error'])
 
     async def test_unknown_exit_status_is_not_reported_as_success(self):
         run = self.run_handle()

@@ -14,8 +14,7 @@ Command endpoints (one-shot piped):
   POST /terminal/kill         { pid }                  → { ok }
 
 Wait endpoints:
-  POST /terminal/wait         { chat_id, seconds, webhook_url? } → { pid }
-  ANY  /webhook/{name}        wake matching wait(webhook_url=...)
+  POST /terminal/wait         { chat_id, seconds } → { pid }
 
 Workspace endpoints:
   GET  /workspace/file        ?chat_id=&path=          → { content }
@@ -369,9 +368,7 @@ def terminal_result(pid: str):
         return {"pid": pid, "output": f"Waited {wp.seconds}s.",
                 "finished": wp.finished, "exit_code": 0,
                 "detached": wp.detached, "detach_reason": wp.detach_reason,
-                "wake_reason": wp.wake_reason,
-                "webhook_method": wp.webhook_method,
-                "webhook_path": wp.webhook_path}
+                "wake_reason": wp.wake_reason}
     return err(f"Unknown pid: {pid}", 404)
 
 @app.post("/terminal/detach")
@@ -396,20 +393,14 @@ async def terminal_wait(req: Request):
     body    = await req.json()
     chat_id = body.get("chat_id")
     seconds = float(body.get("seconds", 5))
-    webhook_url = body.get("webhook_url")
+    if "webhook_url" in body:
+        return err("Webhook waits were removed. Use seconds and an optional terminal slot.")
     if not chat_id: return err("Missing chat_id")
     try:
-        pid = term.start_wait(chat_id, seconds, webhook_url)
+        pid = term.start_wait(chat_id, seconds)
     except ValueError as error:
         return err(str(error))
     return {"pid": pid}
-
-
-@app.api_route("/webhook/{hook_path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
-async def wait_webhook(req: Request, hook_path: str):
-    path = f"/webhook/{hook_path}".rstrip("/")
-    triggered = term.trigger_webhook(path, req.method)
-    return {"ok": True, "triggered": triggered}
 
 
 # ── Terminal WebSocket ────────────────────────────────────────────────────────

@@ -1853,8 +1853,7 @@ async def _wait_result(pid: str, timeout: float) -> dict[str, Any]:
             result = {"output": output, "exit_code": getattr(process, "exit_code", 0), "detached": process.detached,
                       "detach_reason": getattr(process, "detach_reason", "")}
             if wait:
-                result.update(wake_reason=wait.wake_reason, webhook_method=wait.webhook_method,
-                              webhook_path=wait.webhook_path,
+                result.update(wake_reason=wait.wake_reason,
                               elapsed_seconds=round(time.monotonic() - wait.started_monotonic, 3))
             return result
         await asyncio.sleep(0.05)
@@ -1902,9 +1901,9 @@ async def _publish_terminal_completion(run: AgentRun, slot: int, pid: str) -> No
 
 
 async def _wait_for_terminal_slot(
-    run: AgentRun, slot: int, seconds: float, webhook_url: str | None = None
+    run: AgentRun, slot: int, seconds: float
 ) -> dict[str, Any]:
-    """Wake when Bash returns to PS1, a webhook arrives, or timeout wins."""
+    """Wake when Bash returns to PS1 or timeout wins."""
     await asyncio.to_thread(term.ensure_slot_resumed, run.chat["id"], "agent", slot)
     notice = await asyncio.to_thread(term.consume_slot_resume_notice, run.chat["id"], "agent", slot)
     state = await asyncio.to_thread(term.agent_slot_state, run.chat["id"], "agent", slot)
@@ -1914,36 +1913,10 @@ async def _wait_for_terminal_slot(
     started = time.monotonic()
     deadline = started + seconds
     slot_woke = not state["running"]
-    webhook_pid = term.start_wait(run.chat["id"], seconds, webhook_url) if webhook_url else None
-
-    if state["running"] and webhook_pid is None:
-        # PS0 clears TerminalSlot.idle_event and PS1 sets it. This is the shell's
-        # own foreground-work boundary, so slot-only waits can sleep on the
-        # transition instead of polling command bookkeeping every 50 ms.
+    if state["running"]:
         slot_woke = await asyncio.to_thread(
             term.wait_for_slot_idle, run.chat["id"], "agent", slot, seconds
         )
-    elif state["running"]:
-        # Webhook + slot is still a first-condition-wins race. The slot side is
-        # sourced from the PS1 idle event; webhook state is checked at the same
-        # short cadence as rc25 used for the combined race.
-        while time.monotonic() < deadline:
-            if await asyncio.to_thread(term.wait_for_slot_idle, run.chat["id"], "agent", slot, 0):
-                slot_woke = True
-                break
-            webhook_wait = term.get_wait(webhook_pid)
-            if webhook_wait and webhook_wait.finished and webhook_wait.wake_reason == "webhook":
-                return {"result": {
-                    "ok": True,
-                    "wake_reason": "webhook",
-                    "webhook_method": webhook_wait.webhook_method,
-                    "webhook_path": webhook_wait.webhook_path,
-                    "elapsed_seconds": round(time.monotonic() - started, 3),
-                }}
-            await asyncio.sleep(min(0.05, max(0, deadline - time.monotonic())))
-
-    if webhook_pid:
-        term.detach_wait(webhook_pid, "terminal wait condition finished")
 
     state = await asyncio.to_thread(term.agent_slot_state, run.chat["id"], "agent", slot)
     if state is None:
@@ -2563,9 +2536,8 @@ async def execute_tool(run: AgentRun, name: str, arguments: dict[str, Any], turn
             return {"error": "wait requires seconds as a positive number."}
         if seconds > MAX_WAIT_SECONDS:
             return {"error": f"Timeout cannot exceed {MAX_WAIT_SECONDS} seconds."}
-        webhook_url = arguments.get("webhook_url")
-        if webhook_url is not None and (not isinstance(webhook_url, str) or not webhook_url.strip()):
-            return {"error": "webhook_url must be a non-empty URL or /webhook/... path."}
+        if "webhook_url" in arguments:
+            return {"error": "Webhook waits were removed. Use seconds and an optional terminal slot."}
         if "slot" in arguments:
             raw_slot = arguments["slot"]
             if isinstance(raw_slot, bool) or not isinstance(raw_slot, int):
@@ -2574,24 +2546,16 @@ async def execute_tool(run: AgentRun, name: str, arguments: dict[str, Any], turn
             if raw_slot not in run.terminal_slots:
                 return {"error": f"Terminal {raw_slot} is not open."}
             try:
-                return await _wait_for_terminal_slot(run, raw_slot, seconds, webhook_url)
+                return await _wait_for_terminal_slot(run, raw_slot, seconds)
             except ValueError as error:
                 return {"error": str(error)}
         try:
-            pid = term.start_wait(run.chat["id"], seconds, webhook_url)
+            pid = term.start_wait(run.chat["id"], seconds)
         except ValueError as error:
             return {"error": str(error)}
         result = await _wait_result(pid, seconds + 5)
         if result.get("detached"):
             return {"result": {"detached": True, "note": "Detached by user."}}
-        if webhook_url:
-            return {"result": {
-                "ok": True,
-                "waited": result["elapsed_seconds"],
-                "wake_reason": result.get("wake_reason") or "timeout",
-                **({"webhook_method": result.get("webhook_method"), "webhook_path": result.get("webhook_path")}
-                   if result.get("wake_reason") == "webhook" else {}),
-            }}
         return {"result": {"ok": True, "waited": seconds}}
     if name == "present":
         await asyncio.to_thread(workspace.present_file, run.chat["id"], path)

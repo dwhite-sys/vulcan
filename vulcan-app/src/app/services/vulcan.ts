@@ -200,7 +200,7 @@ export async function runCommand(
   return data.pid;
 }
 
-export async function waitForResult(pid: string, timeoutMs = 185_000): Promise<{ output: string; exit_code: number; detached: boolean; detach_reason: string; wake_reason?: string | null; webhook_method?: string | null; webhook_path?: string | null }> {
+export async function waitForResult(pid: string, timeoutMs = 185_000): Promise<{ output: string; exit_code: number; detached: boolean; detach_reason: string; wake_reason?: string | null }> {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     try {
@@ -228,11 +228,10 @@ export async function killProcess(pid: string): Promise<boolean> {
   return data.ok;
 }
 
-export async function startWait(chatId: string, seconds: number, webhookUrl?: string): Promise<string> {
+export async function startWait(chatId: string, seconds: number): Promise<string> {
   const data = await wsRequest('terminal/wait', {
     chat_id: chatId,
     seconds,
-    ...(webhookUrl ? { webhook_url: webhookUrl } : {}),
   });
   return data.pid;
 }

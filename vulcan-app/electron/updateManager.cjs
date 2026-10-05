@@ -285,23 +285,60 @@ nohup "$dst" >/dev/null 2>&1 &
     spawnDetached('/bin/bash', [helper]);
   }
 
-  function scheduleWindowsApply(downloadPath) {
+  async function scheduleWindowsApply(downloadPath) {
     const helper = path.join(os.tmpdir(), `vulcan-update-${process.pid}-${Date.now()}.ps1`);
+    const ready = `${helper}.ready`;
+    const log = path.join(app.getPath('userData'), 'update.log');
     const exe = process.execPath;
     const q = (value) => `'${String(value).replace(/'/g, "''")}'`;
     fs.writeFileSync(helper, `
 $ErrorActionPreference = 'Stop'
+Start-Transcript -Path ${q(log)} -Append | Out-Null
+try {
 $pidToWait = ${process.pid}
 $installer = ${q(downloadPath)}
 $appExe = ${q(exe)}
+[IO.File]::WriteAllText(${q(ready)}, 'ready')
 while (Get-Process -Id $pidToWait -ErrorAction SilentlyContinue) { Start-Sleep -Milliseconds 150 }
-$process = Start-Process -FilePath $installer -ArgumentList '/S' -Wait -PassThru
-if ($process.ExitCode -ne 0) { exit $process.ExitCode }
+$process = Start-Process -FilePath $installer -ArgumentList '/S' -WindowStyle Hidden -PassThru
+$process.WaitForExit()
+if ($process.ExitCode -ne 0) { throw "Vulcan installer exited with code $($process.ExitCode)" }
 Remove-Item -Force $installer -ErrorAction SilentlyContinue
 Start-Process -FilePath $appExe
 Remove-Item -Force $MyInvocation.MyCommand.Path -ErrorAction SilentlyContinue
+} catch {
+  Write-Output ($_ | Out-String)
+  exit 1
+} finally {
+  Stop-Transcript | Out-Null
+}
 `, 'utf8');
-    spawnDetached('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', helper]);
+    // Node's Windows detached launch gives PowerShell no usable console; it
+    // can exit successfully without running -File. Start-Process creates an
+    // independent hidden console for the helper, which survives Electron.
+    const argumentsText = `-NoProfile -ExecutionPolicy Bypass -File "${helper}"`;
+    const command = `Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -ArgumentList ${q(argumentsText)}`;
+    const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', command], {
+      detached: false, stdio: 'ignore', windowsHide: true,
+    });
+    const launched = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        child.kill();
+        reject(new Error('Update launcher did not finish'));
+      }, 15_000);
+      child.once('error', (error) => { clearTimeout(timer); reject(error); });
+      child.once('exit', (code) => {
+        clearTimeout(timer);
+        code === 0 ? resolve() : reject(new Error(`Update launcher exited with code ${code}`));
+      });
+    });
+    await launched;
+    const deadline = Date.now() + 15_000;
+    while (!fs.existsSync(ready)) {
+      if (Date.now() >= deadline) throw new Error(`Update helper did not start. See ${log}`);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    fs.rmSync(ready, { force: true });
   }
 
   function macBundlePath() {
@@ -355,7 +392,7 @@ rm -f "$0"
         emitProgress({ phase: 'installing', percent: 100 });
 
         if (process.platform === 'linux') scheduleLinuxApply(target);
-        else if (process.platform === 'win32') scheduleWindowsApply(target);
+        else if (process.platform === 'win32') await scheduleWindowsApply(target);
         else if (process.platform === 'darwin') scheduleMacApply(target);
         else throw new Error(`Unsupported update platform: ${process.platform}`);
 

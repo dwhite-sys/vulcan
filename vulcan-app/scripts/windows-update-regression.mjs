@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import vm from 'node:vm';
+import { EventEmitter } from 'node:events';
 import { createRequire } from 'node:module';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -23,13 +24,17 @@ try {
       setTimeout(fn, delay) { if (delay === 350) { quitScheduled = true; return 0; } return setTimeout(fn, delay); },
       require(name) {
         if (name === 'electron') return {
-          app: { isPackaged: true, getVersion: () => '1.0.0-rc.38', quit() {} },
+          app: { isPackaged: true, getVersion: () => '1.0.0-rc.38', getPath: () => root, quit() {} },
           net: { fetch: async (url) => url.includes('api.github.com')
             ? { ok: true, json: async () => [{ tag_name: 'v1.0.0-rc.39', assets: [{ name: 'Vulcan-Setup.exe', browser_download_url: 'https://example.test/installer', digest: 'sha256:' + (valid ? digest : '0'.repeat(64)) }] }] }
             : new Response(content) },
         };
         if (name === 'os') return { tmpdir: () => root };
-        if (name === 'child_process') return { spawn(command, args, options) { launches.push({ command, args, options }); return { unref() {} }; } };
+        if (name === 'child_process') return { spawn(command, args, options) { launches.push({ command, args, options }); const child = new EventEmitter();
+          const helper = fs.readdirSync(root).find((file) => /^vulcan-update-.*\.ps1$/.test(file));
+          fs.writeFileSync(path.join(root, helper + '.ready'), 'ready');
+          queueMicrotask(() => child.emit('exit', 0));
+          return child; } };
         return require(name);
       },
     });
@@ -42,18 +47,19 @@ try {
       assert.equal((await updater.install()).ok, true);
       assert.equal(quitScheduled, true);
       assert.equal(launches[0].command, 'powershell.exe');
-      assert.equal(launches[0].options.detached, true);
-      const helper = launches[0].args.at(-1);
+      assert.equal(launches[0].options.detached, false);
+      const helper = path.join(root, fs.readdirSync(root).find((file) => /^vulcan-update-.*\.ps1$/.test(file)));
       const text = fs.readFileSync(helper, 'utf8');
       assert.match(text, /O''Neil Test/);
       assert.match(text, /while \(Get-Process/);
-      assert.match(text, /-ArgumentList '\/S' -Wait -PassThru/);
+      assert.match(text, /-ArgumentList '\/S' -WindowStyle Hidden -PassThru/);
+      assert.match(text, /\$process.WaitForExit\(\)/);
       assert.match(text, /if \(\$process.ExitCode -ne 0\)/);
       const powershell = process.env.VULCAN_TEST_POWERSHELL || (process.platform === 'win32' ? 'powershell.exe' : null);
       if (powershell) {
         const parser = path.join(root, 'parse-helper.ps1');
         fs.writeFileSync(parser, 'param($Source)\n$tokens=$null; $errors=$null\n$null=[Management.Automation.Language.Parser]::ParseFile($Source,[ref]$tokens,[ref]$errors)\nif ($errors.Count) { throw ($errors | Out-String) }\n');
-        await promisify(execFile)(powershell, ['-NoProfile', '-File', parser, helper]);
+        await promisify(execFile)(powershell, ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', parser, helper]);
       }
     }
   }

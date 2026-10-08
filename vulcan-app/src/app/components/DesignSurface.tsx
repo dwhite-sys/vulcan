@@ -1,5 +1,5 @@
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react';
-import { ExternalLink, MousePointer2, RotateCw, X } from 'lucide-react';
+import { ExternalLink, Maximize2, Minimize2, MousePointer2, RotateCw, X } from 'lucide-react';
 import * as vulcan from '../services/vulcan';
 import type { DesignAttachment, MessageElementReference } from '../types/vulcan';
 
@@ -75,6 +75,8 @@ export const DesignSurface = forwardRef<DesignSurfaceHandle, DesignSurfaceProps>
   { design, chatId, onClose, onElement },
   forwardedRef,
 ) {
+  const surfaceRef = useRef<HTMLDivElement | null>(null);
+  const [fullscreen, setFullscreen] = useState(false);
   const webviewRef = useRef<VulcanWebview | null>(null);
   const readyRef = useRef(false);
   const selectingRef = useRef(false);
@@ -87,6 +89,23 @@ export const DesignSurface = forwardRef<DesignSurfaceHandle, DesignSurfaceProps>
   const [loadError, setLoadError] = useState<string | null>(null);
   const desktopDesignAvailable = typeof (window as any).electronAPI?.designTransport?.configure === 'function';
   const display = useMemo(() => displayUrl(design.url), [design.url]);
+
+  useEffect(() => {
+    const onFullscreenChange = () => setFullscreen(document.fullscreenElement === surfaceRef.current);
+    document.addEventListener('fullscreenchange', onFullscreenChange);
+    return () => document.removeEventListener('fullscreenchange', onFullscreenChange);
+  }, []);
+
+  const toggleFullscreen = async () => {
+    const surface = surfaceRef.current;
+    if (!surface) return;
+    try {
+      if (document.fullscreenElement === surface) await document.exitFullscreen();
+      else await surface.requestFullscreen();
+    } catch (error) {
+      console.warn('Could not toggle Design fullscreen:', error);
+    }
+  };
 
   const sendToGuest = useCallback((channel: string, ...args: unknown[]): boolean => {
     const webview = webviewRef.current;
@@ -318,7 +337,7 @@ export const DesignSurface = forwardRef<DesignSurfaceHandle, DesignSurfaceProps>
   };
 
   return (
-    <div className="flex h-full min-h-0 flex-col bg-ash-950" data-vulcan-design={design.id}>
+    <div ref={surfaceRef} className="flex h-full min-h-0 flex-col bg-ash-950" data-vulcan-design={design.id}>
       <div className="flex h-[46px] shrink-0 items-center gap-2 border-b border-ash-800 bg-ash-900 px-2.5">
         <div className="min-w-0 shrink-0">
           <div className="max-w-[160px] truncate text-[11px] font-semibold text-ash-200">{design.name}</div>
@@ -367,6 +386,16 @@ export const DesignSurface = forwardRef<DesignSurfaceHandle, DesignSurfaceProps>
           title={`Open registered upstream ${display} externally`}
         >
           <ExternalLink className="h-3.5 w-3.5" />
+        </button>
+        <button
+          type="button"
+          onClick={() => { void toggleFullscreen(); }}
+          className="grid h-7 w-7 shrink-0 place-items-center rounded-md text-ash-500 transition-colors hover:bg-ash-800 hover:text-ash-200"
+          title={fullscreen ? 'Exit fullscreen' : 'Enter fullscreen'}
+          aria-label={fullscreen ? 'Exit fullscreen' : 'Enter fullscreen'}
+          aria-pressed={fullscreen}
+        >
+          {fullscreen ? <Minimize2 className="h-3.5 w-3.5" /> : <Maximize2 className="h-3.5 w-3.5" />}
         </button>
         <button
           type="button"

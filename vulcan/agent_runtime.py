@@ -1,7 +1,6 @@
 """Server-owned T2 agent runtime.
 
-The provider-visible prompt, tool descriptions, transcript projection, and
-active-turn reasoning deliberately reproduce the established React T2 runner.
+Reasoning and tool history are retained across provider turns and follow-ups.
 Runs belong to the server, never to a WebSocket connection.
 """
 
@@ -34,6 +33,11 @@ SKILL_ORDER = ["tool-discovery", "etna-usage", "kit-building", "terminal", "visu
 TERMINAL_INITIAL_YIELD_SECONDS = 0.35
 TERMINAL_OUTPUT_SETTLE_SECONDS = 0.06
 MAX_WAIT_SECONDS = 3600
+# Inactivity, not total generation time: an actively streaming model may run
+# indefinitely, but a silent provider must not leave a run permanently busy.
+PROVIDER_IDLE_TIMEOUT_SECONDS = 120.0
+PROVIDER_FIRST_DATA_TIMEOUT_SECONDS = 8.0
+PROVIDER_SILENT_ATTEMPTS = 2
 
 # Exact-call loop protection is intentionally local. The original guard counted an
 # identical call for the lifetime of a run, which punished legitimate revisits much
@@ -467,7 +471,7 @@ def _user_content(event: dict[str, Any], content: str | None = None) -> Any:
 
 
 def project_history(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Match the React projector: completed historical reasoning never returns."""
+    """Rebuild provider history without evicting reasoning or tool exchanges."""
     output: list[dict[str, Any]] = []
     index = 0
     while index < len(events):
@@ -492,9 +496,20 @@ def project_history(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
             group.append(events[index])
             index += 1
         text = "".join(item.get("content", "") for item in group if item.get("type") == "assistant_text")
-        tools = [item for item in group if item.get("type") == "tool"]
-        if text or tools:
-            assistant: dict[str, Any] = {"role": "assistant", "content": text or None}
+        thinking = "".join(item.get("content", "") for item in group if item.get("type") == "reasoning")
+        # A cancelled stream may leave only fragments of a tool call. Keep
+        # those events visible, but do not send invalid calls to the provider.
+        tools = [item for item in group if item.get("type") == "tool"
+                 and item.get("callId") and (item.get("rawToolCall") or item.get("status") != "interrupted")]
+        fragments = [item for item in group if item.get("type") == "tool" and item not in tools]
+        for item in fragments:
+            fragment = json.dumps({"tool": item.get("tool", ""), "arguments": item.get("rawArguments", "")}, ensure_ascii=False)
+            text += f"\n[Interrupted tool fragment, not a complete provider call: {fragment}]"
+        if text or thinking or tools:
+            # Match the active-run representation so rebuilding a saved chat
+            # carries the same reasoning, assistant text, and tool identities.
+            content = f"<think>{thinking}</think>{text}" if thinking else (text or None)
+            assistant: dict[str, Any] = {"role": "assistant", "content": content}
             if tools:
                 assistant["tool_calls"] = [item.get("rawToolCall") or {
                     "id": item.get("callId"), "type": "function",
@@ -503,8 +518,8 @@ def project_history(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
             output.append(assistant)
             for item in tools:
                 result = item.get("result")
-                if not result:
-                    continue
+                if result is None:
+                    result = {"error": "Tool execution was interrupted or its result is unavailable. Its effects may be partial or unknown. Inspect the current state before deciding whether to repeat it."}
                 payload = {"error": result["error"]} if result.get("error") else result.get("result", result)
                 output.append({"role": "tool", "tool_call_id": item.get("callId"), "name": item.get("tool"),
                                "content": json.dumps(payload, ensure_ascii=False, separators=(",", ":"))})
@@ -1107,10 +1122,16 @@ class RunManager:
         existing = self.runs.get(chat_id)
         if existing and existing.task and not existing.task.done():
             raise ValueError("An agent run is already active for this chat")
-        if not chat.get("events") or chat["events"][-1].get("type") != "user_message":
-            raise ValueError("A run must end in its triggering user message")
-        event = chat["events"][-1]
-        run_id = event.get("runId") or f"{chat_id}:{event['id']}"
+        if options.get("resume"):
+            if not chat.get("pausedRunId") or not chat.get("events"):
+                raise ValueError("This chat has no stopped run to resume")
+            run_id = f"{chat_id}:resume:{uuid.uuid4().hex}"
+        else:
+            if not chat.get("events") or chat["events"][-1].get("type") != "user_message":
+                raise ValueError("A run must end in its triggering user message")
+            event = chat["events"][-1]
+            run_id = event.get("runId") or f"{chat_id}:{event['id']}"
+        chat.pop("pausedRunId", None)
         if not chat.get("title"):
             chat["title"] = "New Chat"
         chat.setdefault("schemaVersion", 2)
@@ -1294,9 +1315,13 @@ class RunManager:
             for event in run.events:
                 if event.get("status") in ("streaming", "running"):
                     event["status"] = "interrupted" if run.status != "complete" else "complete"
+            if run.status == "interrupted":
+                run.chat["pausedRunId"] = run.run_id
+            else:
+                run.chat.pop("pausedRunId", None)
             await run.flush_checkpoint()
             await run.checkpoint(publish_full=True)
-            self.publish(run.chat["id"], "push/run-status", {"chat_id": run.chat["id"], "status": run.status, "run_id": run.run_id})
+            self.publish(run.chat["id"], "push/run-status", {"chat_id": run.chat["id"], "status": run.status, "run_id": run.run_id, "paused_run_id": run.chat.get("pausedRunId")})
             # Terminal runs must release ownership of the chat. In particular,
             # once cancel_and_wait returns, a replacement run can start immediately.
             if self.runs.get(run.chat["id"]) is run:
@@ -1463,6 +1488,48 @@ async def _provider_title(run: AgentRun, user_message: str) -> str:
 
 async def _provider_response(run: AgentRun, messages: list[dict[str, Any]], tools: list[dict[str, Any]], turn_id: str) -> dict[str, Any]:
     import httpx
+    for attempt in range(PROVIDER_SILENT_ATTEMPTS):
+        first_data = asyncio.Event()
+        response_task = asyncio.create_task(
+            _provider_response_stream(run, messages, tools, turn_id, first_data=first_data))
+        first_data_task = asyncio.create_task(first_data.wait())
+        try:
+            done, _ = await asyncio.wait(
+                (response_task, first_data_task), timeout=PROVIDER_FIRST_DATA_TIMEOUT_SECONDS,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not done:
+                # Close the previous request before retrying the same inference.
+                # No tool execution occurs inside this retry boundary.
+                response_task.cancel()
+                await asyncio.gather(response_task, return_exceptions=True)
+                logger.warning("Provider silent before first data: chat=%s run=%s turn=%s attempt=%s",
+                               run.chat["id"], run.run_id, turn_id, attempt + 1)
+                if attempt + 1 < PROVIDER_SILENT_ATTEMPTS:
+                    continue
+                raise RuntimeError(
+                    f"The model provider stayed silent for {PROVIDER_FIRST_DATA_TIMEOUT_SECONDS:g} seconds "
+                    f"on each of {PROVIDER_SILENT_ATTEMPTS} attempts. Completed tool results are saved. "
+                    "You can send a follow-up to continue from those results."
+                )
+            return await response_task
+        except (httpx.ReadTimeout, httpx.WriteTimeout, asyncio.TimeoutError) as exc:
+            logger.warning("Provider inactivity timeout: chat=%s run=%s turn=%s seconds=%s",
+                           run.chat["id"], run.run_id, turn_id, PROVIDER_IDLE_TIMEOUT_SECONDS)
+            raise RuntimeError(
+                f"The model provider did not respond for {PROVIDER_IDLE_TIMEOUT_SECONDS:g} seconds. "
+                "Completed tool results are saved. You can send a follow-up to continue from those results."
+            ) from exc
+        finally:
+            # Stop must cancel both waits and the active HTTP request, with no retry.
+            first_data_task.cancel()
+            if not response_task.done():
+                response_task.cancel()
+            await asyncio.gather(first_data_task, response_task, return_exceptions=True)
+
+
+async def _provider_response_stream(run: AgentRun, messages: list[dict[str, Any]], tools: list[dict[str, Any]], turn_id: str, *, first_data: asyncio.Event) -> dict[str, Any]:
+    import httpx
     provider = run.options.get("provider") or cfg.load().get("inference", {})
     base_url = provider.get("baseUrl") or provider.get("base_url") or ""
     model = provider.get("model") or ""
@@ -1524,10 +1591,13 @@ async def _provider_response(run: AgentRun, messages: list[dict[str, Any]], tool
         pending = ""
         provider_stream = etna_registry.relay_http_stream(
             str(client_id), endpoint, "POST", headers=headers, body=encoded_body, timeout=3600,
+            idle_timeout=PROVIDER_IDLE_TIMEOUT_SECONDS,
         )
         terminal = False
         try:
             async for chunk in provider_stream:
+                if chunk:
+                    first_data.set()
                 pending += chunk
                 while "\n" in pending:
                     line, pending = pending.split("\n", 1)
@@ -1555,15 +1625,25 @@ async def _provider_response(run: AgentRun, messages: list[dict[str, Any]], tool
             try:
                 async with client.stream(
                     "POST", endpoint, content=encoded_body.encode("utf-8"), headers=headers,
-                    timeout=httpx.Timeout(None, connect=10.0, pool=5.0),
+                    timeout=httpx.Timeout(PROVIDER_IDLE_TIMEOUT_SECONDS, connect=10.0, pool=5.0),
                 ) as response:
                     if response.status_code >= 400:
                         content = (await response.aread()).decode("utf-8", errors="replace")
                         raise ValueError(f"LLM error {response.status_code}: {content}")
-                    async for line in response.aiter_lines():
-                        if process_line(line):
-                            provider_terminal = True
+                    pending = ""
+                    async for chunk in response.aiter_text():
+                        if chunk:
+                            first_data.set()
+                        pending += chunk
+                        while "\n" in pending:
+                            line, pending = pending.split("\n", 1)
+                            if process_line(line.rstrip("\r")):
+                                provider_terminal = True
+                                break
+                        if provider_terminal:
                             break
+                    if not provider_terminal and pending:
+                        provider_terminal = process_line(pending.rstrip("\r"))
                 break
             except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout):
                 if attempt:
@@ -1672,13 +1752,28 @@ async def _resume_agent_terminals(run: AgentRun) -> list[dict[str, Any]]:
     return await task
 
 
+def apply_followups(run: AgentRun, messages: list[dict[str, Any]], *, include_queue: bool = False) -> bool:
+    pending = run.chat.get("pendingFollowups", [])
+    ready = [item for item in pending if include_queue or item["mode"] == "steer"]
+    if not ready:
+        return False
+    run.chat["pendingFollowups"] = [item for item in pending if item not in ready]
+    for item in ready:
+        event = item["event"]
+        run.events.append(event)
+        messages.extend(project_history([event]))
+        run._publish_stream_event(event)
+    run.schedule_checkpoint()
+    return True
+
+
 async def execute_run(run: AgentRun):
     settings = run.options.get("settings", {})
     enabled = run.options.get("enabledKits", [])
     kits = run.options.get("kitsWithTools", [])
     user_event = run.events[-1]
     user_content = run.options.get("userContent") or user_event.get("content", "")
-    if user_event.get("quotes") or user_event.get("references"):
+    if user_event.get("quotes") or user_event.get("references") or user_event.get("elements"):
         user_content = project_quoted_content(user_event.get("content", ""), user_event.get("quotes"), user_event.get("references"), user_event.get("contextOrder"), user_event.get("elements"))
         if user_event.get("attachmentNotices"):
             user_content = (user_content + "\n\n" + user_event["attachmentNotices"]).strip()
@@ -1687,12 +1782,32 @@ async def execute_run(run: AgentRun):
     # that grows with every message. The pre-run history is never mutated by
     # the run, so project it in a worker instead of stalling the loop that
     # serves every other client.
-    history = list(run.events[:-1])
+    history = list(run.events if run.options.get("resume") else run.events[:-1])
     projected = await asyncio.to_thread(project_history, history)
     messages = [{"role": "system", "content": build_prompt(run.chat, settings, kits, enabled, disabled_tools)},
-                *projected, {"role": "user", "content": _user_content(user_event, user_content)}]
+                *projected]
+    if run.options.get("resume"):
+        messages.append({"role": "system", "content":
+            "The user pressed Resume after stopping this task. Continue the original task from the saved progress. "
+            "Retain prior reasoning and completed tool evidence. Do not restart or repeat completed work. "
+            "An interrupted tool may have partial effects: inspect its state before repeating it. "
+            "Continue any partial answer without restating the text already shown."})
+    else:
+        messages.append({"role": "user", "content": _user_content(user_event, user_content)})
     tools = _toolset(run)
     promoted_tools: set[str] = set()
+    if run.options.get("resume"):
+        available = [tool for kit in kits if kit.get("kit_name") in enabled
+                     for tool in kit.get("tools", [])
+                     if f"{kit['kit_name']}::{tool['name']}" not in disabled_tools]
+        available.extend(design_surface_tools(run.options.get("modelVision", "unknown")))
+        for name in run.chat.get("resumeLoadedTools", []):
+            schema = next((tool for tool in available if tool.get("name") == name), None)
+            if schema and not any(tool.get("name") == name for tool in tools):
+                tools.append(schema)
+                promoted_tools.add(name)
+    else:
+        run.chat.pop("resumeLoadedTools", None)
     if settings.get("cliWorkspaceEnabled"):
         # Warm Docker/terminal metadata beside the first provider request rather
         # than putting cold container startup on time-to-first-byte. Terminal
@@ -1703,13 +1818,15 @@ async def execute_run(run: AgentRun):
     repeat_state: dict[str, tuple[int, int]] = {}
     turn = 0
     while True:  # Explicit cancellation and exact-repeat protection replace the old 50-turn ceiling.
+        apply_followups(run, messages)
         turn_id = f"{run.run_id}:turn:{turn}"
         turn += 1
         run.streamed_tool_ids = {}
         response = await _provider_response(run, messages, tools, turn_id)
         run.seal_semantic()
         calls = response.get("toolCalls", [])
-        if response.get("providerTerminal") and not calls:
+        pending_followups = bool(run.chat.get("pendingFollowups"))
+        if response.get("providerTerminal") and not calls and not pending_followups:
             # The OpenAI-compatible provider has explicitly ended the final model
             # completion.  Surface that fact immediately; persistence/title/final
             # checkpoint work must not keep the human composer locked.
@@ -1734,12 +1851,17 @@ async def execute_run(run: AgentRun):
             event.update({"callId": call["id"], "tool": call["function"]["name"], "arguments": arguments,
                           "rawArguments": call["function"].get("arguments", ""), "rawToolCall": call, "status": "running"})
             run._publish_stream_event(event)
-        if not calls:
-            break
-        run.schedule_checkpoint()
         thinking = response.get("thinking")
         content = f"<think>{thinking}</think>{response.get('content') or ''}" if thinking else (response.get("content") or None)
-        messages.append({"role": "assistant", "content": content, "tool_calls": calls})
+        assistant = {"role": "assistant", "content": content}
+        if calls:
+            assistant["tool_calls"] = calls
+        messages.append(assistant)
+        if not calls:
+            if apply_followups(run, messages, include_queue=True):
+                continue
+            break
+        run.schedule_checkpoint()
         questions = []
         stop = False
         for index, call in enumerate(calls):
@@ -1783,6 +1905,7 @@ async def execute_run(run: AgentRun):
                     if inspected is not None:
                         tools.append(inspected)
                         promoted_tools.add(inspected_name)
+                        run.chat["resumeLoadedTools"] = sorted(promoted_tools)
             image_data_url = None
             persisted_result = result
             image_payload = result.get("result") if isinstance(result, dict) else None

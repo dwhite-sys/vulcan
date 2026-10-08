@@ -3,6 +3,7 @@ import { RefreshCw } from 'lucide-react';
 
 type UpdateState = {
   available: boolean;
+  promptOnStartup?: boolean;
   currentVersion?: string;
   latestVersion?: string;
   tag?: string;
@@ -58,7 +59,7 @@ export function UpdatePrompt() {
     void api.getState?.().then((next: UpdateState) => {
       if (disposed || !next?.available) return;
       setState(next);
-      if (deferredTagRef.current !== next.tag) setOpen(true);
+      if (next.promptOnStartup && deferredTagRef.current !== next.tag) setOpen(true);
     }).catch(() => {});
 
     const disposeState = api.onState?.((next: UpdateState) => {
@@ -68,7 +69,7 @@ export function UpdatePrompt() {
         return;
       }
       setState(next);
-      if (deferredTagRef.current !== next.tag) setOpen(true);
+      if (next.promptOnStartup && deferredTagRef.current !== next.tag) setOpen(true);
     });
 
     const disposeOpen = api.onOpen?.((next: UpdateState) => {

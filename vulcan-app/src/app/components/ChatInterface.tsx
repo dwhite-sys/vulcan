@@ -32,11 +32,13 @@ interface ChatInterfaceProps {
   transcriptViewId?: string;
   events: ChatEvent[];
   kits: Kit[];
-  onSendMessage: (content: string, attachments?: File[], quotes?: MessageQuote[], references?: MessageFileReference[], contextOrder?: string[], elements?: MessageElementReference[]) => void;
+  onSendMessage: (content: string, attachments?: File[], quotes?: MessageQuote[], references?: MessageFileReference[], contextOrder?: string[], elements?: MessageElementReference[], mode?: 'steer' | 'queue') => void | Promise<void>;
   onToggleKit: (kitName: string, enabled: boolean) => void;
   skills: SkillMeta[];
   onToggleSkill: (stem: string, enabled: boolean) => void;
   onStop: () => void;
+  onResume?: () => void;
+  canResume?: boolean;
   onEditMessage: (messageId: string, payload: MessageEditPayload) => void;
   onRetry: (userMessageId: string) => void;
   isProcessing?: boolean;
@@ -132,6 +134,8 @@ export function ChatInterface({
   skills,
   onToggleSkill,
   onStop,
+  onResume,
+  canResume,
   onEditMessage,
   onRetry,
   isProcessing,
@@ -636,9 +640,9 @@ export function ChatInterface({
     }
   };
 
-  const handleSubmit = async (e: React.FormEvent, submittedFiles: File[]) => {
+  const handleSubmit = async (e: React.FormEvent, submittedFiles: File[], mode?: 'steer' | 'queue') => {
     e.preventDefault();
-    if ((!stripQuoteReferenceTokens(input).trim() && submittedFiles.length === 0) || isProcessing || submitInFlightRef.current) return;
+    if ((!stripQuoteReferenceTokens(input).trim() && submittedFiles.length === 0) || (isProcessing && !mode) || submitInFlightRef.current) return;
     submitInFlightRef.current = true;
     try {
       const readyFiles: File[] = [];
@@ -649,16 +653,18 @@ export function ChatInterface({
       const text = input.trim();
       if (stripQuoteReferenceTokens(text).trim() || readyFiles.length > 0) {
         scrollControllerRef.current?.resume('smooth');
-        onSendMessage(text, readyFiles.length > 0 ? readyFiles : undefined,
+        await onSendMessage(text, readyFiles.length > 0 ? readyFiles : undefined,
           quotes.length ? quotes.map(({ kind: _kind, ...quote }) => quote) : undefined,
           references.length ? references.map(({ kind: _kind, ...reference }) => reference) : undefined,
           contextOrder.length ? contextOrder : undefined,
-          elements.length ? elements.map(({ kind: _kind, ...element }) => element) : undefined);
+          elements.length ? elements.map(({ kind: _kind, ...element }) => element) : undefined, mode);
         setInput('');
         setContextItems([]);
       }
       filesRef.current = [];
       setFiles([]);
+    } catch (error: any) {
+      toast.error(error?.message ?? 'Could not send message. Your draft is kept.');
     } finally {
       submitInFlightRef.current = false;
     }
@@ -813,6 +819,8 @@ export function ChatInterface({
             setInput={setInput}
             onSubmit={handleSubmit}
             onStop={onStop}
+            onResume={onResume}
+            canResume={canResume}
             isProcessing={isProcessing}
             kits={kits}
             onToggleKit={onToggleKit}

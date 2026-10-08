@@ -1,7 +1,7 @@
 {
   "name": "vulcan",
   "private": true,
-  "version": "1.0.0-rc.46",
+  "version": "1.0.0-rc.47",
   "type": "module",
   "main": "electron/main.cjs",
   "author": {
@@ -15,7 +15,9 @@
     "electron:dev": "concurrently \"npm run dev\" \"wait-on http://localhost:5173 && cross-env NODE_ENV=development electron .\"",
     "electron:build": "npm run runtime:hash && npm run test:packaging && vite build && electron-builder --publish never",
     "electron:preview": "vite build && cross-env NODE_ENV=production electron .",
+    "test:composer-controls": "node scripts/composer-controls-regression.mjs",
     "test:transcript": "node --experimental-strip-types scripts/transcript-regression.ts",
+    "test:sidebar-widths": "node scripts/sidebar-widths-regression.mjs",
     "test:sidebar": "node --experimental-strip-types scripts/sidebar-ordering-regression.ts",
     "test:tool-icons": "node scripts/tool-icon-regression.mjs",
     "test:visualizations": "node scripts/visualization-regression.mjs",
@@ -67,6 +69,7 @@
     "runtime:hash": "node scripts/generate-runtime-hash.mjs",
     "test:packaging": "node scripts/packaging-regression.mjs",
     "test:version": "node scripts/version-regression.mjs",
+    "test:update-prompt": "node scripts/update-prompt-regression.mjs",
     "test:updates": "node scripts/update-regression.mjs",
     "test:run-stream": "node --experimental-strip-types scripts/run-stream-regression.ts",
     "test:client-relay": "node --experimental-strip-types scripts/client-relay-backpressure-regression.ts",

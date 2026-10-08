@@ -56,7 +56,7 @@ function refreshTrayMenu() {
   const template = [];
   if (update?.available) {
     template.push({
-      label: 'Update and Restart',
+      label: 'Update',
       click: () => updater?.openPrompt?.(),
     });
     template.push({ type: 'separator' });
@@ -676,7 +676,7 @@ app.whenReady().then(async () => {
   // Update discovery is passive: startup continues whether GitHub is reachable
   // or not. The renderer asks for current state on mount, so it cannot miss an
   // early result, and hidden autostart launches do not force the window open.
-  setTimeout(() => { void updater?.check?.(); }, 1200);
+  setTimeout(() => { void updater?.check?.({ startup: true }); }, 1200);
   updater.startPeriodicChecks();
 
   // Electron is only one of Vulcan's three lifecycle surfaces. Do not put

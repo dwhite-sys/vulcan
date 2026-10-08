@@ -241,6 +241,7 @@ async def relay_http_stream(
     headers: dict[str, str] | None = None,
     body: Any = None,
     timeout: float = 30.0,
+    idle_timeout: float | None = None,
 ):
     """Yield text chunks from an HTTP response executed by one authenticated client."""
     session = CLIENT_SESSIONS.get(client_id)
@@ -251,6 +252,7 @@ async def relay_http_stream(
     HTTP_STREAMS[relay_id] = stream
     RELAY_CLIENTS[relay_id] = client_id
     completed = False
+    response_timeout = idle_timeout if idle_timeout is not None else timeout + 2
     try:
         await session.send({"type": "push/client-http-request", "payload": {
             "relay_id": relay_id, "url": url, "method": method,
@@ -260,7 +262,7 @@ async def relay_http_stream(
             "flow": {"window_bytes": stream.window},
         }})
         while True:
-            event = await stream.get(timeout + 2)
+            event = await stream.get(response_timeout)
             kind = event.get("event")
             if kind == "headers":
                 status = int(event.get("status", 0))
@@ -268,7 +270,7 @@ async def relay_http_stream(
                     # The client follows with body chunks and done; collect a compact error.
                     chunks = []
                     while True:
-                        item = await stream.get(timeout + 2)
+                        item = await stream.get(response_timeout)
                         if item.get("event") == "chunk":
                             chunks.append(str(item.get("data") or ""))
                         elif item.get("event") == "done":

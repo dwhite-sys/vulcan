@@ -275,6 +275,7 @@ export interface Chat {
   folderId?: string | null;      // parent chat-folder id; null/undefined = root
   tags?: string[];               // server-derived, searchable message-cluster topics
   branching?: BranchingState;     // alternate conversation histories within this chat
+  pausedRunId?: string; // durable continuation point after Stop
   designs?: DesignAttachment[]; // registered live web surfaces attached to this conversation
   /** Internal sidebar projection marker. Full transcript state is loaded on selection. */
   _summaryOnly?: boolean;

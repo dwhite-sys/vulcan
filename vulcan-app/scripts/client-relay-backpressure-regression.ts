@@ -106,4 +106,22 @@ function fakeFetch(stream: ReadableStream<Uint8Array>) {
   assert.ok(events.includes('done'));
 }
 
+// 4. The fetch timeout must also wake a reader blocked on missing credits.
+{
+  const events: any[] = [];
+  const relay = new ClientHttpRelay({
+    push: async (type, payload) => { if (type === 'client/http-event') events.push(payload); },
+  }, fakeFetch(providerStream(1000, { bytes: 0 })) as any);
+  const done = relay.handleRequest({
+    relay_id: 'timeout', url: 'http://provider', method: 'POST', stream: true,
+    timeout_ms: 1000, flow: { window_bytes: 16 * 1024 },
+  });
+  const result = await Promise.race([done.then(() => true), sleep(1600).then(() => false)]);
+  if (!result) relay.handleCancel({ relay_id: 'timeout' });
+  await done;
+  assert.equal(result, true, 'timeout must release a relay even when no credits arrive');
+  assert.equal(relay.activeCount, 0);
+  assert.equal(events.at(-1).event, 'error');
+}
+
 console.log('Client relay backpressure regression: ok');

@@ -103,6 +103,12 @@ export class ClientHttpRelay {
       closed: false,
     };
     this.active.set(relayId, state);
+    // Fetch abort alone cannot release a reader waiting for relay credits.
+    // Wake that wait for every abort source, including the request timeout.
+    state.controller.signal.addEventListener('abort', () => {
+      state.closed = true;
+      this.wake(state);
+    }, { once: true });
     const timeoutMs = Math.max(1000, Number(payload?.timeout_ms || 30000));
     const timer = setTimeout(() => state.controller.abort(), timeoutMs);
     const emit = (event: Record<string, any>) =>

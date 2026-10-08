@@ -108,7 +108,7 @@ def _save_blobs(blobs: dict):
 # Responses to these requests are tiny and latency-critical: CONTROL lane.
 _CONTROL_REQUESTS = frozenset({
     "auth/login", "client/proof-of-life", "client/register", "client/state",
-    "runs/start", "runs/cancel", "runs/answer", "runs/status", "ping",
+    "runs/start", "runs/cancel", "runs/followup", "runs/answer", "runs/status", "ping",
     "etna/http-response", "client/http-event", "design/action-response",
     "server/metrics", "workspace/path", "terminal/slots",
 })
@@ -403,7 +403,7 @@ class GeneralWSSession:
         await self.respond(req_id, "client/register", {
             "ok": True, "client_id": client_id,
             "capabilities": ["run-delta-v1", "relay-credit-v1", "subscribe-include-chat-v1", "branch-refs-v1",
-                             "topics-push-v1", "runs-start-ref-v1"],
+                             "topics-push-v1", "runs-start-ref-v1", "runs-followup-v1", "runs-resume-v1"],
         })
 
 
@@ -492,6 +492,7 @@ class GeneralWSSession:
             # Server-owned background agent runs.
             "runs/start":                  self._runs_start,
             "runs/cancel":                 self._runs_cancel,
+            "runs/followup":               self._runs_followup,
             "runs/subscribe":              self._runs_subscribe,
             "runs/answer":                 self._runs_answer,
             "runs/status":                 self._runs_status,
@@ -714,6 +715,13 @@ class GeneralWSSession:
         options = p.get("options") or {}
         if not isinstance(options, dict):
             raise ValueError("Invalid run options")
+        if options.get("resume"):
+            # Resume the durable server checkpoint, never a client snapshot
+            # that may still be waiting for its final animation-frame flush.
+            saved = await chat_store.run_db_read(chat_store.load_chat, str(chat["id"]))
+            if not saved or not saved.get("pausedRunId") or saved.get("pausedRunId") != chat.get("pausedRunId"):
+                raise ValueError("This stopped run is no longer available to resume")
+            chat, persisted_base = saved, len(saved["events"])
         supplied = options.get("provider")
         if not isinstance(supplied, dict) or not (supplied.get("baseUrl") or supplied.get("base_url")):
             raise ValueError("Missing transient provider configuration")
@@ -752,6 +760,19 @@ class GeneralWSSession:
             "chat_id": chat["id"], "run_id": run.run_id, "status": run.status,
         })
 
+    async def _runs_followup(self, req_id: str, p: dict):
+        run = agent_runtime.MANAGER.runs.get(str(p.get("chat_id", "")))
+        if not run or run.cancel_requested or run.generation_complete or not run.task or run.task.done():
+            raise ValueError("The agent is no longer running. Send this message as a new turn.")
+        event, mode = p.get("event"), p.get("mode")
+        if mode not in ("steer", "queue") or not isinstance(event, dict) or event.get("type") != "user_message" or not event.get("id"):
+            raise ValueError("Invalid follow-up message")
+        pending = run.chat.setdefault("pendingFollowups", [])
+        if not any(item["event"]["id"] == event["id"] for item in pending) and not any(item["id"] == event["id"] for item in run.events):
+            pending.append({"event": event, "mode": mode})
+            await run.checkpoint()
+        await self.respond(req_id, "runs/followup", {"ok": True, "mode": mode})
+
     def begin_cancel(self, chat_id: str) -> None:
         """Take Stop effect immediately (called from the receive loop)."""
         run = agent_runtime.MANAGER.runs.get(chat_id)
@@ -775,8 +796,10 @@ class GeneralWSSession:
                 pass
             stopped = True
         else:
+            run = agent_runtime.MANAGER.runs.get(chat_id)
             stopped = await agent_runtime.MANAGER.cancel_and_wait(chat_id)
-        await self.respond(req_id, "runs/cancel", {"ok": stopped})
+        await self.respond(req_id, "runs/cancel", {"ok": stopped,
+            "paused_run_id": run.chat.get("pausedRunId") if run else None})
 
     async def _runs_subscribe(self, req_id: str, p: dict):
         """One chat-open transaction: subscription + transcript + run state.
@@ -1523,7 +1546,7 @@ _INLINE_MESSAGE_TYPES = frozenset({
 # Admission classes. Each owns its active slots *and* a bounded waiting room,
 # so generic/bulk floods cannot consume capacity reserved for control work.
 _CONTROL_MESSAGE_TYPES = frozenset({
-    "runs/start", "runs/cancel", "runs/status", "runs/answer", "runs/subscribe",
+    "runs/start", "runs/cancel", "runs/followup", "runs/status", "runs/answer", "runs/subscribe",
     "workspace/path", "terminal/slots", "ping", "server/metrics",
 })
 _BULK_MESSAGE_TYPES = frozenset({

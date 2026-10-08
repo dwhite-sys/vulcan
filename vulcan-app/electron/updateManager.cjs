@@ -8,7 +8,7 @@ const { Readable } = require('stream');
 const { once } = require('events');
 
 const RELEASES_URL = 'https://api.github.com/repos/dwhite-sys/vulcan/releases?per_page=30';
-const CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
+const CHECK_INTERVAL_MS = 60 * 60 * 1000;
 
 const ASSET_BY_PLATFORM = {
   linux: 'Vulcan.AppImage',
@@ -87,6 +87,7 @@ function sanitizeState(state) {
     tag: state.tag,
     releaseUrl: state.releaseUrl,
     assetName: state.assetName,
+    promptOnStartup: state.promptOnStartup === true,
   };
 }
 
@@ -109,7 +110,7 @@ function createUpdater({ getMainWindow, onStateChanged }) {
     if (win && !win.isDestroyed()) win.webContents.send('vulcan-update-progress', payload);
   };
 
-  async function check() {
+  async function check({ startup = false } = {}) {
     if (!app.isPackaged) return sanitizeState(state);
     if (checkPromise) return checkPromise;
 
@@ -168,6 +169,7 @@ function createUpdater({ getMainWindow, onStateChanged }) {
 
         state = {
           available: true,
+          promptOnStartup: startup,
           currentVersion: app.getVersion(),
           latestVersion: displayVersion(chosen.version),
           tag: String(chosen.release.tag_name),

@@ -11,9 +11,18 @@ const sourcePath = path.join(appDir, 'electron', 'updateManager.cjs');
 const source = fs.readFileSync(sourcePath, 'utf8');
 
 const sandboxModule = { exports: {} };
+let periodicCheck;
+let periodicInterval;
+let discoveryRequests = 0;
 const electronMock = {
   app: { getVersion: () => '1.0.0-rc.16', isPackaged: true },
-  net: {},
+  net: { fetch: async () => {
+    discoveryRequests++;
+    return { ok: true, json: async () => [{ tag_name: 'v1.0.0rc17', assets: [{
+      name: 'Vulcan.AppImage', browser_download_url: 'https://example.test/Vulcan.AppImage',
+      digest: `sha256:${'a'.repeat(64)}`,
+    }] }] };
+  } },
 };
 const mockRequire = (name) => {
   if (name === 'electron') return electronMock;
@@ -38,7 +47,11 @@ vm.runInNewContext(source, {
   process: { platform: 'linux', pid: 123, env: {}, execPath: '/tmp/Vulcan' },
   setTimeout,
   clearTimeout,
-  setInterval,
+  setInterval: (callback, interval) => {
+    periodicCheck = callback;
+    periodicInterval = interval;
+    return { unref() {} };
+  },
   URL,
   Response,
   AbortController,
@@ -71,14 +84,47 @@ assert.equal(
   hash,
 );
 
+const windowActions = [];
+const states = [];
+const updater = sandboxModule.exports.createUpdater({
+  getMainWindow: () => ({
+    isDestroyed: () => false, isMinimized: () => true,
+    restore: () => windowActions.push('restore'),
+    show: () => windowActions.push('show'),
+    focus: () => windowActions.push('focus'),
+    webContents: { send: (channel, state) => windowActions.push({ channel, state }) },
+  }),
+  onStateChanged: state => states.push(state),
+});
+assert.equal((await updater.check({ startup: true })).promptOnStartup, true);
+assert.equal(states.at(-1).available, true);
+windowActions.length = 0;
+updater.startPeriodicChecks();
+assert.equal(periodicInterval, 60 * 60 * 1000);
+updater.startPeriodicChecks();
+periodicCheck();
+await updater.check(); // joins the periodic request
+assert.equal(states.at(-1).promptOnStartup, false);
+assert.equal(windowActions.length, 1);
+assert.equal(windowActions[0].channel, 'vulcan-update-state');
+windowActions.length = 0;
+const requestsBeforeOpen = discoveryRequests;
+updater.openPrompt();
+assert.deepEqual(windowActions.slice(0, 3), ['restore', 'show', 'focus']);
+assert.equal(windowActions[3].channel, 'vulcan-update-open');
+assert.equal(windowActions[3].state.tag, 'v1.0.0rc17');
+assert.equal(discoveryRequests, requestsBeforeOpen, 'Opening the prompt must not start a download');
+
 const main = fs.readFileSync(path.join(appDir, 'electron', 'main.cjs'), 'utf8');
 const preload = fs.readFileSync(path.join(appDir, 'electron', 'preload.cjs'), 'utf8');
 const app = fs.readFileSync(path.join(appDir, 'src', 'app', 'App.tsx'), 'utf8');
 const prompt = fs.readFileSync(path.join(appDir, 'src', 'app', 'components', 'UpdatePrompt.tsx'), 'utf8');
 
-assert.match(main, /label: 'Update and Restart'/);
+assert.match(main, /label: 'Update'/);
 assert.match(main, /vulcan-update-install/);
 assert.match(main, /updater\.startPeriodicChecks\(\)/);
+assert.match(main, /updater\?\.check\?\.\(\{ startup: true \}\)/);
+assert.match(main, /label: 'Update',\s*click: \(\) => updater\?\.openPrompt\?\.\(\)/);
 assert.match(preload, /updates:\s*\{/);
 assert.match(preload, /vulcan-update-open/);
 assert.match(app, /<UpdatePrompt \/>/);

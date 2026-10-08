@@ -10,6 +10,7 @@ import type { ChatEvent, Kit, Message, MessageQuote, ReasoningEvent, ToolEvent, 
 import { buildTranscriptBlocks, type TranscriptAssistantEvent } from '../services/transcript';
 import { isIsolatedMarkdownFence } from '../services/markdownDefense';
 import type { TranscriptSearchMatch } from '../services/transcriptSearch';
+import { readFileBase64 } from '../services/vulcan';
 
 interface TranscriptRendererProps {
   events: ChatEvent[];
@@ -155,10 +156,28 @@ function PresentedFileCard({ event, chatId }: { event: Extract<ChatEvent, { type
     <div className="my-2 flex items-center gap-3 px-3 py-2.5 bg-ash-800/60 border border-ash-700/60 rounded-lg">
       <FileCode className="w-4 h-4 text-coral-400 flex-shrink-0" />
       <span className="flex-1 min-w-0 text-xs text-ash-200 font-mono truncate" title={pf.path}>{pf.name}</span>
-      <button
-        onClick={() => window.dispatchEvent(new CustomEvent('vulcan:open-file', { detail: { path: pf.path, chatId } }))}
-        className="px-2 py-1 text-xs bg-ash-700 hover:bg-ash-600 text-ash-200 rounded transition-colors"
-      >Open</button>
+      <div className="flex items-center gap-1.5 flex-shrink-0">
+        <button
+          onClick={() => window.dispatchEvent(new CustomEvent('vulcan:open-file', { detail: { path: pf.path, chatId } }))}
+          className="px-2 py-1 text-xs bg-ash-700 hover:bg-ash-600 text-ash-200 rounded transition-colors"
+        >Open</button>
+        <button
+          onClick={async () => {
+            try {
+              if (!chatId) return;
+              const { base64, mimeType } = await readFileBase64(chatId, pf.path);
+              const blob = await (await fetch(`data:${mimeType};base64,${base64}`)).blob();
+              const url = URL.createObjectURL(blob);
+              const a = document.createElement('a');
+              a.href = url;
+              a.download = pf.name;
+              a.click();
+              URL.revokeObjectURL(url);
+            } catch { /* ignore */ }
+          }}
+          className="px-2 py-1 text-xs bg-ash-700 hover:bg-ash-600 text-ash-200 rounded transition-colors"
+        >Download</button>
+      </div>
     </div>
   );
 }

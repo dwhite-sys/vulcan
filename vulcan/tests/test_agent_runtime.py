@@ -942,20 +942,30 @@ class StorageAndParserTests(unittest.TestCase):
         self.assertEqual(result["thinking"], "Consider it.")
         self.assertEqual(result["toolCalls"][0]["function"], {"name": "view_file", "arguments": '{"path":"x"}'})
 
-    def test_history_omits_reasoning_but_preserves_raw_tool_identity(self):
+    def test_history_preserves_reasoning_and_raw_tool_identity(self):
         events = chat("projection")["events"]
         raw = {"id": "raw-id", "type": "function", "function": {"name": "visualize", "arguments": "{}"}}
         events.extend([
-            {"id": "reason", "type": "reasoning", "content": "must never reappear", "turnId": "turn"},
+            {"id": "reason", "type": "reasoning", "content": "retained reasoning", "turnId": "turn"},
             {"id": "text", "type": "assistant_text", "content": "Checking", "turnId": "turn"},
             {"id": "tool", "type": "tool", "callId": "raw-id", "tool": "visualize", "rawToolCall": raw,
              "result": {"result": {"ok": True}}, "turnId": "turn"},
         ])
         messages = agent.project_history(events)
-        self.assertEqual(messages[1]["content"], "Checking")
+        self.assertEqual(messages[1]["content"], "<think>retained reasoning</think>Checking")
         self.assertEqual(messages[1]["tool_calls"], [raw])
         self.assertEqual(messages[2]["tool_call_id"], "raw-id")
-        self.assertNotIn("must never reappear", json.dumps(messages))
+        self.assertIn("retained reasoning", json.dumps(messages))
+
+    def test_saved_reasoning_only_turn_survives_followup_projection(self):
+        value = chat("saved-reasoning")
+        value["events"].append({"id": "reason-only", "type": "reasoning", "content": "Remember this analysis",
+                                "turnId": "prior-turn", "runId": "prior-run", "status": "complete"})
+        chats.save_chat(value)
+        restored = chats.load_chat(value["id"])
+        self.assertEqual(agent.project_history(restored["events"])[-1], {
+            "role": "assistant", "content": "<think>Remember this analysis</think>",
+        })
 
     def test_native_schema_modes_are_canonical(self):
         search = agent.native_tools({"toolMode": "search", "cliWorkspaceEnabled": True, "panelsEnabled": True})
@@ -1484,6 +1494,50 @@ class BackgroundAgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured[0]["content"], agent.build_prompt(value, options()["settings"], [], []))
         self.assertNotIn("<quotes>", captured[0]["content"])
 
+    async def test_first_send_projects_design_selection_into_provider_request(self):
+        element = {
+            "id": "accent", "designId": "design-testbench",
+            "locator": "getByText('ACCENT click a swatch to restyle the whole page', { exact: true })",
+            "hierarchyAddress": "body > main.grid > section.card",
+            "tagName": "section", "text": "ACCENT click a swatch to restyle the whole page",
+            "route": "/?v=2",
+        }
+        descriptor = ('<element id="1" design="design-testbench" '
+                      'locator="getByText(&#x27;ACCENT click a swatch to restyle the whole page&#x27;, { exact: true })" '
+                      'hierarchy="body &gt; main.grid &gt; section.card" tag="section" '
+                      'text="ACCENT click a swatch to restyle the whole page" route="/?v=2"></element>')
+        for index, (content, notices, expected) in enumerate([
+            ("Can you see what I'm attaching?", None,
+             f"<elements>\n  {descriptor}\n</elements>\n\nCan you see what I'm attaching?"),
+            ("Change \ue000vulcan-element:accent\ue001", None, f"Change {descriptor}"),
+            ("Can you see what I'm selecting?", "User attached: notes.txt",
+             f"<elements>\n  {descriptor}\n</elements>\n\nCan you see what I'm selecting?\n\nUser attached: notes.txt"),
+        ]):
+            with self.subTest(content=content, notices=notices):
+                value = chat(f"selected-first-send-{index}")
+                value["title"] = "Design selection"
+                event = value["events"][0]
+                event.update(content=content, elements=[element], contextOrder=["accent"])
+                if notices:
+                    event["attachmentNotices"] = notices
+                captured: list[dict] = []
+
+                async def provider(run, messages, tools, turn_id):
+                    captured.extend(messages)
+                    return {"thinking": "", "content": "Understood", "toolCalls": []}
+
+                # New sends carry raw composer text in userContent, unlike edits.
+                raw_content = f"{content}\n\n{notices}" if notices else content
+                with mock.patch.object(agent, "_provider_response", provider):
+                    run = agent.AgentRun(chat=value,
+                                         options=options(userContent=raw_content, autoGenerateTitle=False),
+                                         manager=agent.RunManager(), run_id=event["runId"])
+                    await asyncio.wait_for(agent.execute_run(run), timeout=2)
+
+                self.assertEqual(captured[-1], {"role": "user", "content": expected})
+                self.assertEqual(captured[-1], agent.project_history([event])[0])
+                self.assertNotIn("\ue000vulcan-element:", captured[-1]["content"])
+
     async def test_new_chat_generates_server_owned_title_and_updates_sidebar(self):
         manager = agent.RunManager()
         session = FakeSession()
@@ -1762,6 +1816,385 @@ class BackgroundAgentTests(unittest.IsolatedAsyncioTestCase):
         stop.assert_called_once_with("managed-stop", reason="manual", force=False)
         session.cleanup()
 
+    async def test_stop_resume_preserves_partial_output_and_completed_tools(self):
+        manager = agent.RunManager()
+        entered = asyncio.Event()
+        calls = []
+
+        async def provider(run, messages, tools, turn_id):
+            calls.append(json.loads(json.dumps(messages)))
+            if len(calls) == 1:
+                run.stream_event({"type": "reasoning_delta", "delta": "Read before changing"}, turn_id)
+                return {"thinking": "Read before changing", "content": "", "toolCalls": [
+                    {"id": "read-once", "type": "function", "function": {"name": "find_in_file", "arguments": "{}"}}]}
+            if len(calls) == 2:
+                run.stream_event({"type": "reasoning_delta", "delta": "The matching component is"}, turn_id)
+                run.stream_event({"type": "text_delta", "delta": "I found the"}, turn_id)
+                entered.set()
+                await asyncio.Event().wait()
+            run.stream_event({"type": "text_delta", "delta": " toolbar. Continuing.",}, turn_id)
+            return {"content": " toolbar. Continuing.", "toolCalls": [], "providerTerminal": True}
+
+        with mock.patch.object(agent, "_provider_response", provider), \
+             mock.patch.object(agent, "execute_tool", new=mock.AsyncMock(return_value={"result": {"matches": [42]}})) as tool:
+            run = manager.start(chat('resume-history'), options(), FakeSession())
+            await asyncio.wait_for(entered.wait(), timeout=2)
+            await manager.cancel_and_wait(run.chat['id'])
+            saved = chats.load_chat(run.chat['id'])
+            self.assertEqual(saved['pausedRunId'], run.run_id)
+            old_ids = [event['id'] for event in saved['events']]
+            continued = await manager.start_async(saved, options(resume=True), FakeSession())
+            self.assertNotEqual(continued.run_id, run.run_id)
+            await asyncio.wait_for(continued.task, timeout=2)
+            tool.assert_awaited_once()
+        self.assertEqual([event['id'] for event in continued.events[:len(old_ids)]], old_ids)
+        self.assertEqual(sum(event['type'] == 'user_message' for event in continued.events), 1)
+        self.assertIn('Read before changing', json.dumps(calls[-1]))
+        self.assertIn('The matching component is', json.dumps(calls[-1]))
+        self.assertIn('I found the', json.dumps(calls[-1]))
+        self.assertTrue(any(message['role'] == 'tool' and message['tool_call_id'] == 'read-once' for message in calls[-1]))
+        self.assertNotIn('pausedRunId', chats.load_chat(run.chat['id']))
+
+    async def test_resume_websocket_uses_server_checkpoint_and_records_unknown_tool_effects(self):
+        manager = agent.RunManager()
+        ws = load_ws_module()
+        sent = []
+        class Transport:
+            async def send_json(self, message):
+                sent.append(message)
+        session = ws.GeneralWSSession(Transport())
+        saved = chat('resume-authority')
+        raw = {"id": "interrupted-call", "type": "function", "function": {"name": "write_file", "arguments": '{"path":"a.txt"}'}}
+        saved['events'].extend([
+            {"id": "partial-reason", "type": "reasoning", "turnId": "stopped-turn", "content": "Important saved analysis", "status": "interrupted"},
+            {"id": "partial-tool", "type": "tool", "turnId": "stopped-turn", "callId": "interrupted-call", "tool": "write_file",
+             "rawToolCall": raw, "status": "interrupted"},
+            {"id": "fragment", "type": "tool", "turnId": "stopped-turn", "callId": "fragment-id", "tool": "wri", "rawArguments": '{', "status": "interrupted"},
+        ])
+        saved['pausedRunId'] = 'stopped-run'
+        saved['resumeLoadedTools'] = ['kit_action', 'disabled_action']
+        chats.save_chat(saved)
+        entered, finish = asyncio.Event(), asyncio.Event()
+        captured = {}
+        async def provider(run, messages, tools, turn_id):
+            captured.update(messages=messages, tools=tools)
+            entered.set()
+            await finish.wait()
+            return {"content": "continued", "toolCalls": []}
+        configuration = options(resume=True, enabledKits=['Test Kit'], disabledTools=['Test Kit::disabled_action'],
+                                kitsWithTools=[{'kit_name': 'Test Kit', 'tools': [
+                                    {'name':'kit_action','parameters':{'type':'object'}},
+                                    {'name':'disabled_action','parameters':{'type':'object'}},
+                                ]}])
+        # The renderer hasn't received its last frame yet: its partial tail is missing.
+        stale = {**saved, 'events': saved['events'][:1]}
+        with mock.patch.object(agent, 'MANAGER', manager), mock.patch.object(agent, '_provider_response', provider), \
+             mock.patch.object(agent, 'execute_tool', new=mock.AsyncMock()) as tool:
+            await session._runs_start('resume', {'chat': stale, 'options': configuration})
+            await asyncio.wait_for(entered.wait(), timeout=2)
+            run = manager.runs[saved['id']]
+            finish.set()
+            await asyncio.wait_for(run.task, timeout=2)
+            tool.assert_not_awaited()
+        self.assertIn('Important saved analysis', json.dumps(captured['messages']))
+        self.assertIn('Interrupted tool fragment', json.dumps(captured['messages']))
+        calls = [call for message in captured['messages'] for call in message.get('tool_calls', [])]
+        self.assertEqual(calls, [raw])
+        result = next(message for message in captured['messages'] if message['role'] == 'tool')
+        self.assertEqual(result['tool_call_id'], 'interrupted-call')
+        self.assertIn('partial or unknown', result['content'])
+        self.assertIn('kit_action', [tool['name'] for tool in captured['tools']])
+        self.assertNotIn('disabled_action', [tool['name'] for tool in captured['tools']])
+        self.assertEqual(sum(event['type'] == 'user_message' for event in run.events), 1)
+        self.assertNotIn('pausedRunId', chats.load_chat(saved['id']))
+        with mock.patch.object(agent, 'MANAGER', manager):
+            with self.assertRaisesRegex(ValueError, 'no longer available'):
+                await session._runs_start('stale', {'chat': stale, 'options': configuration})
+        session.cleanup()
+
+    async def test_resume_before_first_token_and_pending_queue_survive_stop(self):
+        manager = agent.RunManager()
+        entered = asyncio.Event()
+        captured = []
+        async def provider(run, messages, tools, turn_id):
+            captured.append(messages.copy())
+            if len(captured) == 1:
+                entered.set()
+                await asyncio.Event().wait()
+            return {"content": "continued", "toolCalls": []}
+        with mock.patch.object(agent, '_provider_response', provider):
+            run = manager.start(chat('resume-no-token'), options(), FakeSession())
+            await entered.wait()
+            run.chat['pendingFollowups'] = [{"mode": "queue", "event": {
+                "id": "queued-before-stop", "type": "user_message", "content": "Then add tests", "timestamp": agent.now()}}]
+            await manager.cancel_and_wait(run.chat['id'])
+            saved = chats.load_chat(run.chat['id'])
+            self.assertEqual(len(saved['pendingFollowups']), 1)
+            resumed = await manager.start_async(saved, options(resume=True), FakeSession())
+            await asyncio.wait_for(resumed.task, timeout=2)
+        self.assertEqual(captured[1][1]['content'], "Find Bella's traits")
+        self.assertIn('Then add tests', json.dumps(captured[2]))
+        self.assertEqual(resumed.chat['pendingFollowups'], [])
+
+    async def test_followup_websocket_steers_at_tool_boundary_and_queues_until_completion(self):
+        manager = agent.RunManager()
+        ws = load_ws_module()
+        class Transport:
+            async def send_json(self, message):
+                pass
+        session = ws.GeneralWSSession(Transport())
+        in_tool, release = asyncio.Event(), asyncio.Event()
+        captured = []
+        async def provider(run, messages, tools, turn_id):
+            captured.append(json.loads(json.dumps(messages)))
+            if len(captured) == 1:
+                return {"thinking": "Original reasoning", "content": "", "toolCalls": [
+                    {"id": "one-tool", "type": "function", "function": {"name": "find_in_file", "arguments": "{}"}}]}
+            return {"content": "Current task finished" if len(captured) == 2 else "Queued task finished",
+                    "toolCalls": [], "providerTerminal": True}
+        async def tool(*args):
+            in_tool.set()
+            await release.wait()
+            return {"result": {"matches": ["retained evidence"]}}
+        with mock.patch.object(agent, 'MANAGER', manager), mock.patch.object(agent, '_provider_response', provider), \
+             mock.patch.object(agent, 'execute_tool', tool):
+            run = manager.start(chat('followup-boundary'), options(), FakeSession())
+            await in_tool.wait()
+            queue = {"chat_id": run.chat['id'], "mode": "queue", "event": {
+                "id": "queue-message", "type": "user_message", "content": "Next task", "timestamp": agent.now()}}
+            steer = {"chat_id": run.chat['id'], "mode": "steer", "event": {
+                "id": "steer-message", "type": "user_message", "content": "Keep it small", "timestamp": agent.now()}}
+            await session._runs_followup('queue', queue)
+            await session._runs_followup('duplicate', queue)
+            await session._runs_followup('steer', steer)
+            self.assertEqual(len(chats.load_chat(run.chat['id'])['pendingFollowups']), 2)
+            self.assertFalse(any(event.get('id') == 'steer-message' for event in run.events))
+            release.set()
+            await asyncio.wait_for(run.task, timeout=2)
+            with self.assertRaisesRegex(ValueError, 'no longer running'):
+                await session._runs_followup('late', steer)
+        self.assertEqual(len(captured), 3)
+        self.assertIn('Original reasoning', json.dumps(captured[1]))
+        self.assertIn('retained evidence', json.dumps(captured[1]))
+        self.assertEqual(captured[1][-1]['content'], 'Keep it small')
+        self.assertNotIn('Next task', json.dumps(captured[1]))
+        self.assertEqual(captured[2][-1]['content'], 'Next task')
+        self.assertEqual(sum(event.get('id') == 'queue-message' for event in run.events), 1)
+        session.cleanup()
+
+    async def test_silent_provider_after_tool_completion_fails_and_unlocks_run(self):
+        import httpx
+        requests = []
+        closed = asyncio.Event()
+
+        async def handle(reader, writer):
+            try:
+                headers = await reader.readuntil(b"\r\n\r\n")
+                size = next(int(line.split(b":", 1)[1]) for line in headers.split(b"\r\n")
+                            if line.lower().startswith(b"content-length:"))
+                requests.append(json.loads(await reader.readexactly(size)))
+                if len(requests) == 1:
+                    body = ('data: ' + json.dumps({"choices": [{"delta": {"tool_calls": [
+                        {"index": 0, "id": "completed-tool", "function": {"name": "find_in_file", "arguments": "{}"}},
+                    ]}, "finish_reason": "tool_calls"}]}) + '\n\ndata: [DONE]\n\n').encode()
+                    writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n"
+                                 + f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
+                    await writer.drain()
+                else:
+                    # Matches the live stall: the tool has finished and the next
+                    # provider request arrives, but no response headers follow.
+                    await reader.read()
+                    closed.set()
+            finally:
+                writer.close()
+                await writer.wait_closed()
+
+        server = await asyncio.start_server(handle, '127.0.0.1', 0)
+        port = server.sockets[0].getsockname()[1]
+        value = chat('silent-after-tool')
+        value['title'] = 'Silent provider'
+        session = FakeSession()
+        configuration = options()
+        configuration['provider']['baseUrl'] = f'http://127.0.0.1:{port}/v1'
+        try:
+            async with httpx.AsyncClient() as client, server:
+                with mock.patch.object(agent.network, 'client', new=mock.AsyncMock(return_value=client)), \
+                     mock.patch.object(agent, 'PROVIDER_FIRST_DATA_TIMEOUT_SECONDS', 0.05), \
+                     mock.patch.object(agent, 'execute_tool', new=mock.AsyncMock(return_value={'result': {'ok': True}})) as tool:
+                    run = agent.RunManager().start(value, configuration, session)
+                    await asyncio.wait_for(run.task, timeout=2)
+                    await asyncio.wait_for(closed.wait(), timeout=1)
+                tool.assert_awaited_once()
+                self.assertEqual(run.status, 'error')
+                self.assertEqual(len(requests), 3, 'retry inference once without replaying tool work')
+                self.assertEqual(requests[1], requests[2])
+                self.assertEqual(requests[-1]['messages'][-1]['role'], 'tool')
+                event = next(item for item in run.events if item.get('type') == 'tool')
+                self.assertEqual(event['status'], 'complete')
+                self.assertEqual(event['result'], {'result': {'ok': True}})
+                self.assertIn('model provider stayed silent', run.events[-1]['content'])
+                self.assertTrue(any(item.get('type') == 'push/run-status' and
+                                    item['payload'].get('status') == 'error' for item in session.messages))
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    async def test_silent_provider_retry_succeeds_and_keeps_partial_stream(self):
+        import httpx
+        requests = []
+        first_closed = asyncio.Event()
+
+        async def handle(reader, writer):
+            try:
+                headers = await reader.readuntil(b"\r\n\r\n")
+                size = next(int(line.split(b":", 1)[1]) for line in headers.split(b"\r\n")
+                            if line.lower().startswith(b"content-length:"))
+                requests.append(json.loads(await reader.readexactly(size)))
+                if len(requests) == 1:
+                    await reader.read()
+                    first_closed.set()
+                else:
+                    await asyncio.wait_for(first_closed.wait(), timeout=1)
+                    # Even a partial SSE line counts as data. Do not retry it.
+                    writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\nd")
+                    await writer.drain()
+                    await asyncio.sleep(0.15)
+                    writer.write(b'ata: {"choices":[{"delta":{"content":"recovered"},"finish_reason":"stop"}]}\n\n')
+                    await writer.drain()
+            finally:
+                writer.close()
+                await writer.wait_closed()
+
+        server = await asyncio.start_server(handle, '127.0.0.1', 0)
+        configuration = options()
+        configuration['provider']['baseUrl'] = f'http://127.0.0.1:{server.sockets[0].getsockname()[1]}/v1'
+        run = agent.AgentRun(chat=chat('retry-provider'), options=configuration,
+                             manager=agent.RunManager(), run_id='retry-provider:run')
+        raw_call = {"id": "prior-call", "type": "function", "function": {"name": "find_in_file", "arguments": "{}"}}
+        messages = agent.project_history([
+            {"type": "user_message", "content": "Find it"},
+            {"type": "reasoning", "content": "Inspect the existing file", "turnId": "prior"},
+            {"type": "assistant_text", "content": "Checking", "turnId": "prior"},
+            {"type": "tool", "callId": "prior-call", "tool": "find_in_file", "rawToolCall": raw_call,
+             "result": {"result": {"matches": ["line 42"]}}, "turnId": "prior"},
+        ])
+        schemas = [{"name": "find_in_file", "description": "Find text", "parameters": {"type": "object"}}]
+        try:
+            async with httpx.AsyncClient() as client, server:
+                with mock.patch.object(agent.network, 'client', new=mock.AsyncMock(return_value=client)), \
+                     mock.patch.object(agent, 'PROVIDER_FIRST_DATA_TIMEOUT_SECONDS', 0.05):
+                    result = await asyncio.wait_for(agent._provider_response(run, messages, schemas, 'turn'), timeout=2)
+            self.assertEqual(result['content'], 'recovered')
+            self.assertTrue(result['providerTerminal'])
+            self.assertEqual(len(requests), 2)
+            self.assertEqual(requests[0], requests[1])
+            self.assertEqual(requests[1]['messages'], messages)
+            self.assertIn('Inspect the existing file', requests[1]['messages'][1]['content'])
+            self.assertEqual(requests[1]['messages'][1]['tool_calls'], [raw_call])
+            self.assertEqual(requests[1]['messages'][2]['content'], '{"matches":["line 42"]}')
+            self.assertEqual(requests[1]['tools'][0]['function'], schemas[0])
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    async def test_stop_cancels_silent_provider_without_retrying(self):
+        registry = agent.etna_registry
+        session = FakeSession()
+        registry.register_client('stop-silent-provider', session)
+        configuration = options()
+        configuration['provider'].update(networkPointOfView='client', clientId='stop-silent-provider')
+        run = agent.AgentRun(chat=chat('stop-silent'), options=configuration,
+                             manager=agent.RunManager(), run_id='stop-silent:run')
+        try:
+            task = asyncio.create_task(agent._provider_response(run, [], [], 'turn'))
+            for _ in range(100):
+                if session.messages:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertTrue(session.messages)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            requests = [item for item in session.messages if item['type'] == 'push/client-http-request']
+            self.assertEqual(len(requests), 1)
+            relay_id = requests[0]['payload']['relay_id']
+            self.assertNotIn(relay_id, registry.HTTP_STREAMS)
+            self.assertNotIn(relay_id, registry.RELAY_CLIENTS)
+            self.assertTrue(any(item['type'] == 'push/client-http-cancel' for item in session.messages))
+        finally:
+            registry.unregister_client('stop-silent-provider', session)
+
+    async def test_provider_timeout_allows_long_active_stream_but_rejects_midstream_silence(self):
+        import httpx
+        for silent in (False, True):
+            with self.subTest(silent=silent):
+                closed = asyncio.Event()
+
+                async def handle(reader, writer):
+                    try:
+                        headers = await reader.readuntil(b"\r\n\r\n")
+                        size = next(int(line.split(b":", 1)[1]) for line in headers.split(b"\r\n")
+                                    if line.lower().startswith(b"content-length:"))
+                        await reader.readexactly(size)
+                        writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
+                        for _ in range(6):
+                            writer.write(b'data: {"choices":[{"delta":{"content":"x"}}]}\n\n')
+                            await writer.drain()
+                            if silent:
+                                await reader.read()
+                                return
+                            await asyncio.sleep(0.03)
+                        writer.write(b'data: [DONE]\n\n')
+                        await writer.drain()
+                    finally:
+                        writer.close()
+                        await writer.wait_closed()
+                        closed.set()
+
+                server = await asyncio.start_server(handle, '127.0.0.1', 0)
+                configuration = options()
+                configuration['provider']['baseUrl'] = f'http://127.0.0.1:{server.sockets[0].getsockname()[1]}/v1'
+                run = agent.AgentRun(chat=chat('stream-idle-test'), options=configuration,
+                                     manager=agent.RunManager(), run_id='stream-idle-test:run')
+                try:
+                    async with httpx.AsyncClient() as client, server:
+                        with mock.patch.object(agent.network, 'client', new=mock.AsyncMock(return_value=client)), \
+                             mock.patch.object(agent, 'PROVIDER_IDLE_TIMEOUT_SECONDS', 0.1):
+                            if silent:
+                                with self.assertRaisesRegex(RuntimeError, 'model provider did not respond'):
+                                    await asyncio.wait_for(agent._provider_response(run, [], [], 'turn'), timeout=2)
+                            else:
+                                result = await asyncio.wait_for(agent._provider_response(run, [], [], 'turn'), timeout=2)
+                                self.assertEqual(result['content'], 'xxxxxx')
+                                self.assertTrue(result['providerTerminal'])
+                        await asyncio.wait_for(closed.wait(), timeout=1)
+                finally:
+                    server.close()
+                    await server.wait_closed()
+
+    async def test_client_provider_relay_times_out_on_inactivity_and_cancels_fetch(self):
+        registry = agent.etna_registry
+        session = FakeSession()
+        registry.register_client('idle-provider-test', session)
+        configuration = options()
+        configuration['provider'].update(networkPointOfView='client', clientId='idle-provider-test')
+        run = agent.AgentRun(chat=chat('idle-client-provider'), options=configuration,
+                             manager=agent.RunManager(), run_id='idle-client-provider:run')
+        try:
+            with mock.patch.object(agent, 'PROVIDER_FIRST_DATA_TIMEOUT_SECONDS', 0.03):
+                with self.assertRaisesRegex(RuntimeError, 'model provider stayed silent'):
+                    await asyncio.wait_for(agent._provider_response(run, [], [], 'turn'), timeout=1)
+            requests = [item for item in session.messages if item['type'] == 'push/client-http-request']
+            self.assertEqual(len(requests), 2)
+            for request in requests:
+                relay_id = request['payload']['relay_id']
+                self.assertTrue(any(item['type'] == 'push/client-http-cancel' and
+                                    item['payload']['relay_id'] == relay_id for item in session.messages))
+                self.assertNotIn(relay_id, registry.HTTP_STREAMS)
+                self.assertNotIn(relay_id, registry.RELAY_CLIENTS)
+        finally:
+            registry.unregister_client('idle-provider-test', session)
+
     async def test_provider_wire_request_and_sse_parser(self):
         captured = {}
         chunks = [
@@ -1780,10 +2213,10 @@ class BackgroundAgentTests(unittest.IsolatedAsyncioTestCase):
             async def __aexit__(self, *args):
                 return False
 
-            async def aiter_lines(self):
+            async def aiter_text(self):
                 for chunk in chunks:
-                    yield "data: " + json.dumps(chunk)
-                yield "data: [DONE]"
+                    yield "data: " + json.dumps(chunk) + "\n\n"
+                yield "data: [DONE]\n\n"
 
         class Client:
             def __init__(self, **kwargs):
@@ -1832,9 +2265,9 @@ class BackgroundAgentTests(unittest.IsolatedAsyncioTestCase):
             async def __aexit__(self, *args):
                 return False
 
-            async def aiter_lines(self):
-                yield 'data: ' + json.dumps({"choices": [{"delta": {"content": "finished"}}]})
-                yield 'data: [DONE]'
+            async def aiter_text(self):
+                yield 'data: ' + json.dumps({"choices": [{"delta": {"content": "finished"}}]}) + "\n\n"
+                yield 'data: [DONE]\n\n'
                 # Reproduces a provider/proxy that leaves the transport open long
                 # after the LLM has sent its explicit terminal marker. Old Vulcan
                 # blocked here and left the composer permanently disabled.
@@ -1868,8 +2301,8 @@ class BackgroundAgentTests(unittest.IsolatedAsyncioTestCase):
             async def __aexit__(self, *args):
                 return False
 
-            async def aiter_lines(self):
-                yield 'data: ' + json.dumps({"choices": [{"delta": {"content": "finished"}, "finish_reason": "stop"}]})
+            async def aiter_text(self):
+                yield 'data: ' + json.dumps({"choices": [{"delta": {"content": "finished"}, "finish_reason": "stop"}]}) + "\n\n"
                 await release.wait()
 
         class Client:

@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { Panel, PanelGroup, PanelResizeHandle, type ImperativePanelHandle } from 'react-resizable-panels';
+import { useSidebarWidths } from './hooks/useSidebarWidths';
 import { TopBar } from './components/TopBar';
 import { KitSidebar, type SidebarDragItem } from './components/KitSidebar';
 import { ChatInterface } from './components/ChatInterface';
@@ -363,7 +364,8 @@ export default function App() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(true);
   // Mirrors the live resizable sidebar width so the top-bar title can begin at
   // the exact same x-position as the chat pane. This is presentation-only state.
-  const [sidebarSizePercent, setSidebarSizePercent] = useState(20);
+  const sidebarWidths = useSidebarWidths(!sidebarCollapsed, artifactsPanelOpen);
+  const [sidebarSizePercent, setSidebarSizePercent] = useState(sidebarWidths.widths.chat);
 
   const enterDesignFocus = useCallback((designId: string) => {
     if (!designChromeRestoreRef.current) {
@@ -396,6 +398,7 @@ export default function App() {
   }, [activeChat?.id]);
   // AbortController for cancelling in-flight inference
   const abortControllerRef = useRef<AbortController | null>(null);
+  const resumeInFlightRef = useRef(false);
 
   const handleStop = () => {
     abortControllerRef.current?.abort();
@@ -407,8 +410,12 @@ export default function App() {
     // Keep the composer locked until the server confirms that cancellation,
     // checkpoint/finalization, and chat ownership release are complete.
     void vulcan.generalWS.send('runs/cancel', { chat_id: chatId })
-      .then(() => {
-        if (activeChatIdRef.current === chatId) setProcessing(false);
+      .then((response: any) => {
+        if (activeChatIdRef.current === chatId) {
+          setProcessing(false);
+          setQuestionBatch(null);
+          if (response?.paused_run_id) setActiveChat((chat) => chat?.id === chatId ? { ...chat, pausedRunId: response.paused_run_id } : chat);
+        }
       })
       .catch((error) => console.warn('Could not stop server-owned run:', error));
   };
@@ -1973,6 +1980,7 @@ export default function App() {
     isPending: boolean,
     eventsAfterUser: ChatEvent[],
     userContent: string,
+    resume = false,
   ) => {
     const abortController = new AbortController();
     abortControllerRef.current = abortController;
@@ -2511,6 +2519,7 @@ Narrate at the level of intent. Say what you're doing and why; don't narrate eac
         if (repaired) toolSemanticIndexRef.current = repaired;
       });
       const runOptions = {
+        resume,
         userContent,
         autoGenerateTitle: isPending,
         provider,
@@ -2530,7 +2539,7 @@ Narrate at the level of intent. Say what you're doing and why; don't narrate eac
       // (and making the server re-parse) the whole conversation every message.
       // Divergence is refused as stale_base and falls back to a full upload.
       const wireChat = chatForWire(chat);
-      const byReference = !isPending && vulcan.generalWS.hasServerCapability('runs-start-ref-v1') && chat.events.length > 0;
+      const byReference = !resume && !isPending && vulcan.generalWS.hasServerCapability('runs-start-ref-v1') && chat.events.length > 0;
       const referencePayload = () => {
         const history = chat.events.slice(0, -1);
         const { events: _events, ...meta } = wireChat;
@@ -2569,12 +2578,13 @@ Narrate at the level of intent. Say what you're doing and why; don't narrate eac
           : [normalized, ...previous]);
         setActiveChat((previous) => previous?.id === normalized.id ? normalized : previous);
       }
+      if (resume) await subscribeChat(currentChat.id);
       if (isPending) {
         pendingChatIdRef.current = null;
         setPendingChat(null);
       }
     } catch (error: any) {
-      setProcessing(false);
+      if (activeChatIdRef.current === currentChat.id) setProcessing(false);
       toast.error(`Could not start server-owned agent: ${error?.message ?? String(error)}`);
     }
   };
@@ -2602,7 +2612,7 @@ Narrate at the level of intent. Say what you're doing and why; don't narrate eac
   const applySubscription = (chatId: string, result: any) => {
     if (activeChatIdRef.current !== chatId) return;
     setProcessing(result?.status === 'running' || result?.status === 'waiting_for_user');
-    if (result?.question) setQuestionBatch(result.question);
+    setQuestionBatch(result?.question ?? null);
     const hydrated = hydrateChatPayload(result?.chat);
     if (!hydrated) return;
     // The subscription snapshot supersedes everything queued before it: the
@@ -2737,6 +2747,7 @@ Narrate at the level of intent. Say what you're doing and why; don't narrate eac
       const chatId = String(payload.chat_id ?? '');
       if (chatId === activeChatIdRef.current) {
         setProcessing(payload.status === 'running' || payload.status === 'waiting_for_user');
+        setActiveChat((chat) => chat?.id === chatId ? { ...chat, pausedRunId: payload.paused_run_id ?? undefined } : chat);
       }
       if (payload.status === 'complete') {
         void (window as any).electronAPI?.desktop?.notify?.({
@@ -2804,8 +2815,19 @@ Narrate at the level of intent. Say what you're doing and why; don't narrate eac
     void subscribeChat(chatId).catch(() => {});
   }, [activeChat?.id]);
 
-  const handleSendMessage = async (content: string, files?: File[], quotes?: MessageQuote[], references?: MessageFileReference[], contextOrder?: string[], elements?: MessageElementReference[]) => {
-    if (!activeChat || processing) return;
+  const handleResume = async () => {
+    if (!activeChat?.pausedRunId || processing || resumeInFlightRef.current) return;
+    resumeInFlightRef.current = true;
+    setProcessing(true);
+    try {
+      await runInference(activeChat, false, activeChat.events, '', true);
+    } finally {
+      resumeInFlightRef.current = false;
+    }
+  };
+
+  const handleSendMessage = async (content: string, files?: File[], quotes?: MessageQuote[], references?: MessageFileReference[], contextOrder?: string[], elements?: MessageElementReference[], mode?: 'steer' | 'queue') => {
+    if (!activeChat || (processing && !mode)) return;
 
     let currentChat = activeChat;
     const isPending = pendingChat?.id === currentChat.id;
@@ -2853,6 +2875,11 @@ Narrate at the level of intent. Say what you're doing and why; don't narrate eac
       runId,
     };
 
+    if (processing && mode) {
+      await vulcan.generalWS.send('runs/followup', { chat_id: currentChat.id, event: userEvent, mode });
+      toast.success(mode === 'steer' ? 'Steer saved for the next step' : 'Message queued after completion');
+      return;
+    }
     let eventsAfterUser: ChatEvent[];
     if (branchMode && selectedBranch && activeBranching && selectedBranch.id !== activeBranching.currentBranchId) {
       const branched = createBranch(currentChat, 'jump', selectedBranch.id, [...selectedBranchEvents, userEvent]);
@@ -3083,10 +3110,10 @@ ${editedEvent.attachmentNotices}`.trim()
       />
 
       <div className="flex-1 overflow-hidden">
-        <PanelGroup direction="horizontal" id="main-layout">
-          {!sidebarCollapsed && !designOpen && (
+        <PanelGroup direction="horizontal" id="main-layout" ref={sidebarWidths.groupRef} onLayout={sidebarWidths.onLayout}>
+          {!sidebarCollapsed && (
             <>
-              <Panel id="left-sidebar" order={1} defaultSize={20} minSize={15} maxSize={30} onResize={setSidebarSizePercent}>
+              <Panel id="left-sidebar" order={1} defaultSize={sidebarWidths.widths.chat} minSize={15} maxSize={30} onResize={setSidebarSizePercent}>
                 <div className="h-full min-h-0 flex flex-col bg-ash-900 border-r border-ash-800">
                   <div className="flex-1 min-h-0">
                     <KitSidebar
@@ -3127,7 +3154,7 @@ ${editedEvent.attachmentNotices}`.trim()
                   </div>
                 </div>
               </Panel>
-              <PanelResizeHandle id="left-handle" className="w-1 bg-ash-800 hover:bg-coral-500 transition-colors cursor-col-resize" />
+              <PanelResizeHandle id="left-handle" onDragging={sidebarWidths.onDragging} onKeyDownCapture={sidebarWidths.onKeyDownCapture} className="w-1 bg-ash-800 hover:bg-coral-500 transition-colors cursor-col-resize" />
             </>
           )}
 
@@ -3155,6 +3182,8 @@ ${editedEvent.attachmentNotices}`.trim()
                     skills={allSkills}
                     onToggleSkill={handleToggleSkill}
                     onStop={handleStop}
+                    onResume={handleResume}
+                    canResume={Boolean(activeChat?.pausedRunId) && selectedBranch.id === activeBranching.currentBranchId}
                     onEditMessage={handleEditMessage}
                     onRetry={handleRetry}
                     isProcessing={processing}
@@ -3179,6 +3208,8 @@ ${editedEvent.attachmentNotices}`.trim()
                     skills={allSkills}
                     onToggleSkill={handleToggleSkill}
                     onStop={handleStop}
+                    onResume={handleResume}
+                    canResume={Boolean(activeChat?.pausedRunId)}
                     onEditMessage={handleEditMessage}
                     onRetry={handleRetry}
                     isProcessing={processing}
@@ -3224,6 +3255,8 @@ ${editedEvent.attachmentNotices}`.trim()
                 skills={allSkills}
                 onToggleSkill={handleToggleSkill}
                 onStop={handleStop}
+                onResume={handleResume}
+                canResume={Boolean(activeChat?.pausedRunId)}
                 onEditMessage={handleEditMessage}
                 onRetry={handleRetry}
                 isProcessing={processing}
@@ -3236,10 +3269,10 @@ ${editedEvent.attachmentNotices}`.trim()
             )}
           </Panel>
 
-          {artifactsPanelOpen && !designOpen && (
+          {artifactsPanelOpen && (
             <>
-              <PanelResizeHandle id="right-handle" className="w-1 bg-ash-800 hover:bg-coral-500 transition-colors cursor-col-resize" />
-              <Panel id="right-workspace" order={3} defaultSize={30} minSize={20} maxSize={50}>
+              <PanelResizeHandle id="right-handle" onDragging={sidebarWidths.onDragging} onKeyDownCapture={sidebarWidths.onKeyDownCapture} className="w-1 bg-ash-800 hover:bg-coral-500 transition-colors cursor-col-resize" />
+              <Panel id="right-workspace" order={3} defaultSize={sidebarWidths.widths.workspace} minSize={20} maxSize={50}>
                 <WorkspacePanel
                   chatId={workspaceChatId}
                   presentedFiles={presentedFiles}

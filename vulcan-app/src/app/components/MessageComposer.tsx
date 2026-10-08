@@ -1,5 +1,5 @@
-import { useRef } from 'react';
-import { File as FileIcon, FileArchive, FileCode, FileText, Paperclip, Send, Square, X } from 'lucide-react';
+import { useEffect, useId, useRef, useState } from 'react';
+import { File as FileIcon, FileArchive, FileCode, FileText, Paperclip, Play, Send, Square, X } from 'lucide-react';
 import { QuoteComposer, type QuoteComposerHandle } from './QuoteComposer';
 import { PASTE_TEXT_THRESHOLD, makePastedTextFile } from '../utils/composerPaste';
 import { KitToggleMenu } from './KitToggleMenu';
@@ -76,8 +76,10 @@ function ExistingAttachmentChip({ attachment, onRemove }: { attachment: MessageA
 export interface MessageComposerProps {
   input: string;
   setInput: (value: string) => void;
-  onSubmit: (event: React.FormEvent, files: File[]) => void;
+  onSubmit: (event: React.FormEvent, files: File[], mode?: 'steer' | 'queue') => void;
   onStop: () => void;
+  onResume?: () => void;
+  canResume?: boolean;
   isProcessing?: boolean;
   kits: Kit[];
   onToggleKit: (kitName: string, enabled: boolean) => void;
@@ -99,12 +101,38 @@ export interface MessageComposerProps {
 }
 
 export function MessageComposer({
-  input, setInput, onSubmit, onStop, isProcessing, kits, onToggleKit, skills, onToggleSkill,
+  input, setInput, onSubmit, onStop, onResume, canResume, isProcessing, kits, onToggleKit, skills, onToggleSkill,
   files, addFiles, removeFile, existingAttachments = [], onRemoveExistingAttachment,
   isDragging, contextItems, onRemoveContextItem, composerRef, onFocus, compact = false,
   submitLabel, onCancel,
 }: MessageComposerProps) {
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const formRef = useRef<HTMLFormElement>(null);
+  const descriptionId = useId();
+  const [followupChoice, setFollowupChoice] = useState(false);
+  const [highlightedChoice, setHighlightedChoice] = useState<'steer' | 'queue' | null>(null);
+  const chooseFollowup = (event: React.SyntheticEvent, mode: 'steer' | 'queue') => {
+    event.preventDefault();
+    setFollowupChoice(false);
+    onSubmit(event as React.FormEvent, files, mode);
+  };
+  useEffect(() => {
+    if (!isProcessing) setFollowupChoice(false);
+  }, [isProcessing]);
+  useEffect(() => {
+    if (!followupChoice) return;
+    const keydown = (event: KeyboardEvent) => {
+      if (!formRef.current?.contains(document.activeElement) || event.repeat || event.ctrlKey || event.metaKey || event.altKey) return;
+      if (event.key === 'Escape') { event.preventDefault(); setFollowupChoice(false); }
+      if (event.key === '1' || event.key === '2') {
+        event.preventDefault();
+        setFollowupChoice(false);
+        onSubmit({ preventDefault() {} } as React.FormEvent, files, event.key === '1' ? 'steer' : 'queue');
+      }
+    };
+    document.addEventListener('keydown', keydown);
+    return () => document.removeEventListener('keydown', keydown);
+  }, [followupChoice, files, onSubmit]);
   const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
     if (event.target.files) addFiles(Array.from(event.target.files));
   };
@@ -123,13 +151,18 @@ export function MessageComposer({
     }
   };
   const handleSubmit = (event: React.FormEvent) => {
+    if (isProcessing && !compact) {
+      event.preventDefault();
+      if (hasPayload) { setHighlightedChoice(null); setFollowupChoice(true); }
+      return;
+    }
     onSubmit(event, files);
     if (fileInputRef.current) fileInputRef.current.value = '';
   };
   const hasPayload = !!stripQuoteReferenceTokens(input).trim() || files.length > 0 || existingAttachments.length > 0 || contextItems.length > 0;
 
   return (
-    <form onSubmit={handleSubmit} className={compact ? '' : 'w-full'} onFocus={onFocus}>
+    <form ref={formRef} onSubmit={handleSubmit} className={compact ? '' : 'w-full'} onFocus={onFocus}>
       <div className={`relative flex flex-col bg-ash-800 border rounded-xl focus-within:ring-2 focus-within:ring-coral-600 transition-all ${isDragging ? 'border-coral-500 ring-2 ring-coral-500/40' : 'border-ash-700'} ${compact ? '' : 'shadow-lg'}`}>
         {isDragging && <div className="absolute inset-0 rounded-xl bg-coral-500/10 border-2 border-coral-500 border-dashed flex items-center justify-center pointer-events-none z-10"><span className="text-coral-400 text-sm font-medium">Drop files to attach</span></div>}
         {(existingAttachments.length > 0 || files.length > 0) && (
@@ -138,19 +171,34 @@ export function MessageComposer({
             {files.map((file, index) => <NewAttachmentChip key={`new-${index}-${file.name}`} file={file} onRemove={() => removeFile(file)} />)}
           </div>
         )}
-        <QuoteComposer ref={composerRef} value={input} onChange={setInput} items={contextItems} onRemoveItem={onRemoveContextItem} onPaste={handlePaste} onSubmit={() => fileInputRef.current?.form?.requestSubmit()} disabled={isProcessing} onFocus={onFocus} />
-        <div className="flex items-center justify-between px-3 pb-2">
-          <div className="flex items-center gap-1">
+        {followupChoice && <div className="absolute right-3 top-3 z-20 flex gap-1.5" role="group" aria-label="Choose follow-up behavior">
+          {(['steer', 'queue'] as const).map((mode, index) => <button key={mode} type="button"
+            onMouseEnter={() => setHighlightedChoice(mode)} onMouseLeave={() => setHighlightedChoice(null)}
+            onFocus={() => setHighlightedChoice(mode)} onBlur={() => setHighlightedChoice(null)}
+            onClick={(event) => chooseFollowup(event, mode)} aria-describedby={highlightedChoice === mode ? descriptionId : undefined}
+            className={`flex items-center gap-1.5 rounded border px-2 py-0.5 text-xs transition-colors ${highlightedChoice === mode ? 'border-coral-600 bg-ash-700 text-ash-100' : 'border-ash-600 bg-ash-700 text-ash-300'}`}>
+            <kbd className="text-[11px] text-ash-400">{index + 1}</kbd>{mode === 'steer' ? 'Steer' : 'Queue'}
+          </button>)}
+          {highlightedChoice && <div id={descriptionId} role="tooltip" className="pointer-events-none absolute bottom-[calc(100%+22px)] right-0 w-64 rounded-lg border border-ash-700 bg-ash-900 px-3 py-2.5 text-xs text-ash-200 shadow-xl">
+            {highlightedChoice === 'steer' ? 'Update the current task when the current step finishes.' : 'Send this message after the current task finishes.'}
+          </div>}
+        </div>}
+        <div className={followupChoice ? 'pr-[160px]' : ''}><QuoteComposer ref={composerRef} value={input} onChange={setInput} items={contextItems} onRemoveItem={onRemoveContextItem} onPaste={handlePaste} onSubmit={() => fileInputRef.current?.form?.requestSubmit()} disabled={compact && isProcessing} onFocus={onFocus} /></div>
+        <div className="flex items-center justify-between gap-2 px-3 pb-2">
+          <div className="flex min-w-0 flex-wrap items-center gap-1">
             <input ref={fileInputRef} type="file" multiple className="hidden" onChange={handleFileChange} />
             <button type="button" onClick={() => fileInputRef.current?.click()} className="p-1.5 text-ash-400 hover:text-ash-200 hover:bg-ash-700 rounded-md transition-colors" title="Attach files"><Paperclip className="w-4 h-4" /></button>
             <KitToggleMenu kits={kits} onToggleKit={onToggleKit} />
             <SkillToggleMenu skills={skills} onToggleSkill={onToggleSkill} />
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex shrink-0 items-center gap-2">
             {onCancel && <button type="button" onClick={onCancel} className="px-3 py-1.5 bg-ash-700 hover:bg-ash-600 text-ash-200 text-xs rounded-md transition-colors">Cancel</button>}
             {isProcessing ? (
-              <button type="button" onClick={onStop} className="p-2 bg-ash-700 text-white rounded-lg hover:bg-red-600 transition-colors flex items-center justify-center" title="Stop generation"><Square className="w-4 h-4 fill-current" /></button>
-            ) : submitLabel ? (
+              <button type="button" onClick={onStop} className="p-2 bg-ash-700 text-white rounded-lg hover:bg-red-600 transition-colors flex items-center justify-center" title="Stop generation" aria-label="Stop generation"><Square className="w-4 h-4 fill-current" /></button>
+            ) : canResume && onResume ? (
+              <button type="button" onClick={onResume} className="p-2 bg-ash-700 text-white rounded-lg hover:bg-ash-600 transition-colors flex items-center justify-center" title="Resume generation" aria-label="Resume generation"><Play className="w-4 h-4 fill-current" /></button>
+            ) : null}
+            {submitLabel ? (
               <button type="submit" disabled={!hasPayload} className="px-3 py-1.5 bg-coral-500 text-white text-xs rounded-md hover:bg-coral-600 disabled:opacity-40 disabled:cursor-not-allowed transition-colors">{submitLabel}</button>
             ) : (
               <button type="submit" disabled={!hasPayload} className="p-2 bg-coral-500 text-white rounded-lg hover:bg-coral-600 disabled:opacity-40 disabled:cursor-not-allowed transition-colors flex items-center justify-center" title="Send"><Send className="w-4 h-4" /></button>

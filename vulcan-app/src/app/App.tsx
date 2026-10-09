@@ -2492,6 +2492,7 @@ Narrate at the level of intent. Say what you're doing and why; don't narrate eac
     isPending: boolean,
     eventsAfterUser: ChatEvent[],
     userContent: string,
+    resume = false,
   ) => {
     try {
       const baseProvider = llmClient.getConfig();

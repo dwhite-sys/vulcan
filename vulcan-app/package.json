@@ -72,6 +72,7 @@
     "test:update-prompt": "node scripts/update-prompt-regression.mjs",
     "test:updates": "node scripts/update-regression.mjs",
     "test:run-stream": "node --experimental-strip-types scripts/run-stream-regression.ts",
+    "test:run-start": "node scripts/run-start-regression.mjs",
     "test:client-relay": "node --experimental-strip-types scripts/client-relay-backpressure-regression.ts",
     "test:provider-stream-relay": "node --experimental-strip-types scripts/provider-stream-relay-regression.ts"
   },

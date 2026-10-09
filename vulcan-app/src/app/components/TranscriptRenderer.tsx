@@ -158,10 +158,6 @@ function PresentedFileCard({ event, chatId }: { event: Extract<ChatEvent, { type
       <span className="flex-1 min-w-0 text-xs text-ash-200 font-mono truncate" title={pf.path}>{pf.name}</span>
       <div className="flex items-center gap-1.5 flex-shrink-0">
         <button
-          onClick={() => window.dispatchEvent(new CustomEvent('vulcan:open-file', { detail: { path: pf.path, chatId } }))}
-          className="px-2 py-1 text-xs bg-ash-700 hover:bg-ash-600 text-ash-200 rounded transition-colors"
-        >Open</button>
-        <button
           onClick={async () => {
             try {
               if (!chatId) return;
@@ -177,6 +173,10 @@ function PresentedFileCard({ event, chatId }: { event: Extract<ChatEvent, { type
           }}
           className="px-2 py-1 text-xs bg-ash-700 hover:bg-ash-600 text-ash-200 rounded transition-colors"
         >Download</button>
+        <button
+          onClick={() => window.dispatchEvent(new CustomEvent('vulcan:open-file', { detail: { path: pf.path, chatId } }))}
+          className="px-2 py-1 text-xs bg-ash-700 hover:bg-ash-600 text-ash-200 rounded transition-colors"
+        >Open</button>
       </div>
     </div>
   );

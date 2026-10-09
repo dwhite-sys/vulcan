@@ -711,6 +711,15 @@ export function ChatMessage({ message, chatId, steps = [], onStartEditMessage, e
                     </span>
                     <div className="flex items-center gap-1.5 flex-shrink-0">
                       <button
+                        onClick={() => {
+                          // Open in Monaco via custom event
+                          window.dispatchEvent(new CustomEvent('vulcan:open-file', { detail: { path: pf.path, chatId: (pf as any).chatId } }));
+                        }}
+                        className="px-2 py-1 text-xs bg-ash-700 hover:bg-ash-600 text-ash-200 rounded transition-colors"
+                      >
+                        Open
+                      </button>
+                      <button
                         onClick={async () => {
                           try {
                             if (!chatId) return;
@@ -727,15 +736,6 @@ export function ChatMessage({ message, chatId, steps = [], onStartEditMessage, e
                         className="px-2 py-1 text-xs bg-ash-700 hover:bg-ash-600 text-ash-200 rounded transition-colors"
                       >
                         Download
-                      </button>
-                      <button
-                        onClick={() => {
-                          // Open in Monaco via custom event
-                          window.dispatchEvent(new CustomEvent('vulcan:open-file', { detail: { path: pf.path, chatId: (pf as any).chatId } }));
-                        }}
-                        className="px-2 py-1 text-xs bg-ash-700 hover:bg-ash-600 text-ash-200 rounded transition-colors"
-                      >
-                        Open
                       </button>
                     </div>
                   </div>

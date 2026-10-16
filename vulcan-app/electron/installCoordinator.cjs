@@ -220,17 +220,22 @@ async function probePlatformInstallation(app) {
 
   if (process.platform === 'win32') {
     const wslBase = ['-d', 'Vulcan', '-u', 'vulcan', '--exec'];
-    const [integrationHealthy, runtimeHealthy, dockerHealthy, workspaceHealthy] = await Promise.all([
+    const [integrationHealthy, runtimeHealthy, dockerHealthy, workspaceHealthy, etnaStartup] = await Promise.all([
       probeCommand('wsl.exe', [...wslBase, 'true'], 15000),
       probeCommand('wsl.exe', [...wslBase, '/home/vulcan/.vulcan/runtime/bin/vulcan', '--help'], 15000),
       probeCommand('wsl.exe', [...wslBase, 'docker', 'info'], 15000),
       probeCommand('wsl.exe', [...wslBase, '/home/vulcan/.vulcan/runtime/bin/python', '-c', workspaceProbe], 15000),
+      probeCommand('powershell.exe', [
+        '-NoProfile', '-ExecutionPolicy', 'Bypass',
+        '-File', path.join(process.resourcesPath, 'install.ps1'), '-CheckEtnaStartup',
+      ], 15000),
     ]);
     return {
       runtime: runtimeHealthy,
       docker: dockerHealthy,
       workspace: dockerHealthy && workspaceHealthy,
       integration: integrationHealthy,
+      etnaStartup,
     };
   }
 
@@ -297,7 +302,7 @@ async function checkPackagedRuntime({ app, net }) {
     runtime: platform.runtime,
     service: serverReady,
     terminal: server?.terminalHost?.ok === true && server?.terminalHost?.protocol === 1,
-    etna: etnaReady,
+    etna: etnaReady && (process.platform !== 'win32' || platform.etnaStartup === true),
     docker: platform.docker,
     workspace: platform.workspace,
     integration: platform.integration,

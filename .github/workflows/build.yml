@@ -66,6 +66,7 @@ jobs:
           ./scripts/windows-installer-regression.ps1
           ./scripts/windows-flow-regression.ps1
           ./scripts/windows-etna-regression.ps1
+          ./scripts/windows-etna-startup-regression.ps1
 
       - name: Validate headless source bootstrap
         if: matrix.os == 'ubuntu-latest'

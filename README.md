@@ -56,13 +56,40 @@ For development/private testing, `VULCAN_APPIMAGE_URL` together with `VULCAN_APP
 
 Etna deliberately stays on the desktop host on all three platforms so client-POV kits such as Playwright can interact with the user's real desktop/browser. The repair scripts establish uv-managed Python, Etna plus recommended kits (`web`, `playwright`, `ntfy`), the packaged Vulcan server runtime, Docker availability, and the Vulcan service.
 
+## Native OpenAI support
+
+Connections whose base URL has the exact hostname `api.openai.com` automatically
+use the Responses API (`/v1/responses`). Groq, OpenRouter, and other endpoints
+keep the Chat Completions path. Detection is based on the endpoint rather than
+the provider's display name; there is no adapter selector yet.
+
+OpenAI answer text streams into the normal Markdown transcript. Supported
+reasoning models request summaries with `summary: "auto"`; these appear in an
+expandable **Reasoning summary** panel with Markdown formatting. Responses with
+no summary text do not create an empty panel. Refusals appear as assistant text;
+failed, interrupted, and incomplete streams preserve their visible partial
+output and report their status rather than executing incomplete tool calls.
+
+Only Vulcan's function tools and enabled Etna tools are advertised. OpenAI-hosted
+web search, code execution, and image generation are disabled. User image inputs
+and images supplied by Vulcan tools continue through the existing image path.
+
+Requests use `store: false`. Complete Responses output items, including opaque
+reasoning state, are stored separately in the local chat database for tool
+continuation. They are not included in transcript snapshots, exports, or search.
+Replay is scoped to the endpoint/model/account/client and checked against the
+visible turn and preceding history. Edited or mismatched history falls back to
+ordinary messages and completed tool evidence; public summaries are not replayed
+as `<think>` text. This adapter applies to both server and desktop-client network
+paths, including title generation.
+
 ## Reasoning API compatibility
 
 Vulcan uses Chat Completions for inference. Reasoning request controls follow
 the endpoint's dialect: Groq Qwen uses `reasoning_format: "parsed"`, Groq
 GPT-OSS uses `include_reasoning: true`, and OpenRouter uses
-`reasoning: {"enabled": true}`. OpenAI and unknown/custom endpoints use model
-defaults without these optional extensions. Endpoint hostnames determine the
+`reasoning: {"enabled": true}`. Unknown/custom Chat Completions endpoints use model defaults without these
+optional extensions. Official OpenAI connections use the native adapter above. Endpoint hostnames determine the
 dialect; a provider's display name does not.
 
 Responses are parsed independently of that choice: `reasoning`,

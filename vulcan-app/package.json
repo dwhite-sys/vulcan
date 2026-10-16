@@ -16,6 +16,7 @@
     "electron:build": "npm run runtime:hash && npm run test:packaging && vite build && electron-builder --publish never",
     "electron:preview": "vite build && cross-env NODE_ENV=production electron .",
     "test:composer-controls": "node scripts/composer-controls-regression.mjs",
+    "test:openai-summary": "node scripts/openai-summary-regression.mjs",
     "test:transcript": "node --experimental-strip-types scripts/transcript-regression.ts",
     "test:sidebar-widths": "node scripts/sidebar-widths-regression.mjs",
     "test:sidebar": "node --experimental-strip-types scripts/sidebar-ordering-regression.ts",

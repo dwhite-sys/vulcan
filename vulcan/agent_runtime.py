@@ -25,7 +25,7 @@ from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit, urlunsplit
 from typing import Any, Awaitable, Callable
 
-from vulcan import chats, config as cfg, docker, terminal as term, workspace, etna_registry, title_classifier, network
+from vulcan import chats, config as cfg, docker, terminal as term, workspace, etna_registry, title_classifier, network, provider_reasoning
 
 logger = logging.getLogger("vulcan.agent")
 ASSETS = Path(__file__).parent / "agent_assets"
@@ -614,13 +614,13 @@ class ProviderStreamParser:
         details = delta.get("reasoning_details")
         dedicated = ""
         wire = None
-        if details is not None:
+        if isinstance(details, list) and details:
             wire = "reasoning_details"
             self.reasoning_details.extend(details)
             dedicated = "".join(str(item.get("text") or item.get("summary") or "") for item in details)
-        else:
+        if not dedicated:
             for key in ("reasoning", "reasoning_content", "thinking"):
-                if key in delta:
+                if isinstance(delta.get(key), str) and delta[key]:
                     wire = key
                     dedicated = delta.get(key) or ""
                     break
@@ -1529,14 +1529,31 @@ async def _provider_response(run: AgentRun, messages: list[dict[str, Any]], tool
 
 
 async def _provider_response_stream(run: AgentRun, messages: list[dict[str, Any]], tools: list[dict[str, Any]], turn_id: str, *, first_data: asyncio.Event) -> dict[str, Any]:
+    provider = run.options.get("provider") or cfg.load().get("inference", {})
+    controls = provider_reasoning.request_controls(provider)
+    # Each retry removes one optional control, so this loop is bounded. Never
+    # replay a stream once any data (including reasoning/tool fragments) arrived.
+    while True:
+        try:
+            return await _provider_response_stream_once(
+                run, messages, tools, turn_id, first_data=first_data, reasoning_controls=controls)
+        except (ValueError, RuntimeError) as exc:
+            field = provider_reasoning.rejected_control(exc, controls)
+            if first_data.is_set() or field is None:
+                raise
+            controls.pop(field)
+            provider_reasoning.remember_rejection(provider, field)
+            logger.info("Provider rejected optional %s control; retrying without it", field)
+
+
+async def _provider_response_stream_once(run: AgentRun, messages: list[dict[str, Any]], tools: list[dict[str, Any]], turn_id: str, *, first_data: asyncio.Event, reasoning_controls: dict[str, Any]) -> dict[str, Any]:
     import httpx
     provider = run.options.get("provider") or cfg.load().get("inference", {})
     base_url = provider.get("baseUrl") or provider.get("base_url") or ""
     model = provider.get("model") or ""
     if not base_url or not model:
         raise ValueError("LLM not configured. Go to Settings → Providers to add an endpoint and API key.")
-    body: dict[str, Any] = {"model": model, "messages": messages, "stream": True,
-                            "reasoning": {"enabled": True}, "include_reasoning": True}
+    body: dict[str, Any] = {"model": model, "messages": messages, "stream": True, **reasoning_controls}
     if tools:
         body["tools"] = [{"type": "function", "function": {"name": tool["name"], "description": tool.get("description", ""),
                                                            "parameters": tool.get("parameters", {})}} for tool in tools]

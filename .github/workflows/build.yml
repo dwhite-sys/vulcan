@@ -87,7 +87,7 @@ jobs:
 
       - name: Validate agent continuation and provider recovery
         if: matrix.os == 'ubuntu-latest'
-        run: python -m unittest vulcan.tests.test_agent_runtime vulcan.tests.test_provider_client_relay
+        run: python -m unittest vulcan.tests.test_agent_runtime vulcan.tests.test_provider_client_relay vulcan.tests.test_provider_reasoning
         env:
           PYTHONPATH: ..
 

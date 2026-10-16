@@ -2244,8 +2244,8 @@ class BackgroundAgentTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(captured["url"], "http://provider.test/v1/chat/completions")
         self.assertEqual(captured["headers"]["Authorization"], "Bearer wire-secret")
-        self.assertEqual(captured["body"]["reasoning"], {"enabled": True})
-        self.assertTrue(captured["body"]["include_reasoning"])
+        self.assertNotIn("reasoning", captured["body"])
+        self.assertNotIn("include_reasoning", captured["body"])
         self.assertEqual(captured["body"]["tool_choice"], "auto")
         self.assertEqual(captured["body"]["tools"][0]["function"]["name"], "visualize")
         self.assertEqual(result["thinking"], "hidden")

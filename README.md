@@ -56,6 +56,31 @@ For development/private testing, `VULCAN_APPIMAGE_URL` together with `VULCAN_APP
 
 Etna deliberately stays on the desktop host on all three platforms so client-POV kits such as Playwright can interact with the user's real desktop/browser. The repair scripts establish uv-managed Python, Etna plus recommended kits (`web`, `playwright`, `ntfy`), the packaged Vulcan server runtime, Docker availability, and the Vulcan service.
 
+## Reasoning API compatibility
+
+Vulcan uses Chat Completions for inference. Reasoning request controls follow
+the endpoint's dialect: Groq Qwen uses `reasoning_format: "parsed"`, Groq
+GPT-OSS uses `include_reasoning: true`, and OpenRouter uses
+`reasoning: {"enabled": true}`. OpenAI and unknown/custom endpoints use model
+defaults without these optional extensions. Endpoint hostnames determine the
+dialect; a provider's display name does not.
+
+Responses are parsed independently of that choice: `reasoning`,
+`reasoning_content`, `thinking`, `reasoning_details`, and streamed `<think>`
+blocks are supported. Vulcan can display only reasoning the provider returns;
+enabling a request control does not guarantee visible reasoning.
+
+If an endpoint explicitly rejects an optional reasoning property with HTTP
+400/422 before streaming starts, Vulcan retries without that property and
+remembers the rejection for one hour for that endpoint/model/client. Other
+errors propagate, and streams that have already produced data are not replayed
+by this compatibility fallback. Custom gateways use model defaults until a
+specific dialect is implemented; Vulcan does not probe them with paid requests.
+
+References: [Groq reasoning](https://console.groq.com/docs/reasoning),
+[OpenAI reasoning](https://developers.openai.com/api/docs/guides/reasoning?api-mode=chat),
+[OpenRouter reasoning](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens).
+
 ## Build
 
 ```bash

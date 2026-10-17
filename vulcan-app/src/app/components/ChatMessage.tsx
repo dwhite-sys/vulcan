@@ -378,7 +378,7 @@ function formatThinkDuration(ms: number): string {
   return secs === 1 ? '1 second' : `${secs} seconds`;
 }
 
-export function ThinkingStep({ thinking, streaming, durationMs }: { thinking: string; streaming?: boolean; durationMs?: number }) {
+export function ThinkingStep({ thinking, streaming, durationMs, summary = false }: { thinking: string; streaming?: boolean; durationMs?: number; summary?: boolean }) {
   const [open, setOpen] = useState(false);
   const userControlled = useRef(false);
   const startedAtRef = useRef<number | null>(null);
@@ -432,13 +432,13 @@ export function ThinkingStep({ thinking, streaming, durationMs }: { thinking: st
           : <ChevronRight className="w-3 h-3 text-ash-600 flex-shrink-0" />}
         <Brain className="w-3.5 h-3.5 text-ash-500 flex-shrink-0" />
         <span className={`text-xs ${streaming ? 'shimmer' : 'text-ash-500 group-hover:text-ash-300 transition-colors'}`}>
-          {streaming ? 'Thinking…' : durationLabel}
+          {summary ? (streaming ? 'Reasoning summary…' : 'Reasoning summary') : (streaming ? 'Thinking…' : durationLabel)}
         </span>
       </button>
       {open && (
         <div className="mt-1 mb-2 pr-1">
           <div className="px-3 py-2 rounded-lg bg-ash-900/60 border border-ash-700/40">
-            <p className="text-xs text-ash-500 leading-relaxed whitespace-pre-wrap font-mono">{thinking}</p>
+            <div className="text-xs text-ash-500 leading-relaxed">{summary ? <MarkdownRenderer content={thinking} /> : <p className="whitespace-pre-wrap font-mono">{thinking}</p>}</div>
           </div>
         </div>
       )}

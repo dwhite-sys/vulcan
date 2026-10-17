@@ -66,6 +66,7 @@ jobs:
           ./scripts/windows-installer-regression.ps1
           ./scripts/windows-flow-regression.ps1
           ./scripts/windows-etna-regression.ps1
+          ./scripts/windows-etna-startup-regression.ps1
 
       - name: Validate headless source bootstrap
         if: matrix.os == 'ubuntu-latest'
@@ -87,7 +88,7 @@ jobs:
 
       - name: Validate agent continuation and provider recovery
         if: matrix.os == 'ubuntu-latest'
-        run: python -m unittest vulcan.tests.test_agent_runtime vulcan.tests.test_provider_client_relay vulcan.tests.test_provider_reasoning
+        run: python -m unittest vulcan.tests.test_agent_runtime vulcan.tests.test_provider_client_relay vulcan.tests.test_provider_reasoning vulcan.tests.test_openai_responses
         env:
           PYTHONPATH: ..
 
@@ -109,6 +110,7 @@ jobs:
           npx playwright install --with-deps chromium
           npm run test:terminal-resize
           npm run build
+          npm run test:openai-summary
           npm run test:composer-controls
           npm run test:sidebar-widths
           npm run test:update-prompt

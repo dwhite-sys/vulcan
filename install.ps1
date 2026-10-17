@@ -4,8 +4,59 @@ param(
     [string]$ResourcesDir = "",
     [string]$Version = "unknown",
     [switch]$Json,
-    [switch]$ElevatedWslBootstrap
+    [switch]$ElevatedWslBootstrap,
+    [switch]$CheckEtnaStartup
 )
+
+function Get-HostEtnaRoot {
+    if ($env:ETNA_CONFIG_DIR) { return $env:ETNA_CONFIG_DIR }
+    if ($env:APPDATA) { return Join-Path $env:APPDATA "Etna" }
+    return Join-Path $HOME "AppData\Roaming\Etna"
+}
+
+function Test-EtnaStartupDefinition([xml]$Definition, [string]$UserSid, [string]$EtnaRoot) {
+    try {
+        $ns = New-Object Xml.XmlNamespaceManager($Definition.NameTable)
+        $ns.AddNamespace('t', 'http://schemas.microsoft.com/windows/2004/02/mit/task')
+        $task = $Definition.SelectSingleNode('/t:Task', $ns)
+        if (-not $task -or -not $UserSid) { return $false }
+        if ($task.SelectSingleNode('t:Settings/t:Enabled', $ns).InnerText -in @('false', '0')) { return $false }
+        $logon = @($task.SelectNodes('t:Triggers/t:LogonTrigger', $ns)) | Where-Object {
+            $_.SelectSingleNode('t:UserId', $ns).InnerText -eq $UserSid -and
+            $_.SelectSingleNode('t:Enabled', $ns).InnerText -notin @('false', '0')
+        }
+        if (-not $logon) { return $false }
+        $principal = $task.SelectSingleNode('t:Principals/t:Principal', $ns)
+        if ($principal.SelectSingleNode('t:UserId', $ns).InnerText -ne $UserSid -or
+            $principal.SelectSingleNode('t:LogonType', $ns).InnerText -ne 'InteractiveToken') { return $false }
+        $action = $task.SelectSingleNode('t:Actions/t:Exec', $ns)
+        $command = $action.SelectSingleNode('t:Command', $ns).InnerText
+        $launcher = Join-Path $EtnaRoot 'service_launcher.py'
+        $python = Join-Path (Join-Path (Join-Path $EtnaRoot 'venv') 'Scripts') 'pythonw.exe'
+        return $command -ieq $python -and
+            $action.SelectSingleNode('t:Arguments', $ns).InnerText.Trim('"') -ieq $launcher -and
+            $action.SelectSingleNode('t:WorkingDirectory', $ns).InnerText -ieq $EtnaRoot -and
+            (Test-Path $command -PathType Leaf) -and (Test-Path $launcher -PathType Leaf)
+    } catch { return $false }
+}
+
+function Test-EtnaStartupTask {
+    $ErrorActionPreference = 'Continue'
+    try {
+        $taskXml = (& schtasks.exe /Query /TN EtnaMCPServer /XML 2>$null | Out-String)
+        if ($LASTEXITCODE -ne 0) { return $false }
+        $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        $root = [IO.Path]::GetFullPath((Get-HostEtnaRoot)).TrimEnd('\')
+        return Test-EtnaStartupDefinition ([xml]$taskXml) $sid $root
+    } catch { return $false }
+}
+
+# Read-only probe shared with Electron. Run before creating directories or
+# changing the environment so a healthy desktop launch has no repair effects.
+if ($CheckEtnaStartup) {
+    if (Test-EtnaStartupTask) { exit 0 }
+    exit 1
+}
 
 $ErrorActionPreference = "Stop"
 # Match Microsoft's WSL diagnostics: avoid UTF-16/NUL and code-page corruption.
@@ -291,12 +342,19 @@ function Install-EtnaIfAbsent {
 function Ensure-HostEtna {
     # Etna is native Windows so Playwright can drive the user's visible host Chrome.
     # Vulcan only asks it to converge itself; Vulcan neither owns Etna's venv/runtime nor installs Etna kits.
-    $etnaRoot = Join-Path $HOME ".etna_server"
+    $etnaRoot = Get-HostEtnaRoot
     $existing = (Test-Path $etnaRoot -PathType Container) -and
         (Test-Path (Join-Path $etnaRoot "config.json") -PathType Leaf) -and
         (Test-Path (Join-Path $etnaRoot "kits") -PathType Container)
 
-    if (-not $existing) {
+    $healthy = Test-EtnaHealth
+    $startupReady = Test-EtnaStartupTask
+    if ($healthy -and $startupReady) {
+        Write-Step "Etna ready"
+        return
+    }
+
+    if (-not $existing -and -not $healthy) {
         if (-not (Install-EtnaIfAbsent)) {
             Write-Warning "Etna failed: package installation failed"
             Write-Step "Etna failed"
@@ -304,12 +362,7 @@ function Ensure-HostEtna {
         }
     }
 
-    if (Test-EtnaHealth) {
-        Write-Step "Etna ready"
-        return
-    }
-
-    if ($existing) {
+    if ($existing -and $startupReady) {
         try { $null = Invoke-EtnaModule "start" } catch { }
         if (Wait-EtnaHealth) {
             Write-Step "Etna ready"
@@ -321,12 +374,12 @@ function Ensure-HostEtna {
     try { $initCode = Invoke-EtnaModule "init" }
     catch { Write-Warning "Etna init failed: $($_.Exception.Message)" }
 
-    if ($initCode -eq 0 -and (Wait-EtnaHealth)) {
+    if ($initCode -eq 0 -and (Wait-EtnaHealth) -and (Test-EtnaStartupTask)) {
         Write-Step "Etna ready"
         return
     }
 
-    if ($initCode -eq 0) { Write-Warning "Etna failed: init completed but the health check did not pass" }
+    if ($initCode -eq 0) { Write-Warning "Etna failed: init completed but server health or login startup verification did not pass. Run etna logs and check the EtnaMCPServer scheduled task." }
     else { Write-Warning "Etna failed: init exited with code $initCode" }
     Write-Step "Etna failed"
     return

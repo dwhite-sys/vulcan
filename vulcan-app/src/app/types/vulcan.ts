@@ -169,7 +169,7 @@ export interface ReasoningEvent extends BaseChatEvent {
   content: string;
   status: EventStatus;
   reasoningDetails?: any[];
-  reasoningWire?: 'reasoning' | 'reasoning_content' | 'reasoning_details' | 'thinking' | 'inline';
+  reasoningWire?: 'reasoning' | 'reasoning_content' | 'reasoning_details' | 'thinking' | 'inline' | 'summary';
   completedAt?: Date;
 }
 

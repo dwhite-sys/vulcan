@@ -503,6 +503,13 @@ def _ensure_schema(connection: sqlite3.Connection) -> None:
             PRIMARY KEY (chat_id, event_id),
             UNIQUE (chat_id, position)
         );
+        CREATE TABLE IF NOT EXISTS provider_responses (
+            chat_id TEXT NOT NULL,
+            turn_id TEXT NOT NULL,
+            provider_key TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            PRIMARY KEY (chat_id, turn_id, provider_key)
+        );
         CREATE INDEX IF NOT EXISTS chat_events_run ON chat_events(chat_id, run_id, position);
         CREATE INDEX IF NOT EXISTS chats_updated ON chats(updated_at DESC);
         CREATE TABLE IF NOT EXISTS branch_events (
@@ -1202,6 +1209,7 @@ def delete_chat(chat_id: str) -> bool:
     Returns True if the file existed and was deleted.
     """
     with _DB_LOCK, _database() as connection:
+        connection.execute("DELETE FROM provider_responses WHERE chat_id = ?", (chat_id,))
         keys = [row[0] for row in connection.execute("SELECT key FROM fts_rowids WHERE chat_id = ?", (chat_id,))]
         connection.executemany("DELETE FROM chat_search WHERE rowid = ?", [(key,) for key in keys])
         connection.executemany("DELETE FROM transcript_search WHERE rowid = ?", [(key,) for key in keys])
@@ -1512,3 +1520,20 @@ def search_chat_ids(query: str) -> list[str]:
         row["id"] for row in rows
         if all(word in f"{row['title'] or ''} {row['tags']}".lower() for word in words)
     ]
+
+
+def save_provider_response(chat_id: str, turn_id: str, provider_key: str, record: dict) -> None:
+    """Private continuation state: never included in chat payloads or search."""
+    with _DB_LOCK, _database() as connection:
+        connection.execute(
+            'INSERT OR REPLACE INTO provider_responses(chat_id,turn_id,provider_key,payload_json) VALUES(?,?,?,?)',
+            (chat_id, turn_id, provider_key, json.dumps(record, ensure_ascii=False)),
+        )
+
+
+def load_provider_responses(chat_id: str, provider_key: str) -> dict[str, dict]:
+    with _DB_LOCK, _database() as connection:
+        return {row['turn_id']: json.loads(row['payload_json']) for row in connection.execute(
+            'SELECT turn_id,payload_json FROM provider_responses WHERE chat_id = ? AND provider_key = ?',
+            (chat_id, provider_key),
+        )}

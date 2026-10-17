@@ -3,7 +3,7 @@ $source = Join-Path $PSScriptRoot '..\..\install.ps1'
 $tokens = $null; $errors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($source, [ref]$tokens, [ref]$errors)
 if ($errors.Count) { throw ($errors | Out-String) }
-foreach ($name in @('Get-EtnaInitializationVerb', 'Invoke-EtnaModule', 'Get-HostEtnaCommand', 'Install-EtnaIfAbsent', 'Wait-EtnaHealth', 'Ensure-HostEtna')) {
+foreach ($name in @('Get-HostEtnaRoot', 'Get-EtnaInitializationVerb', 'Invoke-EtnaModule', 'Get-HostEtnaCommand', 'Install-EtnaIfAbsent', 'Wait-EtnaHealth', 'Ensure-HostEtna')) {
     $node = $ast.Find({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $true)
     Invoke-Expression $node.Extent.Text
 }
@@ -70,17 +70,39 @@ try {
     $script:checks = 0
     function Test-EtnaHealth { $script:checks++; return $script:checks -ge 3 }
     if (-not (Wait-EtnaHealth) -or $script:checks -ne 3) { throw 'Etna startup readiness was not awaited' }
-    # An existing home should start itself without acquiring packages or reinitializing.
+    # A healthy HTTP endpoint is insufficient when the login task is missing.
+    function Get-HostEtnaRoot { return $root }
     function Test-Path {
         param($Path, $PathType)
-        if ([string]$Path -match '\.etna_server') { return $true }
-        return Microsoft.PowerShell.Management\Test-Path $Path -PathType $PathType
+        return $script:existingHome
     }
-    function Install-EtnaIfAbsent { throw 'Existing Etna was reinstalled' }
-    $script:checks = 0; $script:verbs = @()
-    function Invoke-EtnaModule { param($Verb) $script:verbs += $Verb; return 0 }
-    Ensure-HostEtna
-    if ($script:verbs.Count -ne 1 -or $script:verbs[0] -ne 'start') { throw 'Existing Etna was not started idempotently' }
+    function Test-EtnaHealth { return $script:healthy }
+    function Test-EtnaStartupTask { return $script:startupReady }
+    function Install-EtnaIfAbsent { $script:acquisitions++; return $true }
+    function Invoke-EtnaModule {
+        param($Verb)
+        $script:verbs += $Verb
+        if ($Verb -eq 'init') { $script:startupReady = $true }
+        $script:healthy = $true
+        return 0
+    }
+    foreach ($case in @(
+        @{ existing=$true; healthy=$true; startup=$false; verb='init'; acquire=0 },
+        @{ existing=$true; healthy=$false; startup=$false; verb='init'; acquire=0 },
+        @{ existing=$true; healthy=$false; startup=$true; verb='start'; acquire=0 },
+        @{ existing=$true; healthy=$true; startup=$true; verb=''; acquire=0 },
+        @{ existing=$false; healthy=$false; startup=$false; verb='init'; acquire=1 },
+        @{ existing=$false; healthy=$true; startup=$false; verb='init'; acquire=0 }
+    )) {
+        $script:existingHome = $case.existing
+        $script:healthy = $case.healthy
+        $script:startupReady = $case.startup
+        $script:verbs = @(); $script:acquisitions = 0
+        Ensure-HostEtna
+        if (($script:verbs -join ',') -ne $case.verb -or $script:acquisitions -ne $case.acquire) {
+            throw "Etna startup convergence failed: $($case | Out-String)"
+        }
+    }
 } finally {
     $env:UV_PYTHON_INSTALL_DIR = $oldPython
     $env:UV_TOOL_DIR = $oldTools

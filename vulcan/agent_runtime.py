@@ -25,7 +25,7 @@ from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit, urlunsplit
 from typing import Any, Awaitable, Callable
 
-from vulcan import chats, config as cfg, docker, terminal as term, workspace, etna_registry, title_classifier, network, provider_reasoning
+from vulcan import chats, config as cfg, docker, terminal as term, workspace, etna_registry, title_classifier, network, provider_reasoning, openai_responses
 
 logger = logging.getLogger("vulcan.agent")
 ASSETS = Path(__file__).parent / "agent_assets"
@@ -470,9 +470,10 @@ def _user_content(event: dict[str, Any], content: str | None = None) -> Any:
     return parts
 
 
-def project_history(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def project_history(events: list[dict[str, Any]], responses_records: dict | None = None) -> list[dict[str, Any]]:
     """Rebuild provider history without evicting reasoning or tool exchanges."""
     output: list[dict[str, Any]] = []
+    prefixes = openai_responses.history_prefixes(events) if responses_records else []
     index = 0
     while index < len(events):
         event = events[index]
@@ -491,12 +492,14 @@ def project_history(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if not turn_id:
             index += 1
             continue
+        group_start = index
         group: list[dict[str, Any]] = []
         while index < len(events) and events[index].get("turnId") == turn_id:
             group.append(events[index])
             index += 1
         text = "".join(item.get("content", "") for item in group if item.get("type") == "assistant_text")
-        thinking = "".join(item.get("content", "") for item in group if item.get("type") == "reasoning")
+        thinking = "".join(item.get("content", "") for item in group
+                           if item.get("type") == "reasoning" and item.get("reasoningWire") != "summary")
         # A cancelled stream may leave only fragments of a tool call. Keep
         # those events visible, but do not send invalid calls to the provider.
         tools = [item for item in group if item.get("type") == "tool"
@@ -505,16 +508,19 @@ def project_history(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
         for item in fragments:
             fragment = json.dumps({"tool": item.get("tool", ""), "arguments": item.get("rawArguments", "")}, ensure_ascii=False)
             text += f"\n[Interrupted tool fragment, not a complete provider call: {fragment}]"
-        if text or thinking or tools:
+        record = (responses_records or {}).get(turn_id)
+        if text or thinking or tools or record:
             # Match the active-run representation so rebuilding a saved chat
             # carries the same reasoning, assistant text, and tool identities.
-            content = f"<think>{thinking}</think>{text}" if thinking else (text or None)
+            content = f"<think>{thinking}</think>{text}" if thinking and responses_records is None else (text or None)
             assistant: dict[str, Any] = {"role": "assistant", "content": content}
             if tools:
                 assistant["tool_calls"] = [item.get("rawToolCall") or {
                     "id": item.get("callId"), "type": "function",
                     "function": {"name": item.get("tool"), "arguments": item.get("rawArguments") or json.dumps(item.get("arguments", {}), separators=(",", ":"))},
                 } for item in tools]
+            if record and record.get("prefix") == prefixes[group_start] and record.get("visible") == openai_responses.history_digest(group, visible=True):
+                assistant = {"role": "assistant", "_responses_output": record["output"]}
             output.append(assistant)
             for item in tools:
                 result = item.get("result")
@@ -703,6 +709,7 @@ class AgentRun:
     sequence: int = 0
     active_semantic_id: str | None = None
     active_semantic_type: str | None = None
+    active_semantic_key: str | None = None
     streamed_tool_ids: dict[int, str] = field(default_factory=dict)
     dirty: bool = False
     persistence_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -997,7 +1004,7 @@ class AgentRun:
         kind = event.get("type")
         if kind in ("reasoning_delta", "text_delta"):
             semantic = "reasoning" if kind == "reasoning_delta" else "assistant_text"
-            if self.active_semantic_type != semantic:
+            if self.active_semantic_type != semantic or self.active_semantic_key != event.get("itemKey"):
                 self.seal_semantic()
                 item = {"id": self.event_id(semantic), "type": semantic, "content": "", "status": "streaming",
                         "timestamp": now(), "runId": self.run_id, "turnId": turn_id}
@@ -1006,6 +1013,7 @@ class AgentRun:
                 self.events.append(item)
                 self.active_semantic_id = item["id"]
                 self.active_semantic_type = semantic
+                self.active_semantic_key = event.get("itemKey")
                 self._stream(item)
                 self._publish_stream_event(item)
             item = self.live_events[self.active_semantic_id]
@@ -1049,6 +1057,7 @@ class AgentRun:
                 self._publish_stream_event(item)
         self.active_semantic_id = None
         self.active_semantic_type = None
+        self.active_semantic_key = None
 
 
 class RunManager:
@@ -1445,6 +1454,9 @@ async def _provider_title(run: AgentRun, user_message: str) -> str:
     compatible_body.pop("reasoning_effort", None)
     compatible_body["max_tokens"] = 256
     attempts: list[tuple[dict[str, Any], str]] = [(body, "reasoning-disabled"), (compatible_body, "provider-neutral")]
+    if openai_responses.uses_responses(provider):
+        endpoint = base_url.rstrip("/") + "/responses"
+        attempts = [(openai_responses.request_body(provider, messages, [], title=True), "responses")]
     failures: list[str] = []
     for request, protocol in attempts:
         try:
@@ -1467,6 +1479,13 @@ async def _provider_title(run: AgentRun, user_message: str) -> str:
                 )
                 response.raise_for_status()
                 data = response.json()
+            if protocol == "responses":
+                if data.get("status") != "completed":
+                    raise ValueError("OpenAI title response did not complete")
+                title = openai_responses.response_text(data).strip().strip("\"'“”‘’ \t\r\n")
+                if title:
+                    return title.splitlines()[0][:60]
+                raise ValueError("OpenAI title response contained no text")
             choice = (data.get("choices") or [{}])[0]
             message = choice.get("message") or {}
             finish_reason = choice.get("finish_reason")
@@ -1530,6 +1549,8 @@ async def _provider_response(run: AgentRun, messages: list[dict[str, Any]], tool
 
 async def _provider_response_stream(run: AgentRun, messages: list[dict[str, Any]], tools: list[dict[str, Any]], turn_id: str, *, first_data: asyncio.Event) -> dict[str, Any]:
     provider = run.options.get("provider") or cfg.load().get("inference", {})
+    if openai_responses.uses_responses(provider):
+        return await _provider_responses_stream(run, messages, tools, turn_id, first_data=first_data)
     controls = provider_reasoning.request_controls(provider)
     # Each retry removes one optional control, so this loop is bounded. Never
     # replay a stream once any data (including reasoning/tool fragments) arrived.
@@ -1544,6 +1565,67 @@ async def _provider_response_stream(run: AgentRun, messages: list[dict[str, Any]
             controls.pop(field)
             provider_reasoning.remember_rejection(provider, field)
             logger.info("Provider rejected optional %s control; retrying without it", field)
+
+
+async def _provider_responses_stream(run: AgentRun, messages: list[dict[str, Any]], tools: list[dict[str, Any]], turn_id: str, *, first_data: asyncio.Event) -> dict[str, Any]:
+    import httpx
+    provider = run.options.get("provider") or cfg.load().get("inference", {})
+    base_url = provider.get("baseUrl") or provider.get("base_url") or ""
+    if not base_url or not provider.get("model"):
+        raise ValueError("LLM not configured. Go to Settings → Providers to add an endpoint and API key.")
+    endpoint = base_url.rstrip("/") + "/responses"
+    headers = {"Content-Type": "application/json"}
+    key = provider.get("apiKey") or provider.get("api_key")
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    body = await asyncio.to_thread(openai_responses.request_body, provider, messages, tools)
+    for attempt in range(2):
+        parser = openai_responses.ResponsesParser(lambda event: run.stream_event(event, turn_id))
+        encoded = await asyncio.to_thread(dumps_chunked, body)
+        try:
+            if provider.get("networkPointOfView") == "client":
+                client_id = provider.get("clientId")
+                if not client_id:
+                    raise RuntimeError("Client provider has no connected Vulcan client")
+                stream = etna_registry.relay_http_stream(
+                    str(client_id), endpoint, "POST", headers=headers, body=encoded,
+                    timeout=3600, idle_timeout=PROVIDER_IDLE_TIMEOUT_SECONDS)
+                try:
+                    async for chunk in stream:
+                        if chunk:
+                            first_data.set()
+                        parser.feed(chunk)
+                        if parser.completed:
+                            break
+                finally:
+                    close = getattr(stream, "aclose", None)
+                    if close is not None:
+                        await close()
+            else:
+                client = await network.client()
+                async with client.stream(
+                    "POST", endpoint, content=encoded.encode("utf-8"), headers=headers,
+                    timeout=httpx.Timeout(PROVIDER_IDLE_TIMEOUT_SECONDS, connect=10.0, pool=5.0),
+                ) as response:
+                    if response.status_code >= 400:
+                        detail = (await response.aread()).decode("utf-8", errors="replace")
+                        raise ValueError(f"LLM error {response.status_code}: {detail}")
+                    # Headers prove acceptance; a long hidden reasoning phase
+                    # must not trigger the pre-data retry and duplicate a request.
+                    first_data.set()
+                    async for chunk in response.aiter_text():
+                        parser.feed(chunk)
+                        if parser.completed:
+                            break
+            return parser.finish()
+        except (ValueError, RuntimeError) as exc:
+            if attempt or first_data.is_set() or "summary" not in body.get("reasoning", {}) or not openai_responses.unsupported_summary(exc):
+                raise
+            body.get("reasoning", {}).pop("summary", None)
+            if not body.get("reasoning"):
+                body.pop("reasoning", None)
+            logger.info("Provider does not support reasoning summaries; retrying without summary")
+    raise RuntimeError("OpenAI response could not be created")
 
 
 async def _provider_response_stream_once(run: AgentRun, messages: list[dict[str, Any]], tools: list[dict[str, Any]], turn_id: str, *, first_data: asyncio.Event, reasoning_controls: dict[str, Any]) -> dict[str, Any]:
@@ -1800,7 +1882,10 @@ async def execute_run(run: AgentRun):
     # the run, so project it in a worker instead of stalling the loop that
     # serves every other client.
     history = list(run.events if run.options.get("resume") else run.events[:-1])
-    projected = await asyncio.to_thread(project_history, history)
+    provider = run.options.get("provider") or cfg.load().get("inference", {})
+    responses = openai_responses.uses_responses(provider)
+    records = await chats.run_db(chats.load_provider_responses, run.chat["id"], openai_responses.provider_key(provider)) if responses else None
+    projected = await asyncio.to_thread(project_history, history, records)
     messages = [{"role": "system", "content": build_prompt(run.chat, settings, kits, enabled, disabled_tools)},
                 *projected]
     if run.options.get("resume"):
@@ -1869,10 +1954,21 @@ async def execute_run(run: AgentRun):
                           "rawArguments": call["function"].get("arguments", ""), "rawToolCall": call, "status": "running"})
             run._publish_stream_event(event)
         thinking = response.get("thinking")
-        content = f"<think>{thinking}</think>{response.get('content') or ''}" if thinking else (response.get("content") or None)
+        content = f"<think>{thinking}</think>{response.get('content') or ''}" if thinking and not responses else (response.get("content") or None)
         assistant = {"role": "assistant", "content": content}
         if calls:
             assistant["tool_calls"] = calls
+        if responses and "responsesOutput" in response:
+            # Store the exact wire items separately from UI/search/export data.
+            # Match both preceding context and this turn before replaying after
+            # reload, edits or branch switches. No opaque state crosses models.
+            boundary = next((i for i, event in enumerate(run.events) if event.get("turnId") == turn_id), len(run.events))
+            record = {"prefix": openai_responses.history_digest(run.events[:boundary]),
+                      "visible": openai_responses.history_digest(run.events[boundary:], visible=True),
+                      "output": response["responsesOutput"]}
+            await chats.run_db(chats.save_provider_response, run.chat["id"], turn_id,
+                               openai_responses.provider_key(provider), record)
+            assistant = {"role": "assistant", "_responses_output": response["responsesOutput"]}
         messages.append(assistant)
         if not calls:
             if apply_followups(run, messages, include_queue=True):

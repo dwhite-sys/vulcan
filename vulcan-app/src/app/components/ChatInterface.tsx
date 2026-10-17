@@ -795,6 +795,9 @@ export function ChatInterface({
               searchQuery={searchQuery}
               activeSearchMatch={activeSearchMatch}
             />
+            {isProcessing && !questionBatch && !events.some((event) => 'status' in event && (event.status === 'streaming' || event.status === 'running')) && (
+              <div role="status" aria-live="polite" className="px-4 py-2 text-xs text-ash-500 shimmer">Working…</div>
+            )}
           </div>
         )}
       </div>

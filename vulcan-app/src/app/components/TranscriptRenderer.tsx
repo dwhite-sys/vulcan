@@ -73,7 +73,7 @@ function ActionGroup({ events, isProcessing, activeSearchEventId }: { events: (R
   const tools = events.filter((e): e is ToolEvent => e.type === 'tool').map((e) => e.tool);
   const uniqueTools = [...new Set(tools)];
   const labelParts: string[] = [];
-  if (hasThought) labelParts.push('Thought');
+  if (hasThought) labelParts.push(events.some((e) => e.type === 'reasoning' && e.reasoningWire === 'summary') ? 'Reasoning summary' : 'Thought');
   if (uniqueTools.length <= 2) labelParts.push(...uniqueTools);
   else if (uniqueTools.length) labelParts.push(`${uniqueTools[0]}, +${uniqueTools.length - 1} more`);
   const label = labelParts.join(' · ') || 'Action';
@@ -95,6 +95,7 @@ function ActionGroup({ events, isProcessing, activeSearchEventId }: { events: (R
             <div key={event.id} data-transcript-search-event-id={event.id}>
             <ThinkingStep
               thinking={event.content}
+              summary={event.reasoningWire === 'summary'}
               streaming={event.status === 'streaming'}
               durationMs={event.completedAt ? event.completedAt.getTime() - event.timestamp.getTime() : undefined}
             />

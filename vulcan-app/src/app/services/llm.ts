@@ -18,7 +18,7 @@ export interface ProviderConfig {
 }
 
 
-export type ReasoningWire = 'reasoning' | 'reasoning_content' | 'reasoning_details' | 'thinking' | 'inline';
+export type ReasoningWire = 'reasoning' | 'reasoning_content' | 'reasoning_details' | 'thinking' | 'inline' | 'summary';
 
 export type LLMStreamEvent =
   | { type: 'reasoning_delta'; delta: string; wire?: ReasoningWire; details?: any[] }
@@ -136,7 +136,7 @@ export class LLMClient {
     tools: Tool[] = [],
     onStreamEvent?: (event: LLMStreamEvent) => void,
     signal?: AbortSignal
-  ): Promise<{ content: string; thinking?: string; reasoningDetails?: any[]; reasoningWire?: 'reasoning' | 'reasoning_content' | 'reasoning_details' | 'thinking' | 'inline'; toolCalls?: any[] }> {
+  ): Promise<{ content: string; thinking?: string; reasoningDetails?: any[]; reasoningWire?: 'reasoning' | 'reasoning_content' | 'reasoning_details' | 'thinking' | 'inline' | 'summary'; toolCalls?: any[] }> {
     const url = `${this.config.baseUrl.replace(/\/$/, '')}/chat/completions`;
 
     const body: any = {

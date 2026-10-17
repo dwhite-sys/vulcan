@@ -37,11 +37,10 @@ class ReasoningTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(config=config):
                 self.assertEqual(reasoning.request_controls(config), expected)
 
-    async def test_groq_and_openai_wire_requests(self):
+    async def test_groq_and_custom_chat_wire_requests(self):
         # Exercise the real HTTP/SSE path with the formerly failing Groq model,
-        # Groq GPT-OSS, OpenAI and a strict custom OpenAI-compatible endpoint.
+        # Groq GPT-OSS and a strict custom OpenAI-compatible endpoint.
         for config in [provider(), provider(model="openai/gpt-oss-20b"),
-                       provider(base="https://api.openai.com/v1"),
                        provider(base="http://localhost:1234/v1")]:
             requests = []
 

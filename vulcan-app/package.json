@@ -1,7 +1,7 @@
 {
   "name": "vulcan",
   "private": true,
-  "version": "1.0.0-rc.50",
+  "version": "1.0.0-rc.52",
   "type": "module",
   "main": "electron/main.cjs",
   "author": {
@@ -72,6 +72,8 @@
     "test:version": "node scripts/version-regression.mjs",
     "test:update-prompt": "node scripts/update-prompt-regression.mjs",
     "test:updates": "node scripts/update-regression.mjs",
+    "test:chat-loading": "node --experimental-strip-types scripts/chat-loading-regression.ts",
+    "test:chat-loading-ui": "node scripts/chat-loading-ui-regression.mjs",
     "test:run-stream": "node --experimental-strip-types scripts/run-stream-regression.ts",
     "test:run-start": "node scripts/run-start-regression.mjs",
     "test:client-relay": "node --experimental-strip-types scripts/client-relay-backpressure-regression.ts",

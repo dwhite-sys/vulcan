@@ -13,7 +13,7 @@ assert.match(app, /generalWS\.connected && vulcan\.generalWS\.authenticated[\s\S
   'Hydration must also run when the authenticated socket connected before React subscribed');
 assert.match(app, /Promise\.all\(\[loadChats\(\), loadChatFolders\(\)\]\)/);
 assert.doesNotMatch(app, /providers\/list|providers\/current/);
-assert.match(app, /setChats\(loadedChats\)/);
+assert.match(app, /reconcileChatSummaries\(loadedChats, previous\)/);
 assert.match(app, /setChatFolders\(loadedFolders\)/);
 assert.match(app, /setChatIndexHydrated\(true\)/);
 assert.match(app, /Provider\/Etna definitions are client-owned/);

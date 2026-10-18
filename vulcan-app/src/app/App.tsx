@@ -4,6 +4,7 @@ import { useSidebarWidths } from './hooks/useSidebarWidths';
 import { TopBar } from './components/TopBar';
 import { KitSidebar, type SidebarDragItem } from './components/KitSidebar';
 import { ChatInterface } from './components/ChatInterface';
+import { ChatLoadingBoundary } from './components/ChatLoadingBoundary';
 import { DesignSurface, type DesignSurfaceHandle } from './components/DesignSurface';
 import { BranchGraph } from './components/BranchGraph';
 import type { SkillMeta } from './components/SkillToggleMenu';
@@ -45,10 +46,13 @@ import { branchById, branchEvents, createBranch, ensureBranching, renameBranch, 
 import { ClientHttpRelay } from './services/clientHttpRelay';
 import { CLIENT_CAPABILITIES } from './services/ws';
 import { applyRunStreamBatch, attachSeqs, type RunStreamMessage } from './services/runStream';
+import { ChatLoadCoordinator, SupersededChatLoadError, reconcileChatSummaries } from './services/chatLoading';
 import { toast, Toaster } from 'sonner';
 import { noteLocalToolRepeat, type ToolRepeatState } from './services/toolRepeatGuard';
 
 const getEtnaClientDeviceId = clientDeviceId;
+
+type LoadedChatSubscription = { payload: any; chat: Chat; unchanged: boolean };
 
 function normalizeDesignUrl(raw: string): string | null {
   const trimmed = raw.trim();
@@ -129,6 +133,13 @@ export default function App() {
   const pendingChatIdRef = useRef<string | null>(null);
   if (pendingChat) designsByChatRef.current[pendingChat.id] = pendingChat.designs ?? [];
   const [activeChat, setActiveChat] = useState<Chat | null>(null);
+  const activeChatRef = useRef<Chat | null>(null);
+  activeChatRef.current = activeChat;
+  const [openingChatId, setOpeningChatId] = useState<string | null>(null);
+  const openingChatIdRef = useRef<string | null>(null);
+  const chatLoadsRef = useRef(new ChatLoadCoordinator<LoadedChatSubscription>());
+  const chatConnectionGenerationRef = useRef(0);
+  const chatSnapshotsRef = useRef(new Map<string, { chat: Chat; revision: string }>());
   if (activeChat) designsByChatRef.current[activeChat.id] = activeChat.designs ?? [];
   const activeChatIdRef = useRef<string | null>(null);
   const chatSelectionGenerationRef = useRef(0);
@@ -748,7 +759,7 @@ export default function App() {
     try {
       const [loadedChats, loadedFolders] = await Promise.all([loadChats(), loadChatFolders()]);
       if (serverContextGenerationRef.current !== generation || vulcanServerSwitchingRef.current) return;
-      setChats(loadedChats);
+      setChats((previous) => reconcileChatSummaries(loadedChats, previous));
       setChatFolders(loadedFolders);
       setChatIndexHydrated(true);
       // Provider/Etna definitions are client-owned and deliberately survive Vulcan server switches.
@@ -771,6 +782,13 @@ export default function App() {
     const unsubscribe = vulcan.generalWS.onConnectionChange((connected) => {
       setVulcanConnected(connected);
       if (connected) void hydrateServerOwnedStateFromServer();
+      else {
+        chatConnectionGenerationRef.current += 1;
+        chatLoadsRef.current.reset();
+        chatSelectionGenerationRef.current += 1;
+        openingChatIdRef.current = null;
+        setOpeningChatId(null);
+      }
     });
     return unsubscribe;
   }, [hydrateServerOwnedStateFromServer]);
@@ -957,6 +975,10 @@ export default function App() {
 
   // Create a new pending chat (not in sidebar yet)
   const handleNewChat = () => {
+    chatSelectionGenerationRef.current += 1;
+    openingChatIdRef.current = null;
+    setOpeningChatId(null);
+    chatLoadsRef.current.cancelQueued();
     // Only snapshot kit/tool defaults after kits have loaded — prevents the race
     // condition where the initial chat gets permanently pinned to an empty kit config
     const defaultEnabledKitNames = kitsLoaded
@@ -1017,9 +1039,13 @@ export default function App() {
   }, []);
 
   const handleSelectChat = (chatId: string) => {
-    const generation = ++chatSelectionGenerationRef.current;
-    const candidate = chats.find((c) => c.id === chatId);
+    // A repeated click shares the current load; it must not invalidate it.
+    if (openingChatIdRef.current === chatId) return;
+    const candidate = chatsRef.current.find((c) => c.id === chatId);
     if (!candidate) return;
+    const generation = ++chatSelectionGenerationRef.current;
+    openingChatIdRef.current = candidate._summaryOnly ? chatId : null;
+    setOpeningChatId(openingChatIdRef.current);
     // The sidebar list only receives run boundaries; hand the live transcript
     // of the chat being left back to it so returning to it shows current text.
     const leaving = activeChat;
@@ -1030,41 +1056,47 @@ export default function App() {
     void (async () => {
       let chat = candidate;
       let subscription: any = null;
-      if (candidate._summaryOnly) {
-        // One chat-open transaction: transcript, run status, waiting question
-        // and live subscription arrive together (no chats/get + subscribe
-        // double transfer of the same transcript).
-        subscribedChatIdRef.current = chatId;
-        try {
-          subscription = await vulcan.generalWS.send('runs/subscribe', subscribePayload(chatId));
-        } catch {
-          if (subscribedChatIdRef.current === chatId) subscribedChatIdRef.current = null;
-          return;
+      try {
+        if (candidate._summaryOnly) {
+          // One chat-open transaction: transcript, run status, waiting question
+          // and live subscription arrive together (no chats/get + subscribe
+          // double transfer of the same transcript).
+          const loaded = await requestChatSubscription(chatId);
+          subscription = loaded.payload;
+          chat = loaded.chat;
         }
-        const hydrated = hydrateChatPayload(subscription?.chat);
-        if (!hydrated || generation !== chatSelectionGenerationRef.current) return;
-        attachSeqs(hydrated.events, subscription.seqs);
-        runStreamQueueRef.current.delete(chatId);
-        chat = hydrated;
-        setChats((previous) => previous.map((item) => item.id === chatId ? hydrated : item));
+        if (generation !== chatSelectionGenerationRef.current) return;
+        setActiveChat(chat);
+        if (subscription) {
+          setProcessing(subscription.status === 'running' || subscription.status === 'waiting_for_user');
+          setQuestionBatch(subscription.question ?? null);
+        } else {
+          // Cached transcript: one subscribe reconciles it with server state.
+          void subscribeChat(chatId).catch((error) => {
+            if (!(error instanceof SupersededChatLoadError) && activeChatIdRef.current === chatId) {
+              toast.error('Could not synchronize chat', { description: String(error) });
+            }
+          });
+        }
+        pendingChatIdRef.current = null;
+        setPendingChat(null);
+        const assets = projectWorkspaceAssets(chat.events);
+        setPresentedFiles(assets.presentedFiles);
+        setPanels(assets.panels);
+        setAttachments([]);
+        setBranchMode(false);
+        setSelectedBranchId(null);
+      } catch (error) {
+        if (generation === chatSelectionGenerationRef.current && !(error instanceof SupersededChatLoadError)) {
+          console.warn('[Vulcan] Could not open chat', { chatId, error });
+          toast.error('Could not open chat', { description: String(error) });
+        }
+      } finally {
+        if (generation === chatSelectionGenerationRef.current) {
+          openingChatIdRef.current = null;
+          setOpeningChatId(null);
+        }
       }
-      if (generation !== chatSelectionGenerationRef.current) return;
-      setActiveChat(chat);
-      if (subscription) {
-        setProcessing(subscription.status === 'running' || subscription.status === 'waiting_for_user');
-        if (subscription.question) setQuestionBatch(subscription.question);
-      } else {
-        // Cached transcript: one subscribe reconciles it with server state.
-        void subscribeChat(chatId).catch(() => {});
-      }
-      pendingChatIdRef.current = null;
-      setPendingChat(null);
-      const assets = projectWorkspaceAssets(chat.events);
-      setPresentedFiles(assets.presentedFiles);
-      setPanels(assets.panels);
-      setAttachments([]);
-      setBranchMode(false);
-      setSelectedBranchId(null);
     })();
   };
 
@@ -1521,6 +1553,12 @@ export default function App() {
         },
         detach: () => {
           serverContextGenerationRef.current += 1;
+          chatConnectionGenerationRef.current += 1;
+          chatSelectionGenerationRef.current += 1;
+          chatLoadsRef.current.reset();
+          chatSnapshotsRef.current.clear();
+          openingChatIdRef.current = null;
+          setOpeningChatId(null);
           window.dispatchEvent(new CustomEvent('vulcan:server-switching'));
           activeChatIdRef.current = null;
           pendingChatIdRef.current = null;
@@ -2606,16 +2644,61 @@ Narrate at the level of intent. Say what you're doing and why; don't narrate eac
   const runResyncRef = useRef(new Set<string>());
   const subscribedChatIdRef = useRef<string | null>(null);
 
-  const subscribePayload = (chatId: string) => ({
+  const subscribePayload = (chatId: string, knownRevision?: string) => ({
     chat_id: chatId, include_chat: true, branch_refs: true, capabilities: CLIENT_CAPABILITIES,
+    ...(knownRevision ? { known_revision: knownRevision } : {}),
   });
 
-  const applySubscription = (chatId: string, result: any) => {
+  const currentCachedChat = (chatId: string) => activeChatRef.current?.id === chatId
+    ? activeChatRef.current : chatsRef.current.find((chat) => chat.id === chatId);
+
+  const requestChatSubscription = (chatId: string, forceFull = false): Promise<LoadedChatSubscription> => {
+    const serverGeneration = serverContextGenerationRef.current;
+    const connectionGeneration = chatConnectionGenerationRef.current;
+    return chatLoadsRef.current.request(chatId, async () => {
+      const stillCurrent = () => serverGeneration === serverContextGenerationRef.current
+        && connectionGeneration === chatConnectionGenerationRef.current;
+      const snapshot = chatSnapshotsRef.current.get(chatId);
+      const matches = (chat: Chat | null | undefined) => chat && !chat._summaryOnly && snapshot
+        && chat.events === snapshot.chat.events && chat.branching === snapshot.chat.branching;
+      const knownRevision = !forceFull && matches(currentCachedChat(chatId)) ? snapshot!.revision : undefined;
+      subscribedChatIdRef.current = chatId;
+      try {
+        let payload = await vulcan.generalWS.send('runs/subscribe', subscribePayload(chatId, knownRevision));
+        if (!stillCurrent()) throw new SupersededChatLoadError();
+        // Local edits/stream events may have changed the cache during the RPC.
+        // An unchanged acknowledgement is usable only with its exact baseline.
+        if (payload?.chat_unchanged && (!knownRevision || payload.chat_revision !== knownRevision
+          || !matches(currentCachedChat(chatId)))) {
+          payload = await vulcan.generalWS.send('runs/subscribe', subscribePayload(chatId));
+          if (!stillCurrent()) throw new SupersededChatLoadError();
+          if (payload?.chat_unchanged) throw new Error('Server omitted the requested chat transcript');
+        }
+        const unchanged = !!payload?.chat_unchanged;
+        const chat = unchanged ? currentCachedChat(chatId) : hydrateChatPayload(payload?.chat);
+        if (!chat || chat._summaryOnly || chat.id !== chatId) throw new Error('Server did not return a valid chat transcript');
+        attachSeqs(chat.events, payload.seqs);
+        runStreamQueueRef.current.delete(chatId);
+        runGapChatsRef.current.delete(chatId);
+        if (typeof payload.chat_revision === 'string') {
+          chatSnapshotsRef.current.set(chatId, { chat, revision: payload.chat_revision });
+        } else chatSnapshotsRef.current.delete(chatId);
+        // Cache valid replies even if the user has selected another destination.
+        setChats((previous) => previous.map((item) => item.id === chatId
+          && (item._summaryOnly || activeChatIdRef.current !== chatId) ? chat : item));
+        return { payload, chat, unchanged };
+      } catch (error) {
+        if (stillCurrent() && subscribedChatIdRef.current === chatId) subscribedChatIdRef.current = null;
+        throw error;
+      }
+    });
+  };
+
+  const applySubscription = (chatId: string, result: any, hydrated: Chat, unchanged: boolean) => {
     if (activeChatIdRef.current !== chatId) return;
     setProcessing(result?.status === 'running' || result?.status === 'waiting_for_user');
     setQuestionBatch(result?.question ?? null);
-    const hydrated = hydrateChatPayload(result?.chat);
-    if (!hydrated) return;
+    if (unchanged) return;
     // The subscription snapshot supersedes everything queued before it: the
     // server orders it ahead of every later delta, and its seqs say which
     // deltas it already contains.
@@ -2633,17 +2716,18 @@ Narrate at the level of intent. Say what you're doing and why; don't narrate eac
   };
 
   /** One chat-open/reconnect transaction: subscription + transcript + run state. */
-  const subscribeChat = (chatId: string): Promise<void> => {
-    subscribedChatIdRef.current = chatId;
-    return vulcan.generalWS.send('runs/subscribe', subscribePayload(chatId))
-      .then((result: any) => applySubscription(chatId, result));
+  const subscribeChat = async (chatId: string, forceFull = false): Promise<void> => {
+    if (openingChatIdRef.current && openingChatIdRef.current !== chatId) return;
+    let loaded = await requestChatSubscription(chatId, forceFull);
+    if (forceFull && loaded.unchanged) loaded = await requestChatSubscription(chatId, true);
+    applySubscription(chatId, loaded.payload, loaded.chat, loaded.unchanged);
   };
 
   const requestResync = (chatId: string) => {
     if (runResyncRef.current.has(chatId) || activeChatIdRef.current !== chatId) return;
     if (pendingChatIdRef.current === chatId) return;
     runResyncRef.current.add(chatId);
-    void subscribeChat(chatId).catch(() => {}).finally(() => runResyncRef.current.delete(chatId));
+    void subscribeChat(chatId, true).catch(() => {}).finally(() => runResyncRef.current.delete(chatId));
   };
 
   const flushRunStreams = () => {
@@ -2828,7 +2912,7 @@ Narrate at the level of intent. Say what you're doing and why; don't narrate eac
   };
 
   const handleSendMessage = async (content: string, files?: File[], quotes?: MessageQuote[], references?: MessageFileReference[], contextOrder?: string[], elements?: MessageElementReference[], mode?: 'steer' | 'queue') => {
-    if (!activeChat || (processing && !mode)) return;
+    if (openingChatIdRef.current || !activeChat || (processing && !mode)) return;
 
     let currentChat = activeChat;
     const isPending = pendingChat?.id === currentChat.id;
@@ -3160,6 +3244,17 @@ ${editedEvent.attachmentNotices}`.trim()
           )}
 
           <Panel id="chat-main" order={2} minSize={30}>
+            <ChatLoadingBoundary title={openingChatId ? (chats.find((chat) => chat.id === openingChatId)?.title || 'conversation') : null}
+              onCancel={() => {
+                  chatSelectionGenerationRef.current += 1;
+                  openingChatIdRef.current = null;
+                  setOpeningChatId(null);
+                  chatLoadsRef.current.cancelQueued();
+                  const previous = activeChatRef.current;
+                  if (previous && pendingChatIdRef.current !== previous.id) {
+                    void subscribeChat(previous.id).catch(() => {});
+                  }
+              }}>
             {branchMode && displayChat && activeBranching && selectedBranch ? (
               <PanelGroup direction="horizontal" id="branch-layout">
                 <Panel id="branch-graph" order={1} defaultSize={56} minSize={32}>
@@ -3268,6 +3363,7 @@ ${editedEvent.attachmentNotices}`.trim()
                 activeSearchMatch={displayChat ? hydratedActiveChatSearchMatches[searchHitIndex(displayChat.id)] : undefined}
               />
             )}
+            </ChatLoadingBoundary>
           </Panel>
 
           {artifactsPanelOpen && (

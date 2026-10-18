@@ -168,7 +168,7 @@ assert.doesNotMatch(app, /\}, \[activeChat\?\.id, connected\]\);/, 'subscription
 assert.match(app, /Reconnect has exactly one owner/);
 const select = app.slice(app.indexOf('const handleSelectChat = (chatId: string) =>'), app.indexOf('const searchHitIndex ='));
 assert.doesNotMatch(select, /loadChat\(/, 'chat open must not hydrate via chats/get and then subscribe again');
-assert.match(select, /'runs\/subscribe'/);
+assert.match(select, /requestChatSubscription/);
 
 const start = app.slice(app.indexOf('const runOptions = {'), app.indexOf("response = await vulcan.generalWS.send('runs/start', fullPayload())"));
 assert.match(start, /hasServerCapability\('runs-start-ref-v1'\)/, 'new turns are sent by reference when supported');

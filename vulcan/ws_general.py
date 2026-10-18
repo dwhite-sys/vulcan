@@ -47,6 +47,7 @@ Namespaces
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -201,6 +202,7 @@ class GeneralWSSession:
         # older renderers keep receiving coalesced event snapshots.
         self.supports_run_deltas = False
         self.focused_chat_id: str | None = None
+        self._subscribing_chats: set[str] = set()
         self._uploads: dict[str, dict[str, Any]] = {}
         self._workspace_exports: dict[str, dict[str, Any]] = {}
         self._activity_recorded: dict[str, float] = {}
@@ -802,6 +804,17 @@ class GeneralWSSession:
             "paused_run_id": run.chat.get("pausedRunId") if run else None})
 
     async def _runs_subscribe(self, req_id: str, p: dict):
+        chat_id = str(p["chat_id"])
+        if chat_id in self._subscribing_chats:
+            await self.error(req_id, "A subscription for this chat is already in progress")
+            return
+        self._subscribing_chats.add(chat_id)
+        try:
+            await self._runs_subscribe_snapshot(req_id, p)
+        finally:
+            self._subscribing_chats.discard(chat_id)
+
+    async def _runs_subscribe_snapshot(self, req_id: str, p: dict):
         """One chat-open transaction: subscription + transcript + run state.
 
         ``include_chat`` (default true for older renderers) lets a client that
@@ -835,11 +848,13 @@ class GeneralWSSession:
             await self.respond(req_id, "runs/subscribe", {**state(run), "seqs": dict(run.stream_seq) if run else {}})
             return
         if run is None:
-            payload = {**state(None), "seqs": {}, "chat": loaded}
-            message = {"id": req_id, "type": "runs/subscribe/response", "payload": payload}
+            head = {**state(None), "seqs": {}}
             reserved = self.egress.reserve_ordered()
             try:
-                plaintext = await asyncio.to_thread(agent_runtime.encode_message_chunked, message)
+                plaintext = await asyncio.to_thread(
+                    self._encode_subscription, req_id, head,
+                    lambda: agent_runtime.dumps_chunked(loaded), p.get("known_revision"),
+                )
             except BaseException:
                 self.egress.release_reservation(reserved)
                 raise
@@ -849,36 +864,56 @@ class GeneralWSSession:
         # seqs), claim the ordering slot now, encode the immutable bulk later.
         metadata, history, tail, branching, seqs = run.subscription_parts()
         has_branching = "branching" in run.chat
-        head = agent_runtime.dumps_chunked({**state(run), "seqs": seqs})
+        head = {**state(run), "seqs": seqs}
         meta_json = agent_runtime.dumps_chunked(metadata)
         tail_json = agent_runtime.dumps_chunked(list(tail))
         reserved = self.egress.reserve_ordered()
 
-        def assemble() -> bytes:
+        def assemble_chat() -> str:
             history_json = agent_runtime.dumps_chunked(list(history))
             events_json = _join_json_arrays(history_json, tail_json)
             chat_json = meta_json[:-1] + ("," if len(meta_json) > 2 else "")
             if has_branching:
                 chat_json += '"branching":' + agent_runtime.dumps_chunked(branching) + ","
             chat_json += '"events":' + events_json + "}"
-            payload_json = head[:-1] + ("," if len(head) > 2 else "") + '"chat":' + chat_json + "}"
-            return ('{"id":' + json.dumps(req_id) + ',"type":"runs/subscribe/response","payload":'
-                    + payload_json + "}").encode("utf-8")
+            return chat_json
 
         try:
-            plaintext = await asyncio.to_thread(assemble)
+            plaintext = await asyncio.to_thread(
+                self._encode_subscription, req_id, head, assemble_chat, p.get("known_revision"),
+            )
         except BaseException:
             self.egress.release_reservation(reserved)
             raise
         await self._send_reserved(plaintext, reserved)
 
+    @staticmethod
+    def _encode_subscription(req_id: str, head: dict, build_chat, known_revision: Any) -> bytes:
+        # Hash exactly the immutable snapshot being offered, including branch
+        # topology and metadata. Never infer cache validity from a timestamp.
+        chat_json = build_chat()
+        revision = hashlib.sha256(chat_json.encode("utf-8")).hexdigest()
+        payload = {**head, "chat_revision": revision}
+        if chat_json != "null" and known_revision == revision:
+            payload["chat_unchanged"] = True
+            return agent_runtime.encode_message_chunked({
+                "id": req_id, "type": "runs/subscribe/response", "payload": payload,
+            })
+        head_json = agent_runtime.dumps_chunked(payload)
+        payload_json = head_json[:-1] + ',"chat":' + chat_json + "}"
+        return ('{"id":' + json.dumps(req_id) + ',"type":"runs/subscribe/response","payload":'
+                + payload_json + "}").encode("utf-8")
+
     async def _send_reserved(self, plaintext: bytes, reserved: int) -> None:
         try:
-            await self.egress.send(plaintext, traffic.BULK, reserved=reserved)
+            # Cache acknowledgements/run state should not wait in the bulk
+            # backlog. The reservation still orders later streaming deltas.
+            lane = traffic.CONTROL if len(plaintext) <= 4096 else traffic.BULK
+            await self.egress.send(plaintext, lane, reserved=reserved)
         except asyncio.CancelledError:
             raise
         except Exception:
-            pass
+            logger.warning("Could not deliver chat subscription", exc_info=True)
 
     async def _runs_answer(self, req_id: str, p: dict):
         agent_runtime.MANAGER.answer(p["chat_id"], p["batch_id"], p.get("answers", {}))

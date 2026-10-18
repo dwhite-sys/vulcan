@@ -197,3 +197,34 @@ Not yet exercised: a packaged Electron build against a real provider, a real
 client-POV provider at high tokens/sec, and multi-hour soak tests. CI covers the
 build and packaging, and `server/metrics` is how to observe the new budgets in
 the field.
+
+## Bounded chat navigation and conditional snapshots
+
+The renderer shares an outstanding chat subscription between repeated clicks.
+Only one transcript subscription is sent at a time; while it is running, the
+latest navigation destination replaces any unsent destination. Superseded
+successful responses are cached within their originating server/connection
+context. A missing transcript displays a loading state, blocks sending to the
+previous conversation, and reports failure instead of silently remaining there.
+A matching reconnect summary preserves an already hydrated transcript.
+
+`runs/subscribe` still defaults to a full snapshot for compatibility. Full
+responses now include `chat_revision`, a SHA-256 hash of the exact server chat
+JSON including metadata, events, and branch topology. A renderer holding that
+baseline may send `known_revision`; when it matches, the response contains
+`chat_unchanged: true`, run status/question, and stream sequence numbers, without
+a duplicate `chat`. Local baseline changes during validation trigger a full
+retry. Delta-gap recovery always requests a full snapshot. Old servers may
+ignore the optional request field; old clients may ignore the response fields.
+
+Each server connection also rejects overlapping subscriptions for the same
+chat before another read or encoding job. Small subscription acknowledgements
+use the CONTROL lane while retaining their ordering reservation. This avoids
+placing them behind queued bulk snapshots; it cannot interrupt a large frame
+already being transmitted. First loads and changed snapshots remain full
+messages. History chunking or a separate bulk transport is future work, not a
+guarantee provided by this change.
+
+Validation: `npm run test:chat-loading`, `npm run test:run-stream`,
+`npm run test:hydration`, and
+`python -m unittest vulcan.tests.test_chat_subscriptions vulcan.tests.test_traffic_architecture`.

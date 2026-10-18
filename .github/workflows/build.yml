@@ -92,6 +92,18 @@ jobs:
         env:
           PYTHONPATH: ..
 
+      - name: Validate chat loading and transcript reuse
+        run: |
+          npm run test:chat-loading
+          npm run test:run-stream
+          npm run test:hydration
+
+      - name: Validate subscription admission and snapshot ordering
+        if: matrix.os == 'ubuntu-latest'
+        run: python -m unittest vulcan.tests.test_chat_subscriptions vulcan.tests.test_traffic_architecture
+        env:
+          PYTHONPATH: ..
+
       - name: Install and validate independent terminal host
         if: matrix.os == 'ubuntu-latest'
         run: |
@@ -110,6 +122,7 @@ jobs:
           npx playwright install --with-deps chromium
           npm run test:terminal-resize
           npm run build
+          npm run test:chat-loading-ui
           npm run test:openai-summary
           npm run test:composer-controls
           npm run test:sidebar-widths
